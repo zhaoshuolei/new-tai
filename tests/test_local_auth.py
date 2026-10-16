@@ -1,0 +1,508 @@
+import json
+import os
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+from app.core.config import settings
+from app.core.deps import get_current_context
+from app.core.errors import ErrorCode
+from app.core.redis import get_redis, key
+from app.core.security import decode_access_token
+from app.db.session import get_session
+from app.main import create_app
+from app.models.role import DataScope, Role, RoleStatus
+from app.models.user import UserStatus
+from app.schemas.user import UserCreate
+from app.services import auth as auth_service
+from app.services.user import create_local_user
+
+TEST_DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
+
+
+@pytest.fixture(autouse=True)
+def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jwt_secret", "test-secret-" + "x" * 32)
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+
+    async def get(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        ex: int | None = None,
+        nx: bool = False,
+        xx: bool = False,
+        get: bool = False,
+    ) -> str | bool | None:
+        existing = self.values.get(name)
+        if nx and existing is not None:
+            return None if get else False
+        if xx and existing is None:
+            return None if get else False
+        self.values[name] = value
+        if ex is not None:
+            self.expirations[name] = ex
+        return existing if get else True
+
+    async def delete(self, *names: str) -> int:
+        deleted = 0
+        for name in names:
+            if name in self.values:
+                deleted += 1
+                del self.values[name]
+                self.expirations.pop(name, None)
+        return deleted
+
+    async def incr(self, name: str) -> int:
+        value = int(self.values.get(name, "0")) + 1
+        self.values[name] = str(value)
+        return value
+
+    async def expire(
+        self,
+        name: str,
+        time: int,
+        *,
+        nx: bool = False,
+    ) -> bool:
+        if name not in self.values:
+            return False
+        if nx and name in self.expirations:
+            return False
+        self.expirations[name] = time
+        return True
+
+    async def scan_iter(self, *, match: str) -> AsyncIterator[str]:
+        prefix = match.removesuffix("*")
+        for name in tuple(self.values):
+            if name.startswith(prefix):
+                yield name
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        keys = args[:numkeys]
+        values = args[numkeys:]
+        if len(keys) != 1:
+            raise NotImplementedError
+        redis_key = keys[0]
+        current = self.values.get(redis_key)
+
+        if "redis.call('DEL'" in script:
+            expected = values[0]
+            if current != expected:
+                return 0
+            del self.values[redis_key]
+            self.expirations.pop(redis_key, None)
+            return 1
+
+        expected, replacement, ttl = values
+        if current != expected:
+            return 0
+        self.values[redis_key] = replacement
+        self.expirations[redis_key] = int(ttl)
+        return 1
+
+
+@pytest_asyncio.fixture
+async def session() -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        test_session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield test_session
+        finally:
+            await test_session.close()
+            await transaction.rollback()
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def fake_redis() -> FakeRedis:
+    return FakeRedis()
+
+
+@pytest_asyncio.fixture
+async def client(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> AsyncIterator[AsyncClient]:
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_redis] = lambda: fake_redis
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        application.dependency_overrides.clear()
+
+
+def unique_username(prefix: str) -> str:
+    return f"{prefix}-{uuid4().hex[:12]}"
+
+
+async def login(
+    client: AsyncClient,
+    username: str,
+    password: str,
+    *,
+    device_id: str = "device-a",
+) -> Response:
+    return await client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": username,
+            "password": password,
+            "device_id": device_id,
+        },
+    )
+
+
+async def refresh(client: AsyncClient, refresh_token: str) -> Response:
+    return await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh_token},
+    )
+
+
+async def test_local_login_returns_tokens_and_profile(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("login")
+    password = "correct-password"
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password=password),
+    )
+
+    response = await login(client, username, password)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["code"] == 0
+    data = payload["data"]
+    assert data["token_type"] == "bearer"
+    assert data["access_token"]
+    assert data["refresh_token"]
+    assert data["profile"]["id"] == user.id
+    assert data["profile"]["username"] == username
+
+    await session.refresh(user)
+    assert user.last_login_at is not None
+
+
+async def test_local_login_with_wrong_password_returns_1001(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("wrong-password")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="correct-password"),
+    )
+
+    response = await login(client, username, "wrong-password")
+
+    assert response.status_code == 401
+    assert response.json()["code"] == ErrorCode.INVALID_CREDENTIALS
+
+
+async def test_disabled_user_cannot_login(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("disabled")
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    user.status = UserStatus.DISABLED
+    await session.commit()
+
+    response = await login(client, username, "password")
+
+    assert response.status_code == 401
+    assert response.json()["code"] == ErrorCode.ACCOUNT_DISABLED
+
+
+async def test_me_returns_effective_data_scope(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("me-scope")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(client, username, "password")
+    access_token = login_response.json()["data"]["access_token"]
+
+    response = await client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == 200
+    profile = response.json()["data"]
+    assert profile["username"] == username
+    assert profile["data_scope"] == DataScope.SELF
+    assert profile["permission_codes"] == []
+
+
+async def test_access_token_carries_token_version(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("claims")
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+
+    response = await login(client, username, "password")
+
+    token = response.json()["data"]["access_token"]
+    claims = decode_access_token(token)
+    assert claims["sub"] == str(user.id)
+    assert claims["ver"] == user.token_version
+    assert claims["jti"]
+    assert datetime.fromtimestamp(claims["exp"], tz=UTC) > datetime.now(UTC)
+
+
+async def test_refresh_rotates_and_old_refresh_is_rejected(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("refresh")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(client, username, "password")
+    old_refresh_token = login_response.json()["data"]["refresh_token"]
+
+    rotated = await refresh(client, old_refresh_token)
+
+    assert rotated.status_code == 200
+    new_refresh_token = rotated.json()["data"]["refresh_token"]
+    assert new_refresh_token != old_refresh_token
+
+    reused = await refresh(client, old_refresh_token)
+
+    assert reused.status_code == 401
+    assert reused.json()["code"] == ErrorCode.TOKEN_INVALID
+
+    next_rotation = await refresh(client, new_refresh_token)
+    assert next_rotation.status_code == 200
+
+
+async def test_logout_invalidates_refresh_token(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("logout")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(client, username, "password")
+    refresh_token = login_response.json()["data"]["refresh_token"]
+
+    response = await client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh_token},
+    )
+
+    assert response.status_code == 200
+    rejected = await refresh(client, refresh_token)
+    assert rejected.status_code == 401
+    assert rejected.json()["code"] == ErrorCode.TOKEN_INVALID
+
+
+async def test_logout_all_removes_every_device(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("logout-all")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    first = await login(client, username, "password", device_id="device-a")
+    second = await login(client, username, "password", device_id="device-b")
+    first_data = first.json()["data"]
+    second_data = second.json()["data"]
+
+    response = await client.post(
+        "/api/v1/auth/logout-all",
+        headers={"Authorization": f"Bearer {first_data['access_token']}"},
+    )
+
+    assert response.status_code == 200
+    assert (await refresh(client, first_data["refresh_token"])).status_code == 401
+    assert (await refresh(client, second_data["refresh_token"])).status_code == 401
+
+
+async def test_access_token_rejected_after_token_version_bump(
+    client: AsyncClient,
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    username = unique_username("version")
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(client, username, "password")
+    access_token = login_response.json()["data"]["access_token"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    assert (await client.get("/api/v1/auth/me", headers=headers)).status_code == 200
+
+    await auth_service.bump_token_version(session, user.id, redis=fake_redis)
+
+    response = await client.get("/api/v1/auth/me", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["code"] == ErrorCode.TOKEN_EXPIRED
+
+
+async def test_auth_snapshot_cache_is_populated_and_invalidated(
+    client: AsyncClient,
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    username = unique_username("snapshot")
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(client, username, "password")
+    access_token = login_response.json()["data"]["access_token"]
+    snapshot_key = key("auth", "snapshot", str(user.id))
+
+    response = await client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == 200
+    raw_snapshot = await fake_redis.get(snapshot_key)
+    assert raw_snapshot is not None
+    snapshot = json.loads(raw_snapshot)
+    assert snapshot == {
+        "status": UserStatus.ACTIVE.value,
+        "token_version": user.token_version,
+        "role_id": None,
+        "department_id": None,
+    }
+    assert fake_redis.expirations[snapshot_key] == 600
+
+    await auth_service.invalidate_auth_snapshot(fake_redis, user.id)
+
+    assert await fake_redis.get(snapshot_key) is None
+
+
+@pytest.mark.parametrize("role_kind", ["missing", "disabled"])
+async def test_disabled_or_missing_role_degrades_to_self_without_permissions(
+    client: AsyncClient,
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    role_kind: str,
+) -> None:
+    username = unique_username(f"degraded-{role_kind}")
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    if role_kind == "disabled":
+        role = Role(
+            code=unique_username("disabled-role"),
+            name="Disabled role",
+            data_scope=DataScope.ALL,
+            data_scope_include_children=True,
+            is_system=False,
+            status=RoleStatus.DISABLED,
+        )
+        session.add(role)
+        await session.commit()
+        await session.refresh(role)
+        user.role_id = role.id
+        await session.commit()
+
+    login_response = await login(client, username, "password")
+    access_token = login_response.json()["data"]["access_token"]
+
+    context = await get_current_context(
+        session=session,
+        redis=fake_redis,
+        authorization=f"Bearer {access_token}",
+    )
+
+    assert context.role_id == user.role_id
+    assert context.data_scope == DataScope.SELF
+    assert context.permission_codes == frozenset()
+    assert context.is_super_admin is False
+
+
+async def test_login_rate_limit_returns_1005_after_threshold(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("rate-limit")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="correct-password"),
+    )
+
+    for _ in range(auth_service.LOGIN_RATE_LIMIT_ATTEMPTS):
+        response = await login(client, username, "wrong-password")
+        assert response.status_code == 401
+        assert response.json()["code"] == ErrorCode.INVALID_CREDENTIALS
+
+    response = await login(client, username, "wrong-password")
+
+    assert response.status_code == 429
+    assert response.json()["code"] == ErrorCode.RATE_LIMITED
+
+
+async def test_malformed_access_token_returns_1004(
+    client: AsyncClient,
+) -> None:
+    response = await client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": "Bearer not-a-jwt"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == ErrorCode.TOKEN_INVALID
