@@ -141,10 +141,14 @@ def fake_client(
     return client
 
 
-def _context(caller: User, *permission_codes: str) -> AuthContext:
+def _context(
+    caller: User,
+    *permission_codes: str,
+    role_id: int | None = None,
+) -> AuthContext:
     return AuthContext(
         user_id=caller.id,
-        role_id=None,
+        role_id=role_id,
         department_id=caller.department_id,
         data_scope=DataScope.ALL,
         custom_department_ids=frozenset(),
@@ -369,6 +373,105 @@ async def test_list_customers_returns_paginated_envelope(
     assert data["page_size"] == 20
     assert data["total"] == 1
     assert [item["id"] for item in data["items"]] == [customer.id]
+
+
+async def test_create_customer_returns_timestamps(
+    session: AsyncSession,
+    caller: User,
+) -> None:
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context) as client:
+        response = await client.post(
+            "/api/v1/customers",
+            json={"name": "接口创建客户"},
+        )
+
+    assert response.status_code == 201, response.text
+    data = response.json()["data"]
+    assert data["id"]
+    assert data["name"] == "接口创建客户"
+    assert data["created_at"] is not None
+    assert data["updated_at"] is not None
+
+
+async def test_import_customer_returns_timestamps(
+    session: AsyncSession,
+    caller: User,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context) as client:
+        response = await client.post(
+            "/api/v1/customers/import",
+            json={"credit_code": REQUESTED_CREDIT_CODE, "short_name": "乐视网"},
+        )
+
+    assert response.status_code == 201, response.text
+    data = response.json()["data"]
+    assert data["id"]
+    assert data["credit_code"] == REQUESTED_CREDIT_CODE
+    assert data["business_scope"] == "互联网信息服务"
+    assert data["created_at"] is not None
+    assert data["updated_at"] is not None
+
+
+async def test_update_customer_returns_timestamps(
+    session: AsyncSession,
+    caller: User,
+) -> None:
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context) as client:
+        created = await client.post(
+            "/api/v1/customers",
+            json={"name": "接口更新客户"},
+        )
+        assert created.status_code == 201, created.text
+        customer_id = created.json()["data"]["id"]
+        response = await client.patch(
+            f"/api/v1/customers/{customer_id}",
+            json={"remark": "更新备注"},
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["id"] == customer_id
+    assert data["remark"] == "更新备注"
+    assert data["created_at"] is not None
+    assert data["updated_at"] is not None
+
+
+async def test_transfer_owner_returns_timestamps(
+    session: AsyncSession,
+    caller: User,
+) -> None:
+    target = User(
+        username=f"api-{uuid4().hex[:12]}",
+        password_hash=None,
+        status=UserStatus.ACTIVE,
+        token_version=0,
+    )
+    session.add(target)
+    await session.flush()
+
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS, role_id=1)
+    async with api_client(session, context) as client:
+        created = await client.post(
+            "/api/v1/customers",
+            json={"name": "接口转移客户"},
+        )
+        assert created.status_code == 201, created.text
+        customer_id = created.json()["data"]["id"]
+        response = await client.patch(
+            f"/api/v1/customers/{customer_id}/owner",
+            json={"owner_user_id": target.id},
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["id"] == customer_id
+    assert data["owner_user_id"] == target.id
+    assert data["created_at"] is not None
+    assert data["updated_at"] is not None
 
 
 async def test_search_rate_limited_after_limit(

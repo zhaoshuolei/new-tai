@@ -22,6 +22,9 @@ async def get_by_credit_code(
 async def add(session: AsyncSession, customer: Customer) -> Customer:
     session.add(customer)
     await session.flush()
+    # 刷新以加载服务端生成的 created_at/updated_at，避免序列化时异步懒加载
+    # 触发 MissingGreenlet（与 integration_config.upsert 一致）。
+    await session.refresh(customer)
     return customer
 
 

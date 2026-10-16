@@ -405,6 +405,9 @@ async def update_customer(
         for field_name, value in changes.items():
             setattr(customer, field_name, value)
         await session.flush()
+    # 刷新以加载服务端更新的 updated_at，避免序列化时异步懒加载
+    # 触发 MissingGreenlet。
+    await session.refresh(customer)
     return customer
 
 
@@ -451,6 +454,9 @@ async def transfer_owner(
     customer.owner_user_id = target.id
     customer.owner_department_id = target.department_id
     await session.flush()
+    # 刷新以加载服务端更新的 updated_at，避免序列化时异步懒加载
+    # 触发 MissingGreenlet。
+    await session.refresh(customer)
     return customer
 
 
