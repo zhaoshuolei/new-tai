@@ -51,15 +51,23 @@ def _error_response(
     code: int,
     message: str,
     status_code: int,
+    extra: dict[str, object] | None = None,
 ) -> JSONResponse:
     request_id = _request_id(request)
-    return JSONResponse(
-        status_code=status_code,
-        content={
+    content: dict[str, object] = {}
+    if extra:
+        content.update(extra)
+    # Reserved keys are written last so extra cannot overwrite them.
+    content.update(
+        {
             "code": code,
             "message": message,
             "request_id": request_id,
-        },
+        }
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=content,
         headers={
             "X-Request-Id": request_id,
             **SECURITY_HEADERS,
@@ -136,6 +144,7 @@ async def business_error_handler(
         code=exc.code,
         message=exc.message,
         status_code=exc.http_status,
+        extra=exc.extra,
     )
 
 

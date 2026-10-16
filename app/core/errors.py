@@ -57,11 +57,13 @@ class BusinessError(Exception):
         code: int,
         message: str,
         http_status: int = 400,
+        extra: dict[str, object] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.http_status = http_status
+        self.extra = extra
 
 
 __all__: tuple[str, ...] = ("BusinessError", "ErrorCode")

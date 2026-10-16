@@ -259,3 +259,69 @@ async def test_business_error_returns_envelope() -> None:
     assert payload["code"] == ErrorCode.FORBIDDEN
     assert payload["message"] == "permission denied"
     assert payload["request_id"]
+
+
+def test_business_error_default_extra_is_none() -> None:
+    assert BusinessError(1000, "x").extra is None
+
+
+async def test_business_error_extra_is_rendered() -> None:
+    test_app = create_app()
+
+    @test_app.get("/__test__/extra")
+    async def extra_error() -> None:
+        raise BusinessError(
+            ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS,
+            "credit code exists",
+            http_status=409,
+            extra={"existing_customer_id": 9},
+        )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/__test__/extra")
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["existing_customer_id"] == 9
+    assert payload["code"] == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert payload["message"] == "credit code exists"
+    assert payload["request_id"]
+    assert set(payload) == {
+        "code",
+        "message",
+        "request_id",
+        "existing_customer_id",
+    }
+
+
+async def test_business_error_extra_cannot_overwrite_reserved_keys() -> None:
+    test_app = create_app()
+
+    @test_app.get("/__test__/extra-reserved")
+    async def extra_reserved_error() -> None:
+        raise BusinessError(
+            ErrorCode.FORBIDDEN,
+            "permission denied",
+            http_status=403,
+            extra={
+                "code": 1,
+                "message": "overwritten",
+                "request_id": "overwritten",
+            },
+        )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/__test__/extra-reserved")
+
+    assert response.status_code == 403
+    payload = response.json()
+    assert payload["code"] == ErrorCode.FORBIDDEN
+    assert payload["message"] == "permission denied"
+    assert payload["request_id"] != "overwritten"
+    assert set(payload) == {"code", "message", "request_id"}
