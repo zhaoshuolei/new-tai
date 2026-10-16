@@ -1,12 +1,10 @@
-"""本地认证、令牌生命周期与请求认证快照。"""
+"""本地认证与令牌生命周期。"""
 
-import json
 import logging
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from json import JSONDecodeError
 from typing import Any, cast
 from uuid import uuid4
 
@@ -18,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
-from app.core.permissions import get_role_permission_codes
 from app.core.redis import key
 from app.core.redis import redis_client as default_redis_client
 from app.core.security import create_access_token, verify_password
@@ -27,10 +24,6 @@ from app.models.user import User, UserStatus
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
 
-AUTH_SNAPSHOT_TTL_SECONDS = 600
-# Epoch 只在安全变更时递增；TTL 至少覆盖两倍快照窗口，确保旧快照
-# 不可能在 epoch 过期后重新被信任。
-AUTH_EPOCH_TTL_SECONDS = AUTH_SNAPSHOT_TTL_SECONDS * 2
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
@@ -70,78 +63,6 @@ if not current or current ~= ARGV[1] then
 end
 return redis.call('DEL', KEYS[1])
 """
-_INCREMENT_AUTH_EPOCH_SCRIPT = """
-local epoch = redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-return epoch
-"""
-_WRITE_SNAPSHOT_IF_EPOCH_MATCHES_SCRIPT = """
-local current_epoch = redis.call('GET', KEYS[1])
-if not current_epoch then
-    return 0
-end
-if current_epoch ~= ARGV[1] then
-    return 0
-end
-redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
-return 1
-"""
-
-
-@dataclass(frozen=True)
-class AuthSnapshot:
-    status: UserStatus
-    token_version: int
-    role_id: int | None
-    department_id: int | None
-
-    def to_cache(self, *, epoch: str | None = None) -> str:
-        payload: dict[str, Any] = {
-            "status": self.status.value,
-            "token_version": self.token_version,
-            "role_id": self.role_id,
-            "department_id": self.department_id,
-        }
-        if epoch is not None:
-            payload["epoch"] = epoch
-        return json.dumps(payload, separators=(",", ":"))
-
-    @classmethod
-    def from_cache(
-        cls,
-        raw: str,
-        *,
-        expected_epoch: str | None = None,
-    ) -> AuthSnapshot | None:
-        try:
-            payload: Any = json.loads(raw)
-            if not isinstance(payload, dict):
-                return None
-            status = UserStatus(payload["status"])
-            token_version = payload["token_version"]
-            role_id = payload["role_id"]
-            department_id = payload["department_id"]
-            epoch = payload.get("epoch")
-        except JSONDecodeError, KeyError, TypeError, ValueError:
-            return None
-
-        if expected_epoch is not None and epoch != expected_epoch:
-            return None
-        if epoch is not None and not isinstance(epoch, str):
-            return None
-        if (
-            not isinstance(token_version, int)
-            or isinstance(token_version, bool)
-            or not _optional_int(role_id)
-            or not _optional_int(department_id)
-        ):
-            return None
-        return cls(
-            status=status,
-            token_version=token_version,
-            role_id=role_id,
-            department_id=department_id,
-        )
 
 
 @dataclass(frozen=True)
@@ -156,18 +77,6 @@ class TokenPair:
 class LoginResult:
     tokens: TokenPair
     user: User
-
-
-def _optional_int(value: object) -> bool:
-    return value is None or (isinstance(value, int) and not isinstance(value, bool))
-
-
-def _snapshot_key(user_id: int) -> str:
-    return key("auth", "snapshot", str(user_id))
-
-
-def _auth_epoch_key(user_id: int) -> str:
-    return key("auth", "epoch", str(user_id))
 
 
 def _refresh_key(user_id: int, device_id: str) -> str:
@@ -190,107 +99,23 @@ def _login_account_key(username: str) -> str:
     return key("auth", "login", "account", _normalize_account(username))
 
 
-def _normalize_epoch(raw: str | bytes | None) -> str | None:
-    if raw is None:
-        return None
-    if isinstance(raw, bytes):
-        return raw.decode()
-    return raw
-
-
-async def _get_auth_epoch(redis: Redis, user_id: int) -> str | None:
-    return _normalize_epoch(await redis.get(_auth_epoch_key(user_id)))
-
-
-async def _increment_auth_epoch(redis: Redis, user_id: int) -> None:
-    """原子递增用户 epoch，并刷新 epoch TTL。"""
-    await redis.eval(
-        _INCREMENT_AUTH_EPOCH_SCRIPT,
-        1,
-        _auth_epoch_key(user_id),
-        str(AUTH_EPOCH_TTL_SECONDS),
-    )
-
-
-async def get_auth_snapshot(
-    session: AsyncSession,
-    redis: Redis,
-    user_id: int,
-) -> AuthSnapshot:
-    """返回用户认证快照；缓存未命中时回源数据库并写回。"""
-    snapshot_key = _snapshot_key(user_id)
-    observed_epoch = await _get_auth_epoch(redis, user_id)
-    if observed_epoch is not None:
-        cached = await redis.get(snapshot_key)
-        if isinstance(cached, str):
-            snapshot = AuthSnapshot.from_cache(
-                cached,
-                expected_epoch=observed_epoch,
-            )
-            if snapshot is not None:
-                return snapshot
-            # 旧 epoch 或旧格式缓存一律丢弃，避免安全变更后继续信任旧授权。
-            await redis.delete(snapshot_key)
-
-    user = await user_repository.get_by_id(session, user_id)
-    if user is None:
-        raise BusinessError(
-            ErrorCode.TOKEN_INVALID,
-            "Token invalid",
-            http_status=401,
-        )
-
-    snapshot = AuthSnapshot(
-        status=user.status,
-        token_version=user.token_version,
-        role_id=user.role_id,
-        department_id=user.department_id,
-    )
-    if observed_epoch is None:
-        # epoch 缺失时禁止回填缓存，避免 epoch 过期后使用旧值信任快照。
-        return snapshot
-
-    await redis.eval(
-        _WRITE_SNAPSHOT_IF_EPOCH_MATCHES_SCRIPT,
-        2,
-        _auth_epoch_key(user_id),
-        snapshot_key,
-        observed_epoch,
-        snapshot.to_cache(epoch=observed_epoch),
-        str(AUTH_SNAPSHOT_TTL_SECONDS),
-    )
-    return snapshot
-
-
-async def invalidate_auth_snapshot(redis: Redis, user_id: int) -> None:
-    await redis.delete(_snapshot_key(user_id))
-
-
-async def _finish_user_session_invalidation(redis: Redis, user_id: int) -> None:
-    """提交后再删一次，清理提交窗口内可能写入的快照。"""
-    try:
-        await invalidate_user_sessions(redis, user_id)
-    except Exception:
-        # epoch 已递增且 TTL 长于快照 TTL；旧快照即使残留也无法通过
-        # get_auth_snapshot 的 epoch 校验。
-        logger.exception(
-            "Post-commit session invalidation failed",
-            extra={"user_id": user_id},
-        )
-
-
 async def invalidate_refresh_tokens(redis: Redis, user_id: int) -> None:
     pattern = _refresh_key_pattern(user_id)
     async for refresh_key in redis.scan_iter(match=pattern):
         await redis.delete(refresh_key)
 
 
-async def invalidate_user_sessions(
+async def _invalidate_refresh_tokens_best_effort(
     redis: Redis,
     user_id: int,
 ) -> None:
-    await invalidate_auth_snapshot(redis, user_id)
-    await invalidate_refresh_tokens(redis, user_id)
+    try:
+        await invalidate_refresh_tokens(redis, user_id)
+    except Exception:
+        logger.exception(
+            "Post-commit refresh token invalidation failed",
+            extra={"user_id": user_id},
+        )
 
 
 async def _increment_token_version_in_transaction(
@@ -319,24 +144,13 @@ async def commit_security_change(
     redis: Redis,
     increment_token_version: bool = True,
 ) -> None:
-    """提交安全变更并保证提交前后均完成会话失效。
+    """在同一事务提交安全变更和 token_version，随后清理 refresh token。
 
-    顺序固定为：事务内改字段/版本、第一次删除、提交、递增用户 epoch、
-    第二次删除。第一次删除失败会回滚数据库；提交后的 epoch 递增使观察
-    到旧 epoch 的并发读取者无法回填旧快照。
+    访问令牌每次请求都回源数据库并比对 token_version，因此旧访问令牌
+    在提交后立即失效，无需依赖任何授权缓存或缓存失效操作。
     """
     if increment_token_version:
         await _increment_token_version_in_transaction(session, user_id)
-
-    try:
-        await invalidate_user_sessions(redis, user_id)
-    except Exception as error:
-        await session.rollback()
-        raise BusinessError(
-            ErrorCode.INTERNAL_ERROR,
-            "Session invalidation failed; database change rolled back",
-            http_status=503,
-        ) from error
 
     try:
         await session.commit()
@@ -344,8 +158,7 @@ async def commit_security_change(
         await session.rollback()
         raise
 
-    await _increment_auth_epoch(redis, user_id)
-    await _finish_user_session_invalidation(redis, user_id)
+    await _invalidate_refresh_tokens_best_effort(redis, user_id)
 
 
 async def bump_token_version(
@@ -579,20 +392,18 @@ async def clear_login_account_failures(
 
 async def build_auth_context(
     session: AsyncSession,
-    user_id: int,
-    snapshot: AuthSnapshot,
-    *,
-    redis: Redis | None = None,
+    user: User,
 ) -> AuthContext:
+    """从权威用户行构建请求授权上下文，不读取任何授权缓存。"""
     role = None
-    if snapshot.role_id is not None:
-        role = await role_repository.get_by_id(session, snapshot.role_id)
+    if user.role_id is not None:
+        role = await role_repository.get_by_id(session, user.role_id)
 
     if role is None or role.status == RoleStatus.DISABLED:
         return AuthContext(
-            user_id=user_id,
-            role_id=snapshot.role_id,
-            department_id=snapshot.department_id,
+            user_id=user.id,
+            role_id=user.role_id,
+            department_id=user.department_id,
             data_scope=DataScope.SELF,
             custom_department_ids=frozenset(),
             include_children=False,
@@ -609,29 +420,24 @@ async def build_auth_context(
         )
         custom_department_ids = frozenset(result.all())
 
+    from app.services.role import list_role_permission_codes
+
     return AuthContext(
-        user_id=user_id,
+        user_id=user.id,
         role_id=role.id,
-        department_id=snapshot.department_id,
+        department_id=user.department_id,
         data_scope=role.data_scope,
         custom_department_ids=custom_department_ids,
         include_children=role.data_scope_include_children,
-        permission_codes=await get_role_permission_codes(
-            session,
-            redis or default_redis_client,
-            role,
-        ),
+        permission_codes=await list_role_permission_codes(session, role),
         is_super_admin=role.code == "super_admin" and role.is_system,
     )
 
 
 __all__: tuple[str, ...] = (
-    "AUTH_EPOCH_TTL_SECONDS",
-    "AUTH_SNAPSHOT_TTL_SECONDS",
     "LOGIN_RATE_LIMIT_ATTEMPTS",
     "LOGIN_RATE_LIMIT_WINDOW_SECONDS",
     "REFRESH_TOKEN_TTL_SECONDS",
-    "AuthSnapshot",
     "LoginResult",
     "TokenPair",
     "authenticate_local_user",
@@ -640,10 +446,7 @@ __all__: tuple[str, ...] = (
     "clear_login_account_failures",
     "commit_security_change",
     "enforce_login_rate_limit",
-    "get_auth_snapshot",
-    "invalidate_auth_snapshot",
     "invalidate_refresh_tokens",
-    "invalidate_user_sessions",
     "issue_token_pair",
     "login_local_user",
     "logout_refresh_token",

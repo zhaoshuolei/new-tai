@@ -1,4 +1,3 @@
-import asyncio
 import os
 from collections.abc import AsyncIterator
 from uuid import uuid4
@@ -6,10 +5,10 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.auth_context import AuthContext
+from app.core.config import settings
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis, key
@@ -48,7 +47,7 @@ ALL_USER_PERMISSIONS = frozenset(
 )
 
 
-class EpochRedis:
+class RecordingRedis:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
         self.expirations: dict[str, int] = {}
@@ -91,93 +90,17 @@ class EpochRedis:
             if name.startswith(prefix):
                 yield name
 
-    async def eval(self, script: str, numkeys: int, *args: object) -> int:
-        keys = args[:numkeys]
-        values = args[numkeys:]
-        if "local epoch" in script:
-            epoch_key = str(keys[0])
-            epoch = int(self.values.get(epoch_key, "0")) + 1
-            self.values[epoch_key] = str(epoch)
-            self.expirations[epoch_key] = int(str(values[0]))
-            return epoch
-        if "local current_epoch" in script:
-            epoch_key = str(keys[0])
-            snapshot_key = str(keys[1])
-            current_epoch = self.values.get(epoch_key, "0")
-            if current_epoch != str(values[0]):
-                return 0
-            self.values[snapshot_key] = str(values[1])
-            self.expirations[snapshot_key] = int(str(values[2]))
-            return 1
-        raise NotImplementedError
 
-
-class FailingRedis(EpochRedis):
-    async def eval(self, script: str, numkeys: int, *args: object) -> int:
-        raise RuntimeError("redis unavailable")
-
-    async def delete(self, *names: str) -> int:
+class RefreshCleanupFailingRedis(RecordingRedis):
+    async def scan_iter(self, *, match: str) -> AsyncIterator[str]:
+        if False:
+            yield match
         raise RuntimeError("redis unavailable")
 
 
-class InspectingFailingRedis(EpochRedis):
-    def __init__(self, session: AsyncSession, user_id: int) -> None:
-        super().__init__()
-        self.session = session
-        self.user_id = user_id
-        self.observed: tuple[int | None, int] | None = None
-
-    async def delete(self, *names: str) -> int:
-        row = (
-            await self.session.execute(
-                select(User.role_id, User.token_version).where(User.id == self.user_id)
-            )
-        ).one()
-        self.observed = (row.role_id, row.token_version)
-        raise RuntimeError("redis unavailable")
-
-
-class PostCommitDeleteFailingRedis(EpochRedis):
-    def __init__(self, snapshot_key: str, stale_snapshot: str) -> None:
-        super().__init__()
-        self.snapshot_key = snapshot_key
-        self.stale_snapshot = stale_snapshot
-        self.snapshot_deletes = 0
-
-    async def delete(self, *names: str) -> int:
-        if self.snapshot_key in names:
-            self.snapshot_deletes += 1
-            if self.snapshot_deletes == 2:
-                self.values[self.snapshot_key] = self.stale_snapshot
-                raise RuntimeError("redis unavailable after commit")
-        deleted = await super().delete(*names)
-        if self.snapshot_key in names and self.snapshot_deletes == 1:
-            self.values[self.snapshot_key] = self.stale_snapshot
-            self.expirations[self.snapshot_key] = auth_service.AUTH_SNAPSHOT_TTL_SECONDS
-        return deleted
-
-
-class BlockingEpochRedis(EpochRedis):
-    def __init__(self, session: AsyncSession) -> None:
-        super().__init__()
-        self.session = session
-        self.reader_ready_to_write = asyncio.Event()
-        self.release_reader = asyncio.Event()
-        self._block_next_snapshot_write = True
-        self.epoch_increment_in_transaction: bool | None = None
-
-    async def eval(self, script: str, numkeys: int, *args: object) -> int:
-        if "local epoch" in script:
-            self.epoch_increment_in_transaction = self.session.in_transaction()
-        if "local current_epoch" in script and self._block_next_snapshot_write:
-            self._block_next_snapshot_write = False
-            self.reader_ready_to_write.set()
-            await self.release_reader.wait()
-        return await super().eval(script, numkeys, *args)
-
-
-class RecordingRedis(EpochRedis):
-    pass
+@pytest.fixture(autouse=True)
+def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jwt_secret", "test-secret-" + "x" * 32)
 
 
 @pytest_asyncio.fixture
@@ -299,14 +222,12 @@ def context_for(
     )
 
 
-async def seed_session_state(redis: RecordingRedis, user_id: int) -> None:
-    await redis.set(key("auth", "snapshot", str(user_id)), "snapshot")
+async def seed_refresh_tokens(redis: RecordingRedis, user_id: int) -> None:
     await redis.set(key("auth", "refresh", str(user_id), "device-a"), "refresh-a")
     await redis.set(key("auth", "refresh", str(user_id), "device-b"), "refresh-b")
 
 
-def assert_session_state_cleared(redis: RecordingRedis, user_id: int) -> None:
-    assert key("auth", "snapshot", str(user_id)) not in redis.values
+def assert_refresh_tokens_cleared(redis: RecordingRedis, user_id: int) -> None:
     prefix = key("auth", "refresh", str(user_id), "")
     assert not any(name.startswith(prefix) for name in redis.values)
 
@@ -623,7 +544,7 @@ async def test_role_change_bumps_token_version_and_clears_sessions(
     caller = await add_user(session, role=role)
     target = await add_user(session)
     assigned_role = await add_role(session)
-    await seed_session_state(redis, target.id)
+    await seed_refresh_tokens(redis, target.id)
 
     updated = await assign_user_role(
         session,
@@ -635,7 +556,7 @@ async def test_role_change_bumps_token_version_and_clears_sessions(
 
     assert updated.role_id == assigned_role.id
     assert updated.token_version == 1
-    assert_session_state_cleared(redis, target.id)
+    assert_refresh_tokens_cleared(redis, target.id)
 
 
 async def test_department_change_bumps_token_version(
@@ -646,7 +567,7 @@ async def test_department_change_bumps_token_version(
     caller = await add_user(session, role=role)
     target = await add_user(session)
     department = await add_department(session)
-    await seed_session_state(redis, target.id)
+    await seed_refresh_tokens(redis, target.id)
 
     updated = await assign_user_department(
         session,
@@ -658,7 +579,7 @@ async def test_department_change_bumps_token_version(
 
     assert updated.department_id == department.id
     assert updated.token_version == 1
-    assert_session_state_cleared(redis, target.id)
+    assert_refresh_tokens_cleared(redis, target.id)
 
 
 async def test_status_change_bumps_token_version_and_clears_sessions(
@@ -668,7 +589,7 @@ async def test_status_change_bumps_token_version_and_clears_sessions(
     role = await add_role(session)
     caller = await add_user(session, role=role)
     target = await add_user(session)
-    await seed_session_state(redis, target.id)
+    await seed_refresh_tokens(redis, target.id)
 
     updated = await update_user_status(
         session,
@@ -680,7 +601,7 @@ async def test_status_change_bumps_token_version_and_clears_sessions(
 
     assert updated.status == UserStatus.DISABLED
     assert updated.token_version == 1
-    assert_session_state_cleared(redis, target.id)
+    assert_refresh_tokens_cleared(redis, target.id)
 
 
 def test_assignable_role_sets_respect_enabled_and_super_admin() -> None:
@@ -776,14 +697,14 @@ async def test_non_super_admin_cannot_update_or_delete_super_admin_role(
     assert super_admin.description is None
 
 
-async def test_password_reset_bumps_epoch_and_invalidates_sessions(
+async def test_password_reset_bumps_token_version_and_clears_refresh_tokens(
     session: AsyncSession,
     redis: RecordingRedis,
 ) -> None:
     role = await add_role(session)
     caller = await add_user(session, role=role)
     target = await add_user(session, role=role)
-    await seed_session_state(redis, target.id)
+    await seed_refresh_tokens(redis, target.id)
 
     reset = await reset_user_password(
         session,
@@ -794,11 +715,7 @@ async def test_password_reset_bumps_epoch_and_invalidates_sessions(
     )
 
     assert reset.token_version == 1
-    assert redis.values[key("auth", "epoch", str(target.id))] == "1"
-    assert redis.expirations[key("auth", "epoch", str(target.id))] == (
-        auth_service.AUTH_EPOCH_TTL_SECONDS
-    )
-    assert_session_state_cleared(redis, target.id)
+    assert_refresh_tokens_cleared(redis, target.id)
 
 
 async def test_non_super_admin_cannot_reset_local_emergency_superadmin_password(
@@ -860,55 +777,143 @@ async def test_non_super_admin_cannot_reset_local_emergency_superadmin_password(
     assert error.value.code == ErrorCode.INVALID_CREDENTIALS
 
 
-async def test_invalidation_failure_rolls_back_department_change(
+async def test_refresh_cleanup_failure_does_not_rollback_security_change(
     session: AsyncSession,
-) -> None:
-    role = await add_role(session)
-    caller = await add_user(session, role=role)
-    target = await add_user(session)
-    department = await add_department(session)
-
-    with pytest.raises(BusinessError) as error:
-        await assign_user_department(
-            session,
-            target.id,
-            UserDepartmentUpdate(department_id=department.id),
-            context=context_for(caller, role),
-            redis=FailingRedis(),
-        )
-
-    assert error.value.code == ErrorCode.INTERNAL_ERROR
-    assert error.value.http_status == 503
-    assert "roll" in error.value.message.lower()
-    await session.refresh(target)
-    assert target.department_id is None
-    assert target.token_version == 0
-
-
-async def test_role_change_and_token_bump_are_in_one_transaction_before_invalidation(
-    session: AsyncSession,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     role = await add_role(session)
     caller = await add_user(session, role=role)
     target = await add_user(session)
     assigned_role = await add_role(session)
-    assigned_role_id = assigned_role.id
-    inspecting_redis = InspectingFailingRedis(session, target.id)
 
-    with pytest.raises(BusinessError) as error:
+    updated = await assign_user_role(
+        session,
+        target.id,
+        UserRoleUpdate(role_id=assigned_role.id),
+        context=context_for(caller, role),
+        redis=RefreshCleanupFailingRedis(),
+    )
+
+    assert updated.role_id == assigned_role.id
+    assert updated.token_version == 1
+    assert "Post-commit refresh token invalidation failed" in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["role", "department"])
+async def test_security_change_rejects_old_access_token_and_accepts_new_one(
+    session: AsyncSession,
+    operation: str,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session, role=role)
+    redis = RecordingRedis()
+    old_tokens = await auth_service.issue_token_pair(
+        redis,
+        target,
+        device_id="before-change",
+    )
+    before = await get_current_context(
+        session=session,
+        authorization=f"Bearer {old_tokens.access_token}",
+    )
+    assert before.user_id == target.id
+
+    if operation == "role":
+        assigned_role = await add_role(session)
         await assign_user_role(
             session,
             target.id,
-            UserRoleUpdate(role_id=assigned_role_id),
+            UserRoleUpdate(role_id=assigned_role.id),
             context=context_for(caller, role),
-            redis=inspecting_redis,
+            redis=redis,
+        )
+    else:
+        department = await add_department(session)
+        await assign_user_department(
+            session,
+            target.id,
+            UserDepartmentUpdate(department_id=department.id),
+            context=context_for(caller, role),
+            redis=redis,
         )
 
-    assert error.value.code == ErrorCode.INTERNAL_ERROR
-    assert inspecting_redis.observed == (assigned_role_id, 1)
+    with pytest.raises(BusinessError) as error:
+        await get_current_context(
+            session=session,
+            authorization=f"Bearer {old_tokens.access_token}",
+        )
+    assert error.value.code == ErrorCode.TOKEN_EXPIRED
+
     await session.refresh(target)
-    assert target.role_id is None
-    assert target.token_version == 0
+    new_tokens = await auth_service.issue_token_pair(
+        redis,
+        target,
+        device_id="after-change",
+    )
+    context = await get_current_context(
+        session=session,
+        authorization=f"Bearer {new_tokens.access_token}",
+    )
+    assert context.user_id == target.id
+
+
+async def test_disabled_user_existing_access_token_is_rejected(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session, role=role)
+    redis = RecordingRedis()
+    tokens = await auth_service.issue_token_pair(redis, target)
+
+    await update_user_status(
+        session,
+        target.id,
+        UserStatusUpdate(status=UserStatus.DISABLED),
+        context=context_for(caller, role),
+        redis=redis,
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await get_current_context(
+            session=session,
+            authorization=f"Bearer {tokens.access_token}",
+        )
+    assert error.value.code == ErrorCode.ACCOUNT_DISABLED
+
+
+async def test_token_issued_after_status_change_works(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session, role=role)
+    redis = RecordingRedis()
+
+    await update_user_status(
+        session,
+        target.id,
+        UserStatusUpdate(status=UserStatus.DISABLED),
+        context=context_for(caller, role),
+        redis=redis,
+    )
+    await update_user_status(
+        session,
+        target.id,
+        UserStatusUpdate(status=UserStatus.ACTIVE),
+        context=context_for(caller, role),
+        redis=redis,
+    )
+    await session.refresh(target)
+    tokens = await auth_service.issue_token_pair(redis, target)
+
+    context = await get_current_context(
+        session=session,
+        authorization=f"Bearer {tokens.access_token}",
+    )
+
+    assert context.user_id == target.id
 
 
 async def test_non_super_admin_cannot_revoke_super_admin(
@@ -937,96 +942,6 @@ async def test_non_super_admin_cannot_revoke_super_admin(
     assert error.value.http_status == 403
     await session.refresh(target)
     assert target.role_id == super_admin.id
-
-
-async def test_aba_reader_cannot_persist_stale_snapshot_after_mutation(
-    session: AsyncSession,
-) -> None:
-    role = await add_role(session)
-    caller = await add_user(session, role=role)
-    target = await add_user(session, role=role)
-    assigned_role = await add_role(session)
-    snapshot_key = key("auth", "snapshot", str(target.id))
-    epoch_key = key("auth", "epoch", str(target.id))
-    redis = BlockingEpochRedis(session)
-    await redis.set(
-        epoch_key,
-        "0",
-        ex=auth_service.AUTH_EPOCH_TTL_SECONDS,
-    )
-    reader_task = asyncio.create_task(
-        auth_service.get_auth_snapshot(session, redis, target.id)
-    )
-
-    await asyncio.wait_for(redis.reader_ready_to_write.wait(), timeout=2)
-    updated = await assign_user_role(
-        session,
-        target.id,
-        UserRoleUpdate(role_id=assigned_role.id),
-        context=context_for(caller, role),
-        redis=redis,
-    )
-    redis.release_reader.set()
-    stale_reader_snapshot = await asyncio.wait_for(reader_task, timeout=2)
-
-    assert stale_reader_snapshot.role_id == role.id
-    assert redis.epoch_increment_in_transaction is False
-    assert redis.values[epoch_key] == "1"
-    assert snapshot_key not in redis.values
-
-    fresh_snapshot = await auth_service.get_auth_snapshot(session, redis, target.id)
-    assert fresh_snapshot.role_id == assigned_role.id
-    assert fresh_snapshot.token_version == updated.token_version
-    assert snapshot_key in redis.values
-
-
-async def test_missing_epoch_does_not_create_snapshot_cache_entry(
-    session: AsyncSession,
-) -> None:
-    role = await add_role(session)
-    user = await add_user(session, role=role)
-    redis = RecordingRedis()
-    snapshot_key = key("auth", "snapshot", str(user.id))
-    epoch_key = key("auth", "epoch", str(user.id))
-
-    snapshot = await auth_service.get_auth_snapshot(session, redis, user.id)
-
-    assert snapshot.role_id == role.id
-    assert epoch_key not in redis.values
-    assert snapshot_key not in redis.values
-
-
-async def test_post_commit_delete_failure_epoch_blocks_stale_snapshot(
-    session: AsyncSession,
-) -> None:
-    role = await add_role(session)
-    caller = await add_user(session, role=role)
-    target = await add_user(session, role=role)
-    assigned_role = await add_role(session)
-    snapshot_key = key("auth", "snapshot", str(target.id))
-    epoch_key = key("auth", "epoch", str(target.id))
-    stale_snapshot = auth_service.AuthSnapshot(
-        status=target.status,
-        token_version=target.token_version,
-        role_id=target.role_id,
-        department_id=target.department_id,
-    ).to_cache()
-    redis = PostCommitDeleteFailingRedis(snapshot_key, stale_snapshot)
-
-    updated = await assign_user_role(
-        session,
-        target.id,
-        UserRoleUpdate(role_id=assigned_role.id),
-        context=context_for(caller, role),
-        redis=redis,
-    )
-    snapshot = await auth_service.get_auth_snapshot(session, redis, target.id)
-
-    assert updated.role_id == assigned_role.id
-    assert redis.values[epoch_key] == "1"
-    assert snapshot.role_id == assigned_role.id
-    assert snapshot.token_version == updated.token_version
-    assert snapshot_key in redis.values
 
 
 async def test_target_visibility_uses_dept_child_and_custom_semantics(

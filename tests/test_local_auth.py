@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -102,13 +101,6 @@ class FakeRedis:
         keys = args[:numkeys]
         values = args[numkeys:]
 
-        if "local epoch" in script:
-            epoch_key = keys[0]
-            epoch = int(self.values.get(epoch_key, "0")) + 1
-            self.values[epoch_key] = str(epoch)
-            self.expirations[epoch_key] = int(values[0])
-            return epoch
-
         if "redis.call('INCR'" in script:
             ttl = int(values[0])
             threshold = int(values[1])
@@ -121,15 +113,6 @@ class FakeRedis:
                 if count > threshold:
                     exceeded = 1
             return exceeded
-
-        if "local current_epoch" in script:
-            epoch_key, snapshot_key = keys
-            current_epoch = self.values.get(epoch_key, "0")
-            if current_epoch != values[0]:
-                return 0
-            self.values[snapshot_key] = values[1]
-            self.expirations[snapshot_key] = int(values[2])
-            return 1
 
         if len(keys) != 1:
             raise NotImplementedError
@@ -462,55 +445,33 @@ async def test_access_token_rejected_after_token_version_bump(
     assert response.json()["code"] == ErrorCode.TOKEN_EXPIRED
 
 
-async def test_auth_snapshot_cache_is_populated_and_invalidated(
+async def test_authentication_reads_database_without_authorization_cache(
     client: AsyncClient,
     session: AsyncSession,
     fake_redis: FakeRedis,
 ) -> None:
-    username = unique_username("snapshot")
+    username = unique_username("database-authority")
     user = await create_local_user(
         session,
         UserCreate(username=username, password="password"),
     )
     login_response = await login(client, username, "password")
     access_token = login_response.json()["data"]["access_token"]
-    snapshot_key = key("auth", "snapshot", str(user.id))
-    epoch_key = key("auth", "epoch", str(user.id))
-    await fake_redis.set(
-        epoch_key,
-        "7",
-        ex=auth_service.AUTH_EPOCH_TTL_SECONDS,
+
+    context = await get_current_context(
+        session=session,
+        authorization=f"Bearer {access_token}",
     )
 
-    response = await client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-
-    assert response.status_code == 200
-    raw_snapshot = await fake_redis.get(snapshot_key)
-    assert raw_snapshot is not None
-    snapshot = json.loads(raw_snapshot)
-    assert snapshot == {
-        "status": UserStatus.ACTIVE.value,
-        "token_version": user.token_version,
-        "role_id": None,
-        "department_id": None,
-        "epoch": "7",
-    }
-    assert fake_redis.expirations[snapshot_key] == 600
-    assert fake_redis.expirations[epoch_key] == auth_service.AUTH_EPOCH_TTL_SECONDS
-
-    await auth_service.invalidate_auth_snapshot(fake_redis, user.id)
-
-    assert await fake_redis.get(snapshot_key) is None
+    assert context.user_id == user.id
+    assert all("snapshot" not in name for name in fake_redis.values)
+    assert all("epoch" not in name for name in fake_redis.values)
 
 
 @pytest.mark.parametrize("role_kind", ["missing", "disabled"])
 async def test_disabled_or_missing_role_degrades_to_self_without_permissions(
     client: AsyncClient,
     session: AsyncSession,
-    fake_redis: FakeRedis,
     role_kind: str,
 ) -> None:
     username = unique_username(f"degraded-{role_kind}")
@@ -538,7 +499,6 @@ async def test_disabled_or_missing_role_degrades_to_self_without_permissions(
 
     context = await get_current_context(
         session=session,
-        redis=fake_redis,
         authorization=f"Bearer {access_token}",
     )
 
