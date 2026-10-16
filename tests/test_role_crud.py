@@ -1,10 +1,13 @@
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.dialects import mysql
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.errors import BusinessError, ErrorCode
@@ -56,6 +59,14 @@ async def session() -> AsyncIterator[AsyncSession]:
             await test_session.close()
             await transaction.rollback()
     await engine.dispose()
+
+
+class _RecordingScalarSession:
+    statement: Any = None
+
+    async def scalar(self, statement: Any) -> None:
+        self.statement = statement
+        return None
 
 
 async def add_role(
@@ -134,6 +145,35 @@ async def test_duplicate_role_code_conflicts(session: AsyncSession) -> None:
     assert error.value.http_status == 409
 
 
+@pytest.mark.parametrize("code", ["super_admin", "default"])
+async def test_create_role_rejects_reserved_system_code(
+    session: AsyncSession,
+    code: str,
+) -> None:
+    with pytest.raises(BusinessError) as error:
+        await create_role(session, RoleCreate(code=code, name="保留角色"))
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.http_status == 409
+    assert await role_repository.get_by_code(session, code) is None
+
+
+@pytest.mark.parametrize("code", ["super_admin", "default"])
+async def test_update_role_rejects_reserved_system_code(
+    session: AsyncSession,
+    code: str,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+
+    with pytest.raises(BusinessError) as error:
+        await update_role(session, role.id, RoleUpdate(code=code))
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.http_status == 409
+    loaded = await get_role(session, role.id)
+    assert loaded.code == "operator"
+
+
 async def test_system_role_cannot_be_deleted(session: AsyncSession) -> None:
     role = await add_role(
         session,
@@ -195,14 +235,116 @@ async def test_assign_menus_replaces_previous_set(session: AsyncSession) -> None
     )
 
     await assign_role_menus(session, role.id, [user_update.id])
-    assert await list_role_permission_codes(session, role) == frozenset(
-        {"user:update"}
-    )
+    assert await list_role_permission_codes(session, role) == frozenset({"user:update"})
 
     result = await session.scalars(
         select(RoleMenu.c.menu_id).where(RoleMenu.c.role_id == role.id)
     )
     assert set(result.all()) == {user_update.id}
+
+
+@pytest.mark.asyncio
+async def test_lock_role_by_id_uses_for_update_query() -> None:
+    recording = _RecordingScalarSession()
+
+    await role_repository.lock_by_id(
+        cast(AsyncSession, recording),
+        10,
+    )
+
+    compiled = str(
+        recording.statement.compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "`role`.id = 10" in compiled
+    assert "FOR UPDATE" in compiled
+
+
+async def test_assign_menus_locks_role_before_replacement(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+    original_lock = role_repository.lock_by_id
+    original_replace = role_repository.replace_role_menus
+    events: list[str] = []
+
+    async def record_lock(
+        lock_session: AsyncSession,
+        role_id: int,
+    ) -> Role | None:
+        events.append("lock")
+        return await original_lock(lock_session, role_id)
+
+    async def record_replace(
+        replace_session: AsyncSession,
+        role_id: int,
+        menu_ids: set[int],
+    ) -> None:
+        events.append("replace")
+        await original_replace(replace_session, role_id, menu_ids)
+
+    monkeypatch.setattr(role_repository, "lock_by_id", record_lock)
+    monkeypatch.setattr(role_repository, "replace_role_menus", record_replace)
+
+    await assign_role_menus(session, role.id, [])
+
+    assert events == ["lock", "replace"]
+
+
+async def test_assign_menus_maps_deadlock_to_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+
+    async def deadlock(
+        _session: AsyncSession,
+        _role_id: int,
+    ) -> Role | None:
+        raise OperationalError(
+            "SELECT",
+            {},
+            Exception(1213, "Deadlock found when trying to get lock"),
+        )
+
+    monkeypatch.setattr(role_repository, "lock_by_id", deadlock)
+
+    with pytest.raises(BusinessError) as error:
+        await assign_role_menus(session, role.id, [])
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.http_status == 409
+    assert "稍后重试" in error.value.message
+
+
+async def test_assign_menus_maps_duplicate_key_to_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+
+    async def duplicate(
+        _session: AsyncSession,
+        _role_id: int,
+        _menu_ids: set[int],
+    ) -> None:
+        raise IntegrityError(
+            "INSERT",
+            {},
+            Exception(1062, "Duplicate entry '1-2' for key 'role_menu.PRIMARY'"),
+        )
+
+    monkeypatch.setattr(role_repository, "replace_role_menus", duplicate)
+
+    with pytest.raises(BusinessError) as error:
+        await assign_role_menus(session, role.id, [])
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.http_status == 409
+    assert "稍后重试" in error.value.message
 
 
 async def test_disabled_role_yields_empty_permission_codes(
@@ -258,9 +400,7 @@ async def test_super_admin_permissions_come_from_all_enabled_menus(
         MenuUpdate(status=MenuStatus.DISABLED),
     )
 
-    assert await list_role_permission_codes(session, role) == frozenset(
-        {"user:read"}
-    )
+    assert await list_role_permission_codes(session, role) == frozenset({"user:read"})
     assert active.permission_code == "user:read"
 
 
@@ -281,9 +421,7 @@ async def test_newly_added_menu_is_automatically_in_super_admin(
             permission_code="user:read",
         ),
     )
-    assert await list_role_permission_codes(session, role) == frozenset(
-        {"user:read"}
-    )
+    assert await list_role_permission_codes(session, role) == frozenset({"user:read"})
 
     await create_menu(
         session,
@@ -369,6 +507,76 @@ async def test_set_custom_data_scope_persists_valid_departments(
         )
     )
     assert set(result.all()) == {first.id, second.id}
+
+
+async def test_set_data_scope_locks_role_before_replacement(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+    original_lock = role_repository.lock_by_id
+    original_replace = role_repository.replace_role_departments
+    events: list[str] = []
+
+    async def record_lock(
+        lock_session: AsyncSession,
+        role_id: int,
+    ) -> Role | None:
+        events.append("lock")
+        return await original_lock(lock_session, role_id)
+
+    async def record_replace(
+        replace_session: AsyncSession,
+        role_id: int,
+        department_ids: Iterable[int],
+    ) -> None:
+        events.append("replace")
+        await original_replace(replace_session, role_id, department_ids)
+
+    monkeypatch.setattr(role_repository, "lock_by_id", record_lock)
+    monkeypatch.setattr(
+        role_repository,
+        "replace_role_departments",
+        record_replace,
+    )
+
+    await set_role_data_scope(
+        session,
+        role.id,
+        RoleDataScopeUpdate(data_scope=DataScope.SELF),
+    )
+
+    assert events == ["lock", "replace"]
+
+
+async def test_set_data_scope_maps_lock_timeout_to_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+
+    async def lock_timeout(
+        _session: AsyncSession,
+        _role_id: int,
+    ) -> Role | None:
+        raise OperationalError(
+            "SELECT",
+            {},
+            Exception(1205, "Lock wait timeout exceeded"),
+        )
+
+    monkeypatch.setattr(role_repository, "lock_by_id", lock_timeout)
+
+    with pytest.raises(BusinessError) as error:
+        await set_role_data_scope(
+            session,
+            role.id,
+            RoleDataScopeUpdate(data_scope=DataScope.SELF),
+        )
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.http_status == 409
+    assert "稍后重试" in error.value.message
 
 
 async def test_custom_data_scope_rejects_system_department(

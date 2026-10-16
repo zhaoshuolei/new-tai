@@ -16,6 +16,17 @@ async def get_by_id(session: AsyncSession, role_id: int) -> Role | None:
     return await session.get(Role, role_id)
 
 
+async def lock_by_id(session: AsyncSession, role_id: int) -> Role | None:
+    """按主键锁定角色行，供整集合替换串行化使用。"""
+    statement = (
+        select(Role)
+        .where(Role.id == role_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return await session.scalar(statement)
+
+
 async def get_by_code(session: AsyncSession, code: str) -> Role | None:
     statement = select(Role).where(Role.code == code)
     return await session.scalar(statement)
@@ -66,10 +77,7 @@ async def replace_role_menus(
     if menu_ids:
         await session.execute(
             insert(RoleMenu),
-            [
-                {"role_id": role_id, "menu_id": menu_id}
-                for menu_id in sorted(menu_ids)
-            ],
+            [{"role_id": role_id, "menu_id": menu_id} for menu_id in sorted(menu_ids)],
         )
 
 
@@ -109,9 +117,10 @@ def _user_table_is_defined() -> bool:
 
 
 async def has_users(session: AsyncSession, role_id: int) -> bool:
-    # TODO（Task 9 用户模型与本地账号 CRUD）：当前任务阶段 user 表尚未创建。
-    # 后续用户任务必须保留 role_id 外键 ON DELETE RESTRICT，并将约束冲突
-    # 映射为 ROLE_IN_USE=3002。
+    # TODO（Task 9 用户模型与本地账号 CRUD）：当前 user 表尚未创建，这里是
+    # ROLE_IN_USE 的临时守卫。Task 9 必须替换为真实 User.role_id 外键
+    # ON DELETE RESTRICT，将外键删除异常映射为 ROLE_IN_USE=3002，并补充
+    # “删除被用户引用的角色失败”的真实数据库集成测试。
     if not _user_table_is_defined():
         return False
 
@@ -141,6 +150,7 @@ __all__: tuple[str, ...] = (
     "list_assigned_permission_codes",
     "list_departments_by_ids",
     "list_menus_by_ids",
+    "lock_by_id",
     "replace_role_departments",
     "replace_role_menus",
 )

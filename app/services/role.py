@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import NoReturn
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
@@ -15,9 +15,13 @@ from app.services import menu as menu_service
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset({"code", "name", "status"})
 _SUPER_ADMIN_IMMUTABLE_UPDATE_FIELDS = frozenset({"code", "name", "status"})
+# 种子初始化依赖这些代码；普通角色不得抢占。
+_RESERVED_SYSTEM_ROLE_CODES = frozenset({"super_admin", "default"})
 
 
-def _mysql_error_number(error: IntegrityError) -> int | None:
+def _mysql_error_number(
+    error: IntegrityError | OperationalError,
+) -> int | None:
     args = getattr(error.orig, "args", ())
     if args and isinstance(args[0], int):
         return args[0]
@@ -35,10 +39,26 @@ def _raise_mapped_integrity_error(error: IntegrityError) -> NoReturn:
             "Role code already exists",
             http_status=409,
         )
+    if error_number == 1062:
+        raise BusinessError(
+            ErrorCode.CONFLICT,
+            "角色授权正在被并发修改，请稍后重试",
+            http_status=409,
+        )
     if error_number == 1451 and "foreign key" in message and "`user`" in message:
         raise BusinessError(
             ErrorCode.ROLE_IN_USE,
             "Role is in use",
+        )
+    raise error
+
+
+def _raise_mapped_operational_error(error: OperationalError) -> NoReturn:
+    if _mysql_error_number(error) in {1205, 1213}:
+        raise BusinessError(
+            ErrorCode.CONFLICT,
+            "角色授权正在被并发修改，请稍后重试",
+            http_status=409,
         )
     raise error
 
@@ -50,6 +70,9 @@ async def _map_role_write_errors(session: AsyncSession) -> AsyncIterator[None]:
     except IntegrityError as error:
         await session.rollback()
         _raise_mapped_integrity_error(error)
+    except OperationalError as error:
+        await session.rollback()
+        _raise_mapped_operational_error(error)
 
 
 async def get_role(session: AsyncSession, role_id: int) -> Role:
@@ -61,6 +84,33 @@ async def get_role(session: AsyncSession, role_id: int) -> Role:
             http_status=404,
         )
     return role
+
+
+async def _get_role_for_update(session: AsyncSession, role_id: int) -> Role:
+    # 同一角色的整集合覆盖先按主键 FOR UPDATE 串行化；菜单/部门校验和
+    # DELETE+INSERT 必须在同一事务内完成，避免并发 PUT 交叉替换。
+    role = await role_repository.lock_by_id(session, role_id)
+    if role is None:
+        raise BusinessError(
+            ErrorCode.ROLE_NOT_FOUND,
+            "Role not found",
+            http_status=404,
+        )
+    return role
+
+
+def _ensure_role_code_is_not_reserved(
+    code: str,
+    *,
+    is_system: bool,
+    current_code: str | None,
+) -> None:
+    if code in _RESERVED_SYSTEM_ROLE_CODES and not (is_system and current_code == code):
+        raise BusinessError(
+            ErrorCode.CONFLICT,
+            "Role code is reserved for a system role",
+            http_status=409,
+        )
 
 
 async def _ensure_role_code_available(
@@ -80,6 +130,11 @@ async def _ensure_role_code_available(
 
 async def create_role(session: AsyncSession, payload: RoleCreate) -> Role:
     async with _map_role_write_errors(session):
+        _ensure_role_code_is_not_reserved(
+            payload.code,
+            is_system=False,
+            current_code=None,
+        )
         await _ensure_role_code_available(session, payload.code)
         role = Role(
             code=payload.code,
@@ -124,6 +179,11 @@ async def update_role(
                 )
 
         new_code = changes.get("code", role.code)
+        _ensure_role_code_is_not_reserved(
+            new_code,
+            is_system=role.is_system,
+            current_code=role.code,
+        )
         await _ensure_role_code_available(
             session,
             new_code,
@@ -162,7 +222,7 @@ async def assign_role_menus(
     menu_ids: list[int],
 ) -> Role:
     async with _map_role_write_errors(session):
-        role = await get_role(session, role_id)
+        role = await _get_role_for_update(session, role_id)
         unique_menu_ids = set(menu_ids)
 
         if role.code == "super_admin" and role.is_system:
@@ -194,7 +254,7 @@ async def set_role_data_scope(
     payload: RoleDataScopeUpdate,
 ) -> Role:
     async with _map_role_write_errors(session):
-        role = await get_role(session, role_id)
+        role = await _get_role_for_update(session, role_id)
 
         if role.code == "super_admin" and role.is_system:
             if payload.data_scope != DataScope.ALL or payload.department_ids:
@@ -239,9 +299,7 @@ async def set_role_data_scope(
         await role_repository.replace_role_departments(
             session,
             role.id,
-            unique_department_ids
-            if payload.data_scope == DataScope.CUSTOM
-            else set(),
+            unique_department_ids if payload.data_scope == DataScope.CUSTOM else set(),
         )
         await session.commit()
         await session.refresh(role)
