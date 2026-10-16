@@ -148,6 +148,9 @@ async def test_denied_audit_survives_rollback(session: AsyncSession) -> None:
         await op(session, context=SUPER_ADMIN_CONTEXT, user_id=7)
 
     await session.rollback()
+    ghost_users = await session.scalars(select(User).where(User.username == "ghost"))
+    assert ghost_users.all() == []
+
     row = (await session.scalars(select(AuditLog))).one()
     assert row.result is AuditResult.DENIED
     assert row.reason == "LAST_SUPER_ADMIN"
