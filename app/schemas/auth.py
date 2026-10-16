@@ -19,6 +19,12 @@ class LoginRequest(BaseModel):
     )
 
 
+class FeishuLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=2048)
+
+
 class RefreshRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -52,6 +58,7 @@ class CurrentUserRead(UserRead):
 
 __all__: tuple[str, ...] = (
     "CurrentUserRead",
+    "FeishuLoginRequest",
     "LoginRead",
     "LoginRequest",
     "LogoutRequest",

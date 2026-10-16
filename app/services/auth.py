@@ -13,13 +13,15 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.clients.feishu import FeishuClient, FeishuUserInfo
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import key
 from app.core.redis import redis_client as default_redis_client
 from app.core.security import create_access_token, verify_password
-from app.models.role import DataScope, RoleDepartment, RoleStatus
+from app.models.department import Department
+from app.models.role import DataScope, Role, RoleDepartment, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
@@ -297,6 +299,89 @@ async def login_local_user(
     return LoginResult(tokens=tokens, user=user)
 
 
+async def _get_pending_department(session: AsyncSession) -> Department:
+    statement = select(Department).where(Department.is_system.is_(True))
+    department = await session.scalar(statement)
+    if department is None:
+        raise BusinessError(
+            ErrorCode.INTERNAL_ERROR,
+            "Pending assignment department is not configured",
+            http_status=500,
+        )
+    return department
+
+
+async def _get_default_role(session: AsyncSession) -> Role:
+    role = await role_repository.get_by_code(session, "default")
+    if role is None:
+        raise BusinessError(
+            ErrorCode.INTERNAL_ERROR,
+            "Default role is not configured",
+            http_status=500,
+        )
+    return role
+
+
+def _sync_feishu_profile(
+    user: User,
+    info: FeishuUserInfo,
+    *,
+    login_at: datetime,
+) -> None:
+    if not user.nickname and info.name:
+        user.nickname = info.name
+    if not user.email and info.email:
+        user.email = info.email
+    user.avatar = info.avatar_url
+    user.last_login_at = login_at
+
+
+async def login_with_feishu(
+    session: AsyncSession,
+    redis: Redis,
+    code: str,
+    *,
+    client: FeishuClient | None = None,
+) -> tuple[str, str, User]:
+    feishu_client = client or FeishuClient()
+    user_access_token = await feishu_client.exchange_code(code)
+    info = await feishu_client.get_user_info(user_access_token)
+
+    statement = select(User).where(User.feishu_open_id == info.open_id)
+    user = await session.scalar(statement)
+    login_at = datetime.now(UTC).replace(tzinfo=None)
+
+    if user is None:
+        pending_department = await _get_pending_department(session)
+        default_role = await _get_default_role(session)
+        user = User(
+            feishu_open_id=info.open_id,
+            username=None,
+            password_hash=None,
+            nickname=info.name,
+            email=info.email,
+            avatar=info.avatar_url,
+            department_id=pending_department.id,
+            role_id=default_role.id,
+            status=UserStatus.ACTIVE,
+            last_login_at=login_at,
+        )
+        session.add(user)
+    else:
+        if user.status == UserStatus.DISABLED:
+            raise BusinessError(
+                ErrorCode.ACCOUNT_DISABLED,
+                "Account disabled",
+                http_status=401,
+            )
+        _sync_feishu_profile(user, info, login_at=login_at)
+
+    await session.commit()
+    await session.refresh(user)
+    tokens = await issue_token_pair(redis, user)
+    return tokens.access_token, tokens.refresh_token, user
+
+
 async def rotate_refresh_token(
     session: AsyncSession,
     redis: Redis,
@@ -449,6 +534,7 @@ __all__: tuple[str, ...] = (
     "invalidate_refresh_tokens",
     "issue_token_pair",
     "login_local_user",
+    "login_with_feishu",
     "logout_refresh_token",
     "rotate_refresh_token",
 )

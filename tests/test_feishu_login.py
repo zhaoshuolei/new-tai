@@ -1,0 +1,449 @@
+import os
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import parse_qsl
+from uuid import uuid4
+
+import httpx
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+from app.clients.feishu import (
+    FEISHU_TOKEN_URL,
+    FEISHU_USER_INFO_URL,
+    FeishuClient,
+    FeishuUserInfo,
+    get_feishu_client,
+)
+from app.core.config import settings
+from app.core.errors import BusinessError, ErrorCode
+from app.core.redis import get_redis
+from app.db.session import get_session
+from app.main import create_app
+from app.models.department import Department, DepartmentStatus
+from app.models.role import DataScope, Role, RoleStatus
+from app.models.user import User, UserStatus
+from app.services import auth as auth_service
+
+TEST_DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
+
+
+class FakeFeishuClient(FeishuClient):
+    def __init__(
+        self,
+        *,
+        open_id: str | None = None,
+        name: str = "Feishu User",
+        avatar_url: str = "https://example.com/avatar.png",
+        email: str | None = "feishu@example.com",
+    ) -> None:
+        self.open_id = open_id or f"ou-{uuid4().hex}"
+        self.name = name
+        self.avatar_url = avatar_url
+        self.email = email
+
+    async def exchange_code(self, code: str) -> str:
+        assert code == "valid-code"
+        return "user-access-token"
+
+    async def get_user_info(self, user_access_token: str) -> FeishuUserInfo:
+        assert user_access_token == "user-access-token"
+        return FeishuUserInfo(
+            open_id=self.open_id,
+            name=self.name,
+            avatar_url=self.avatar_url,
+            email=self.email,
+        )
+
+
+@pytest_asyncio.fixture
+async def session() -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        test_session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield test_session
+        finally:
+            await test_session.close()
+            await transaction.rollback()
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def feishu_defaults(
+    session: AsyncSession,
+) -> tuple[Department, Role]:
+    pending = Department(
+        name="待分配",
+        path="/1/",
+        status=DepartmentStatus.ACTIVE,
+        is_system=True,
+    )
+    default_role = Role(
+        code="default",
+        name="默认角色",
+        data_scope=DataScope.SELF,
+        data_scope_include_children=False,
+        is_system=True,
+        status=RoleStatus.ACTIVE,
+    )
+    session.add_all([pending, default_role])
+    await session.commit()
+    await session.refresh(pending)
+    await session.refresh(default_role)
+    return pending, default_role
+
+
+@pytest.fixture(autouse=True)
+def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jwt_secret", "test-secret-" + "x" * 32)
+
+
+@pytest_asyncio.fixture
+async def client(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> AsyncIterator[AsyncClient]:
+    application = create_app()
+    feishu_client = FakeFeishuClient(open_id="ou-api-login")
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_redis] = lambda: fake_redis
+    application.dependency_overrides[get_feishu_client] = lambda: feishu_client
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        application.dependency_overrides.clear()
+
+
+async def _add_existing_user(
+    session: AsyncSession,
+    *,
+    open_id: str,
+    nickname: str | None = None,
+    email: str | None = None,
+    avatar: str | None = None,
+    last_login_at: datetime | None = None,
+) -> User:
+    user = User(
+        feishu_open_id=open_id,
+        nickname=nickname,
+        email=email,
+        avatar=avatar,
+        status=UserStatus.ACTIVE,
+        last_login_at=last_login_at,
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def test_first_login_auto_provisions_user(
+    session: AsyncSession,
+    fake_redis: Any,
+    feishu_defaults: tuple[Department, Role],
+) -> None:
+    pending, default_role = feishu_defaults
+    feishu_client = FakeFeishuClient(open_id="ou-first-login")
+
+    access_token, refresh_token, user = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=feishu_client,
+    )
+
+    assert access_token
+    assert refresh_token
+    assert user.id is not None
+    assert user.feishu_open_id == "ou-first-login"
+    assert user.department_id == pending.id
+    assert user.role_id == default_role.id
+    assert user.last_login_at is not None
+
+
+async def test_new_user_lands_in_pending_department_with_default_role(
+    session: AsyncSession,
+    fake_redis: Any,
+    feishu_defaults: tuple[Department, Role],
+) -> None:
+    pending, default_role = feishu_defaults
+
+    _, _, user = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(open_id="ou-provisioned"),
+    )
+
+    assert user.department_id == pending.id
+    assert user.role_id == default_role.id
+    assert user.status == UserStatus.ACTIVE
+    assert user.username is None
+    assert user.password_hash is None
+
+
+async def test_existing_user_reuses_record_by_open_id(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    existing = await _add_existing_user(session, open_id="ou-existing")
+
+    _, _, user = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(open_id="ou-existing"),
+    )
+
+    count = await session.scalar(
+        select(func.count())
+        .select_from(User)
+        .where(User.feishu_open_id == "ou-existing")
+    )
+    assert user.id == existing.id
+    assert count == 1
+
+
+async def test_login_backfills_only_empty_profile_fields(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    user = await _add_existing_user(session, open_id="ou-backfill")
+
+    _, _, logged_in = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(
+            open_id="ou-backfill",
+            name="Filled Nickname",
+            email="filled@example.com",
+        ),
+    )
+
+    assert logged_in.id == user.id
+    assert logged_in.nickname == "Filled Nickname"
+    assert logged_in.email == "filled@example.com"
+
+
+async def test_admin_edited_nickname_is_not_overwritten(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    user = await _add_existing_user(
+        session,
+        open_id="ou-admin-edited",
+        nickname="Admin Edited",
+        email="admin-edited@example.com",
+    )
+
+    _, _, logged_in = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(
+            open_id="ou-admin-edited",
+            name="Feishu Name",
+            email="feishu-email@example.com",
+        ),
+    )
+
+    assert logged_in.id == user.id
+    assert logged_in.nickname == "Admin Edited"
+    assert logged_in.email == "admin-edited@example.com"
+
+
+async def test_avatar_and_last_login_always_refreshed(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    previous_login = datetime(2026, 1, 1)
+    user = await _add_existing_user(
+        session,
+        open_id="ou-refresh",
+        avatar="https://example.com/old.png",
+        last_login_at=previous_login,
+    )
+
+    _, _, logged_in = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(
+            open_id="ou-refresh",
+            avatar_url="https://example.com/new.png",
+        ),
+    )
+
+    assert logged_in.id == user.id
+    assert logged_in.avatar == "https://example.com/new.png"
+    assert logged_in.last_login_at is not None
+    assert logged_in.last_login_at > previous_login
+    assert logged_in.last_login_at.tzinfo is None
+    assert logged_in.last_login_at <= datetime.now(UTC).replace(tzinfo=None)
+
+
+async def test_disabled_user_login_returns_1002(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    user = await _add_existing_user(session, open_id="ou-disabled")
+    user.status = UserStatus.DISABLED
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client=FakeFeishuClient(open_id="ou-disabled"),
+        )
+
+    assert error.value.code == ErrorCode.ACCOUNT_DISABLED
+    assert error.value.http_status == 401
+
+
+async def test_feishu_error_response_maps_to_business_error() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "code": 20003,
+                "error": "invalid_grant",
+                "error_description": "authorization code not found",
+            },
+        )
+
+    feishu_client = FeishuClient(
+        transport=httpx.MockTransport(handler),
+        app_id="cli-test",
+        app_secret="secret",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await feishu_client.exchange_code("invalid-code")
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
+
+
+async def test_transport_error_maps_to_business_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    feishu_client = FeishuClient(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(BusinessError) as error:
+        await feishu_client.exchange_code("valid-code")
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
+
+
+async def test_exchange_code_uses_v3_endpoint_and_form_body() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"code": 0, "access_token": "user-access-token"},
+        )
+
+    feishu_client = FeishuClient(
+        transport=httpx.MockTransport(handler),
+        app_id="cli-test",
+        app_secret="secret",
+        redirect_uri="https://example.com/callback",
+    )
+
+    token = await feishu_client.exchange_code("authorization-code")
+
+    assert token == "user-access-token"
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert str(request.url) == FEISHU_TOKEN_URL
+    assert request.headers["content-type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+    assert dict(parse_qsl(request.content.decode())) == {
+        "grant_type": "authorization_code",
+        "client_id": "cli-test",
+        "client_secret": "secret",
+        "code": "authorization-code",
+        "redirect_uri": "https://example.com/callback",
+    }
+
+
+async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert str(request.url) == FEISHU_USER_INFO_URL
+        assert request.headers["authorization"] == "Bearer user-access-token"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "msg": "success",
+                "data": {
+                    "open_id": "ou-test",
+                    "name": "Test User",
+                    "avatar_url": "https://example.com/avatar.png",
+                    "email": "test@example.com",
+                },
+            },
+        )
+
+    feishu_client = FeishuClient(transport=httpx.MockTransport(handler))
+
+    info = await feishu_client.get_user_info("user-access-token")
+
+    assert info == FeishuUserInfo(
+        open_id="ou-test",
+        name="Test User",
+        avatar_url="https://example.com/avatar.png",
+        email="test@example.com",
+    )
+
+
+async def test_login_endpoint_returns_local_token_shape(
+    client: AsyncClient,
+    feishu_defaults: tuple[Department, Role],
+) -> None:
+    response = await client.post(
+        "/api/v1/auth/feishu/login",
+        json={"code": "valid-code"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["code"] == 0
+    data = payload["data"]
+    assert data["access_token"]
+    assert data["refresh_token"]
+    assert data["token_type"] == "bearer"
+    assert data["expires_in"] > 0
+    assert data["profile"]["feishu_open_id"] == "ou-api-login"

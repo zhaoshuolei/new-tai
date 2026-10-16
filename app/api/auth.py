@@ -6,7 +6,9 @@ from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.clients.feishu import FeishuClient, get_feishu_client
 from app.core.auth_context import AuthContext
+from app.core.config import settings
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis
@@ -15,6 +17,7 @@ from app.db.session import get_session
 from app.repositories import user as user_repository
 from app.schemas.auth import (
     CurrentUserRead,
+    FeishuLoginRequest,
     LoginRead,
     LoginRequest,
     LogoutRequest,
@@ -48,6 +51,29 @@ async def login(
         token_type=result.tokens.token_type,
         expires_in=result.tokens.expires_in,
         profile=UserRead.model_validate(result.user),
+    )
+    return success(response)
+
+
+@router.post("/feishu/login")
+async def feishu_login(
+    payload: FeishuLoginRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+    feishu_client: Annotated[FeishuClient, Depends(get_feishu_client)],
+) -> dict[str, Any]:
+    access_token, refresh_token, user = await auth_service.login_with_feishu(
+        session,
+        redis,
+        payload.code,
+        client=feishu_client,
+    )
+    response = LoginRead(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        profile=UserRead.model_validate(user),
     )
     return success(response)
 
@@ -116,6 +142,7 @@ async def get_me(
 
 
 __all__: tuple[str, ...] = (
+    "feishu_login",
     "get_me",
     "login",
     "logout",
