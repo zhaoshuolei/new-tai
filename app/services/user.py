@@ -25,6 +25,7 @@ from app.schemas.user import (
 )
 from app.services import auth as auth_service
 from app.services import authorization as authorization_service
+from app.services.audit import audited
 from app.services.data_scope import apply_user_scope, build_user_scope_filter
 
 
@@ -58,7 +59,13 @@ def _validate_local_username(username: str) -> str:
         ) from error
 
 
-async def create_local_user(session: AsyncSession, payload: UserCreate) -> User:
+@audited(action="user:create", resource_type="user", resource_id_attr="id")
+async def create_local_user(
+    session: AsyncSession,
+    payload: UserCreate,
+    *,
+    context: AuthContext | None = None,
+) -> User:
     _validate_local_password(payload.password)
     normalized_username = _validate_local_username(payload.username)
     existing = await user_repository.get_by_username(session, normalized_username)
@@ -186,6 +193,7 @@ async def list_users(
     )
 
 
+@audited(action="user:update", resource_type="user", resource_id_param="user_id")
 async def update_user(
     session: AsyncSession,
     user_id: int,
@@ -202,6 +210,7 @@ async def update_user(
     return user
 
 
+@audited(action="user:assign", resource_type="user", resource_id_param="user_id")
 async def assign_user_role(
     session: AsyncSession,
     user_id: int,
@@ -242,6 +251,7 @@ async def assign_user_role(
     return user
 
 
+@audited(action="user:assign", resource_type="user", resource_id_param="user_id")
 async def assign_user_department(
     session: AsyncSession,
     user_id: int,
@@ -279,6 +289,7 @@ async def assign_user_department(
     return user
 
 
+@audited(action="user:update", resource_type="user", resource_id_param="user_id")
 async def update_user_status(
     session: AsyncSession,
     user_id: int,
@@ -307,6 +318,7 @@ async def update_user_status(
     return user
 
 
+@audited(action="user:update", resource_type="user", resource_id_param="user_id")
 async def reset_user_password(
     session: AsyncSession,
     user_id: int,
@@ -331,6 +343,7 @@ async def reset_user_password(
     return user
 
 
+@audited(action="user:delete", resource_type="user", resource_id_param="user_id")
 async def delete_user(
     session: AsyncSession,
     user_id: int,

@@ -361,11 +361,11 @@ async def test_write_failure_does_not_propagate(...):
 **Interfaces:**
 - Produces:
   - `app/services/monitor.py`: `async def run_retention(session) -> dict[str, int]` — 对四表按 spec 第 8 节的时间列删除超过保留天数的行，返回各表删除数；对应保留天数配置为 `0` 时跳过该表。采样循环每约 1 小时调用一次（按 `sampled_at` 与 `time.monotonic()` 计数均可，实现者裁量，但必须可测：直接暴露 `run_retention`）。
-  - 菜单种子新增（`_MENU_SEEDS` 追加，父级 `system`）：`logs`（目录 `/system/logs`）、`logs-operations`（菜单 `/system/logs/operations`，`audit:read`）、`logs-logins`（菜单 `/system/logs/logins`，`login_log:read`）、`monitor`（菜单 `/system/monitor`，`monitor:read`）、`exceptions`（菜单 `/system/monitor/exceptions`，`exception:read`）、`exceptions-ack`（按钮，父级 `exceptions`，`exception:update`）。
+  - 菜单种子新增（`_MENU_SEEDS` 追加，父级 `system`）：`logs`（目录 `/system/logs`）、`logs-operations`（菜单 `/system/logs/operations`，`audit:read`）、`logs-logins`（菜单 `/system/logs/logins`，`login_log:read`）、`monitor`（菜单 `/system/monitor`，`monitor:read`）、`exceptions`（菜单 `/system/monitor/exceptions`，`exception:read`，**父级 `system`**——菜单服务的层级不变量只允许 `MENU` 下挂 `BUTTON`，故 `exceptions` 不能挂在同为 `MENU` 的 `monitor` 下）、`exceptions-ack`（按钮，父级 `exceptions`，`exception:update`）。
 - Consumes: Task 1 配置、Task 10 采样循环。
 
 - [ ] **Step 1: 写失败测试**
-  - `test_retention_deletes_only_expired`：各表插入 1 行 10 天前 + 1 行刚刚，`*_retention_days=30` 执行后只剩新行。
+  - `test_retention_deletes_only_expired`：各表插入 1 行 10 天前 + 1 行刚刚，把该表保留天数设为 **7 天**（10 > 7，故旧行应被删、新行保留）执行后只剩新行。（注：保留语义是"删除早于 N 天的行"，用例的保留天数必须小于插入行的年龄，否则旧行本就不该删。）
   - `test_retention_zero_disables_cleanup`：配置为 0 时旧行仍在、返回计数 0。
   - `test_seed_data.py`：`EXPECTED_PERMISSION_CODES` 增加 5 个新权限码；断言 `exceptions-ack` 按钮父级为 `exceptions`。
 - [ ] **Step 2: 跑测试确认失败** — Run: `uv run pytest tests/test_retention.py tests/test_seed_data.py -v`，Expected: FAIL

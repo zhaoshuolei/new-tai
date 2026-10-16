@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,7 @@ from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware, configure_security
 from app.core.redis import redis_client
 from app.db.session import engine
+from app.services.monitor import run_sampler
 
 OPENAPI_TAGS: list[dict[str, str]] = [
     {"name": "认证", "description": "认证与会话管理"},
@@ -60,18 +62,35 @@ def _raise_cleanup_errors(errors: list[Exception]) -> None:
     raise ExceptionGroup("Application resource cleanup failed", errors)
 
 
+async def _stop_sampler(task: asyncio.Task[None] | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.redis_client = None
     application.state.db_engine = None
+    application.state.monitor_sampler_task = None
+    sampler_task: asyncio.Task[None] | None = None
 
     try:
         _validate_critical_settings()
         application.state.redis_client = redis_client
         application.state.db_engine = engine
         await redis_client.ping()
+        if settings.monitor_enabled:
+            sampler_task = asyncio.create_task(
+                run_sampler(settings.monitor_sample_interval_seconds),
+                name="system-metric-sampler",
+            )
+            application.state.monitor_sampler_task = sampler_task
         yield
     except BaseException as primary_error:
+        await _stop_sampler(sampler_task)
+        application.state.monitor_sampler_task = None
         cleanup_errors = await _cleanup_resources(redis_client, engine)
         application.state.redis_client = None
         application.state.db_engine = None
@@ -82,6 +101,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             ) from primary_error
         raise
     else:
+        await _stop_sampler(sampler_task)
+        application.state.monitor_sampler_task = None
         cleanup_errors = await _cleanup_resources(redis_client, engine)
         application.state.redis_client = None
         application.state.db_engine = None

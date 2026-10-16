@@ -1,4 +1,5 @@
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -11,7 +12,7 @@ os.environ.setdefault(
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 
 
 class FakeRedis:
@@ -69,6 +70,19 @@ class FakeRedis:
             if count > threshold:
                 exceeded = 1
         return exceeded
+
+
+@pytest.fixture(autouse=True)
+def _disable_monitor_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "monitor_enabled", False)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_global_engine_after_test() -> AsyncIterator[None]:
+    import app.db.session as db_session
+
+    yield
+    await db_session.engine.dispose()
 
 
 @pytest_asyncio.fixture

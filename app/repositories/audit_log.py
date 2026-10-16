@@ -6,6 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.datetime_utils import to_utc_naive
 from app.models.audit_log import AuditLog, AuditResult
 
 
@@ -40,10 +41,12 @@ async def list_audit_logs(
         conditions.append(AuditLog.resource_id == resource_id)
     if result is not None:
         conditions.append(AuditLog.result == result)
-    if start_time is not None:
-        conditions.append(AuditLog.created_at >= start_time)
-    if end_time is not None:
-        conditions.append(AuditLog.created_at <= end_time)
+    normalized_start_time = to_utc_naive(start_time)
+    normalized_end_time = to_utc_naive(end_time)
+    if normalized_start_time is not None:
+        conditions.append(AuditLog.created_at >= normalized_start_time)
+    if normalized_end_time is not None:
+        conditions.append(AuditLog.created_at <= normalized_end_time)
     if keyword:
         pattern = f"%{keyword}%"
         conditions.append(

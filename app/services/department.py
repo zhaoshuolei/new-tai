@@ -3,6 +3,7 @@
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.models.department import Department, DepartmentStatus
 from app.repositories import department as department_repository
@@ -11,6 +12,7 @@ from app.schemas.department import (
     DepartmentNode,
     DepartmentUpdate,
 )
+from app.services.audit import audited
 
 
 def _is_delete_fk_error(error: IntegrityError, table_name: str) -> bool:
@@ -37,9 +39,12 @@ async def _require_department(
     return department
 
 
+@audited(action="dept:create", resource_type="department", resource_id_attr="id")
 async def create_department(
     session: AsyncSession,
     payload: DepartmentCreate,
+    *,
+    context: AuthContext | None = None,
 ) -> Department:
     parent: Department | None = None
     if payload.parent_id is not None:
@@ -128,10 +133,17 @@ def _nearest_visible_ancestor(
     return None
 
 
+@audited(
+    action="dept:update",
+    resource_type="department",
+    resource_id_param="department_id",
+)
 async def update_department(
     session: AsyncSession,
     department_id: int,
     payload: DepartmentUpdate,
+    *,
+    context: AuthContext | None = None,
 ) -> Department:
     department = await _require_department(session, department_id)
     if department.is_system:
@@ -148,10 +160,13 @@ async def update_department(
     return department
 
 
+@audited(action="dept:move", resource_type="department", resource_id_param="dept_id")
 async def move_department(
     session: AsyncSession,
     dept_id: int,
     new_parent_id: int | None,
+    *,
+    context: AuthContext | None = None,
 ) -> Department:
     department = await _require_department(session, dept_id)
     if department.is_system:
@@ -197,9 +212,16 @@ async def move_department(
     return department
 
 
+@audited(
+    action="dept:delete",
+    resource_type="department",
+    resource_id_param="department_id",
+)
 async def delete_department(
     session: AsyncSession,
     department_id: int,
+    *,
+    context: AuthContext | None = None,
 ) -> None:
     department = await _require_department(session, department_id)
     if department.is_system:

@@ -1,4 +1,6 @@
+import asyncio
 from collections.abc import AsyncGenerator, Callable
+from time import perf_counter
 
 import pytest
 from fastapi import FastAPI
@@ -8,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api import health as health_module
 from app.api.health import router
 from app.db import session as session_module
+from app.services import health as health_service
 
 SessionDependency = Callable[[], AsyncGenerator[AsyncSession]]
 
@@ -47,6 +50,36 @@ async def failing_session() -> AsyncGenerator[AsyncSession]:
     )
 
 
+class HangingSession:
+    def __init__(self) -> None:
+        self.invalidated = False
+
+    async def execute(self, statement: object) -> None:
+        await asyncio.Event().wait()
+
+    async def invalidate(self) -> None:
+        self.invalidated = True
+
+
+class FakeConnectionPool:
+    def __init__(self) -> None:
+        self.disconnected = False
+        self.inuse_connections: bool | None = None
+
+    async def disconnect(self, *, inuse_connections: bool) -> None:
+        self.inuse_connections = inuse_connections
+        self.disconnected = True
+
+
+class HangingRedis:
+    def __init__(self) -> None:
+        self.connection_pool = FakeConnectionPool()
+
+    async def ping(self) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+
 def make_test_app(
     session_dependency: SessionDependency = fake_session,
 ) -> FastAPI:
@@ -54,6 +87,27 @@ def make_test_app(
     test_app.include_router(router)
     test_app.dependency_overrides[session_module.get_session] = session_dependency
     return test_app
+
+
+@pytest.mark.asyncio
+async def test_hanging_probes_timeout_and_discard_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(health_service, "HEALTH_PROBE_TIMEOUT_SECONDS", 0.01)
+    session = HangingSession()
+    redis = HangingRedis()
+    started_at = perf_counter()
+
+    assert await health_service.check_database(session) is False  # type: ignore[arg-type]
+    assert await health_service.check_redis(redis) is False  # type: ignore[arg-type]
+    elapsed = perf_counter() - started_at
+
+    assert elapsed < 0.5
+    assert session.invalidated is True
+    assert redis.connection_pool.disconnected is True
+    # A failed shared probe must drop only idle connections; aborting in-use
+    # sockets would disconnect unrelated concurrent requests.
+    assert redis.connection_pool.inuse_connections is False
 
 
 @pytest.mark.asyncio
