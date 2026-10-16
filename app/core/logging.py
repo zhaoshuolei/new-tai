@@ -28,7 +28,7 @@ _SENSITIVE_VALUE_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?P<key_quote>[\"']?)\b"
     r"(?P<key>access_token|refresh_token|authorization|password|token|code)"
     r"(?P=key_quote)\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'"
+    r"(?P<value>\"(?:\\.|[^\"\\\\])*\"|'(?:\\.|[^'\\\\])*'"
     r"|[^,\r\n}\]]+)",
 )
 _STANDARD_RECORD_ATTRIBUTES: Final[frozenset[str]] = frozenset(

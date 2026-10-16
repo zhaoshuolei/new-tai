@@ -108,6 +108,24 @@ def test_quoted_sensitive_keys_are_redacted_in_message_text(text: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        '{"password": "ab\\"c,d"}',
+        '{"token": "a\\"b,c"}',
+        'password="xy\\"z,w"',
+    ],
+)
+def test_escaped_sensitive_values_are_fully_redacted(text: str) -> None:
+    """转义引号后若正则提前失配，会退化成贪婪匹配并泄漏逗号后的密文尾部。"""
+    output = mask_sensitive_text(text)
+
+    assert "***" in output
+    assert ",d" not in output
+    assert ",c" not in output
+    assert ",w" not in output
+
+
+@pytest.mark.parametrize(
     ("value", "secret"),
     [
         (b"password=secret-bytes", "secret-bytes"),

@@ -4,7 +4,10 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
-os.environ.setdefault("DATABASE_URL", "mysql+asyncmy://test:test@localhost/test")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
@@ -76,7 +79,9 @@ async def fake_redis() -> FakeRedis:
 @pytest.fixture
 def test_settings() -> Settings:
     return Settings(
-        database_url="mysql+asyncmy://test:test@localhost/test",
+        database_url=(
+            "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test"
+        ),
         redis_url="redis://localhost:6379/15",
         jwt_secret="test-secret",
     )

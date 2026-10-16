@@ -73,13 +73,17 @@ def test_page_enforces_global_pagination_bounds() -> None:
     with pytest.raises(ValidationError):
         Page[int](items=[], total=0, page=0, page_size=1)
 
-    with pytest.raises(ValidationError):
-        Page[int](
-            items=[],
-            total=0,
-            page=MAX_PAGE_SIZE + 1,
-            page_size=1,
-        )
+
+def test_page_number_has_no_upper_bound() -> None:
+    """页码不受 page_size 上限约束，否则大页码请求会在响应建模阶段变成 500。"""
+    page = Page[int](
+        items=[],
+        total=0,
+        page=MAX_PAGE_SIZE + 1,
+        page_size=1,
+    )
+
+    assert page.page == MAX_PAGE_SIZE + 1
 
 
 async def test_http_exception_returns_error_envelope() -> None:

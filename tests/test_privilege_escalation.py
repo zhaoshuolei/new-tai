@@ -18,6 +18,7 @@ from app.main import create_app
 from app.models.department import Department, DepartmentStatus
 from app.models.role import DataScope, Role, RoleStatus
 from app.models.user import User, UserStatus
+from app.repositories import user as user_repository
 from app.schemas.role import RoleUpdate
 from app.schemas.user import (
     UserCreate,
@@ -1055,6 +1056,57 @@ async def test_non_super_admin_cannot_revoke_super_admin(
     assert error.value.http_status == 403
     await session.refresh(target)
     assert target.role_id == super_admin.id
+
+
+async def test_non_super_admin_cannot_delete_super_admin(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    """删除超管同样是撤销超管权限，必须校验调用者本身是超管。"""
+    regular_role = await add_role(session)
+    caller = await add_user(session, role=regular_role)
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    keeper = await add_user(session, role=super_admin, feishu=True)
+    target = await add_user(session, role=super_admin, feishu=True)
+    assert keeper.id != target.id
+
+    with pytest.raises(BusinessError) as error:
+        await delete_user(
+            session,
+            target.id,
+            context=context_for(caller, regular_role),
+            redis=redis,
+        )
+
+    assert error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
+    assert error.value.http_status == 403
+    assert await user_repository.get_by_id(session, target.id) is not None
+
+
+async def test_super_admin_can_delete_non_last_super_admin(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    caller = await add_user(session, role=super_admin, feishu=True)
+    target = await add_user(session, role=super_admin, feishu=True)
+
+    await delete_user(
+        session,
+        target.id,
+        context=context_for(caller, super_admin, is_super_admin=True),
+        redis=redis,
+    )
+
+    assert await user_repository.get_by_id(session, target.id) is None
 
 
 async def test_target_visibility_uses_dept_child_and_custom_semantics(

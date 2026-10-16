@@ -3,7 +3,9 @@ from typing import Annotated, Any
 from pydantic import BaseModel, Field
 
 MAX_PAGE_SIZE = 100
-PageNumber = Annotated[int, Field(ge=1, le=MAX_PAGE_SIZE)]
+# 页码无上限，page_size 才有上限；两者共用一个别集会让大页码请求在响应建模阶段变成 500。
+PageNumber = Annotated[int, Field(ge=1)]
+PageSize = Annotated[int, Field(ge=1, le=MAX_PAGE_SIZE)]
 
 
 def success(data: Any = None, message: str = "ok") -> dict[str, Any]:
@@ -20,12 +22,14 @@ class Page[T](BaseModel):
     items: list[T]
     total: int
     page: PageNumber
-    page_size: PageNumber
+    page_size: PageSize
 
 
 __all__: tuple[str, ...] = (
     "MAX_PAGE_SIZE",
     "Page",
+    "PageNumber",
+    "PageSize",
     "SuccessEnvelope",
     "success",
 )

@@ -341,10 +341,12 @@ async def delete_user(
     user = await _get_writable_user(session, user_id, context)
     authorization_service.assert_not_self(context, user)
     current_role = await _get_current_role(session, user)
-    await authorization_service.assert_can_reduce_super_admin(
+    await authorization_service.assert_can_revoke_super_admin(
         session,
+        context,
         user,
         current_role,
+        None,
         "delete",
     )
 
