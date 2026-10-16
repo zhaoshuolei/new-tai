@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.clients.feishu import (
@@ -41,7 +42,7 @@ class FakeFeishuClient(FeishuClient):
         *,
         open_id: str | None = None,
         name: str = "Feishu User",
-        avatar_url: str = "https://example.com/avatar.png",
+        avatar_url: str | None = "https://example.com/avatar.png",
         email: str | None = "feishu@example.com",
     ) -> None:
         self.open_id = open_id or f"ou-{uuid4().hex}"
@@ -167,15 +168,16 @@ async def test_first_login_auto_provisions_user(
     pending, default_role = feishu_defaults
     feishu_client = FakeFeishuClient(open_id="ou-first-login")
 
-    access_token, refresh_token, user = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
         client=feishu_client,
     )
+    user = result.user
 
-    assert access_token
-    assert refresh_token
+    assert result.tokens.access_token
+    assert result.tokens.refresh_token
     assert user.id is not None
     assert user.feishu_open_id == "ou-first-login"
     assert user.department_id == pending.id
@@ -190,12 +192,13 @@ async def test_new_user_lands_in_pending_department_with_default_role(
 ) -> None:
     pending, default_role = feishu_defaults
 
-    _, _, user = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
         client=FakeFeishuClient(open_id="ou-provisioned"),
     )
+    user = result.user
 
     assert user.department_id == pending.id
     assert user.role_id == default_role.id
@@ -210,12 +213,13 @@ async def test_existing_user_reuses_record_by_open_id(
 ) -> None:
     existing = await _add_existing_user(session, open_id="ou-existing")
 
-    _, _, user = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
         client=FakeFeishuClient(open_id="ou-existing"),
     )
+    user = result.user
 
     count = await session.scalar(
         select(func.count())
@@ -232,7 +236,7 @@ async def test_login_backfills_only_empty_profile_fields(
 ) -> None:
     user = await _add_existing_user(session, open_id="ou-backfill")
 
-    _, _, logged_in = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
@@ -242,6 +246,7 @@ async def test_login_backfills_only_empty_profile_fields(
             email="filled@example.com",
         ),
     )
+    logged_in = result.user
 
     assert logged_in.id == user.id
     assert logged_in.nickname == "Filled Nickname"
@@ -259,7 +264,7 @@ async def test_admin_edited_nickname_is_not_overwritten(
         email="admin-edited@example.com",
     )
 
-    _, _, logged_in = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
@@ -269,6 +274,7 @@ async def test_admin_edited_nickname_is_not_overwritten(
             email="feishu-email@example.com",
         ),
     )
+    logged_in = result.user
 
     assert logged_in.id == user.id
     assert logged_in.nickname == "Admin Edited"
@@ -287,7 +293,7 @@ async def test_avatar_and_last_login_always_refreshed(
         last_login_at=previous_login,
     )
 
-    _, _, logged_in = await auth_service.login_with_feishu(
+    result = await auth_service.login_with_feishu(
         session,
         fake_redis,
         "valid-code",
@@ -296,6 +302,7 @@ async def test_avatar_and_last_login_always_refreshed(
             avatar_url="https://example.com/new.png",
         ),
     )
+    logged_in = result.user
 
     assert logged_in.id == user.id
     assert logged_in.avatar == "https://example.com/new.png"
@@ -303,6 +310,166 @@ async def test_avatar_and_last_login_always_refreshed(
     assert logged_in.last_login_at > previous_login
     assert logged_in.last_login_at.tzinfo is None
     assert logged_in.last_login_at <= datetime.now(UTC).replace(tzinfo=None)
+
+
+@pytest.mark.parametrize("empty_avatar", [None, ""])
+async def test_empty_feishu_avatar_does_not_clear_stored_avatar(
+    session: AsyncSession,
+    fake_redis: Any,
+    empty_avatar: str | None,
+) -> None:
+    previous_login = datetime(2026, 1, 1)
+    user = await _add_existing_user(
+        session,
+        open_id="ou-avatar-preserved",
+        avatar="https://example.com/admin-avatar.png",
+        last_login_at=previous_login,
+    )
+
+    result = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(
+            open_id="ou-avatar-preserved",
+            avatar_url=empty_avatar,
+        ),
+    )
+    logged_in = result.user
+
+    assert logged_in.id == user.id
+    assert logged_in.avatar == "https://example.com/admin-avatar.png"
+    assert logged_in.last_login_at is not None
+    assert logged_in.last_login_at > previous_login
+
+
+async def test_pending_department_lookup_is_identity_based(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
+    other_system_department = Department(
+        name="其他系统节点",
+        path="/1/",
+        status=DepartmentStatus.ACTIVE,
+        is_system=True,
+    )
+    session.add(other_system_department)
+    await session.commit()
+    await session.refresh(other_system_department)
+
+    pending = Department(
+        name="待分配",
+        path="/2/",
+        status=DepartmentStatus.ACTIVE,
+        is_system=True,
+    )
+    default_role = Role(
+        code="default",
+        name="默认角色",
+        data_scope=DataScope.SELF,
+        data_scope_include_children=False,
+        is_system=True,
+        status=RoleStatus.ACTIVE,
+    )
+    session.add_all([pending, default_role])
+    await session.commit()
+    await session.refresh(pending)
+    await session.refresh(default_role)
+
+    result = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(open_id="ou-pending-identity"),
+    )
+    user = result.user
+
+    assert user.department_id == pending.id
+    assert user.department_id != other_system_department.id
+
+
+async def test_duplicate_open_id_race_recovers_existing_user(
+    session: AsyncSession,
+    fake_redis: Any,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    open_id = f"ou-race-{uuid4().hex}"
+    winner = await _add_existing_user(
+        session,
+        open_id=open_id,
+        nickname="Race Winner",
+    )
+    original_lookup = auth_service._get_feishu_user_by_open_id
+    lookup_calls = 0
+
+    async def racing_lookup(
+        lookup_session: AsyncSession,
+        lookup_open_id: str,
+    ) -> User | None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        if lookup_calls == 1:
+            return None
+        return await original_lookup(lookup_session, lookup_open_id)
+
+    monkeypatch.setattr(auth_service, "_get_feishu_user_by_open_id", racing_lookup)
+
+    result = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client=FakeFeishuClient(open_id=open_id),
+    )
+    logged_in = result.user
+
+    assert lookup_calls == 2
+    assert logged_in.id == winner.id
+    assert logged_in.nickname == "Race Winner"
+
+
+async def test_duplicate_open_id_race_without_winner_returns_business_error(
+    session: AsyncSession,
+    fake_redis: Any,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    open_id = f"ou-race-missing-{uuid4().hex}"
+
+    async def missing_lookup(
+        _lookup_session: AsyncSession,
+        _lookup_open_id: str,
+    ) -> User | None:
+        return None
+
+    monkeypatch.setattr(auth_service, "_get_feishu_user_by_open_id", missing_lookup)
+
+    original_commit = session.commit
+    commit_calls = 0
+
+    async def racing_commit() -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 1:
+            raise IntegrityError(
+                "INSERT user",
+                {},
+                Exception("duplicate feishu_open_id"),
+            )
+        await original_commit()
+
+    monkeypatch.setattr(session, "commit", racing_commit)
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client=FakeFeishuClient(open_id=open_id),
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
 
 
 async def test_disabled_user_login_returns_1002(
@@ -447,3 +614,37 @@ async def test_login_endpoint_returns_local_token_shape(
     assert data["token_type"] == "bearer"
     assert data["expires_in"] > 0
     assert data["profile"]["feishu_open_id"] == "ou-api-login"
+
+
+async def test_login_endpoint_uses_issued_token_metadata(
+    client: AsyncClient,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def custom_issue_token_pair(
+        _redis: Any,
+        _user: User,
+        *,
+        device_id: str | None = None,
+    ) -> auth_service.TokenPair:
+        assert device_id is None
+        return auth_service.TokenPair(
+            access_token="issued-access-token",
+            refresh_token="issued-refresh-token",
+            token_type="custom",
+            expires_in=123,
+        )
+
+    monkeypatch.setattr(auth_service, "issue_token_pair", custom_issue_token_pair)
+
+    response = await client.post(
+        "/api/v1/auth/feishu/login",
+        json={"code": "valid-code"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["access_token"] == "issued-access-token"
+    assert data["refresh_token"] == "issued-refresh-token"
+    assert data["token_type"] == "custom"
+    assert data["expires_in"] == 123

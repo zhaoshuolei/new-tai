@@ -11,6 +11,7 @@ from uuid import uuid4
 from redis.asyncio import Redis
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.feishu import FeishuClient, FeishuUserInfo
@@ -29,6 +30,7 @@ from app.repositories import user as user_repository
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
+_PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 
 logger = logging.getLogger(__name__)
 
@@ -299,8 +301,26 @@ async def login_local_user(
     return LoginResult(tokens=tokens, user=user)
 
 
+async def _get_feishu_user_by_open_id(
+    session: AsyncSession,
+    open_id: str,
+) -> User | None:
+    """按飞书 open_id 查询本系统用户，供首次登录与竞争恢复复用。"""
+    statement = select(User).where(User.feishu_open_id == open_id)
+    return await session.scalar(statement)
+
+
 async def _get_pending_department(session: AsyncSession) -> Department:
-    statement = select(Department).where(Department.is_system.is_(True))
+    """定位唯一的系统“待分配”节点，避免误选其他系统部门。"""
+    statement = (
+        select(Department)
+        .where(
+            Department.is_system.is_(True),
+            Department.name == _PENDING_ASSIGNMENT_DEPARTMENT_NAME,
+        )
+        .order_by(Department.id)
+        .limit(1)
+    )
     department = await session.scalar(statement)
     if department is None:
         raise BusinessError(
@@ -332,8 +352,24 @@ def _sync_feishu_profile(
         user.nickname = info.name
     if not user.email and info.email:
         user.email = info.email
-    user.avatar = info.avatar_url
+    if info.avatar_url:
+        user.avatar = info.avatar_url
     user.last_login_at = login_at
+
+
+def _prepare_existing_feishu_user(
+    user: User,
+    info: FeishuUserInfo,
+    *,
+    login_at: datetime,
+) -> None:
+    if user.status == UserStatus.DISABLED:
+        raise BusinessError(
+            ErrorCode.ACCOUNT_DISABLED,
+            "Account disabled",
+            http_status=401,
+        )
+    _sync_feishu_profile(user, info, login_at=login_at)
 
 
 async def login_with_feishu(
@@ -342,13 +378,12 @@ async def login_with_feishu(
     code: str,
     *,
     client: FeishuClient | None = None,
-) -> tuple[str, str, User]:
+) -> LoginResult:
     feishu_client = client or FeishuClient()
     user_access_token = await feishu_client.exchange_code(code)
     info = await feishu_client.get_user_info(user_access_token)
 
-    statement = select(User).where(User.feishu_open_id == info.open_id)
-    user = await session.scalar(statement)
+    user = await _get_feishu_user_by_open_id(session, info.open_id)
     login_at = datetime.now(UTC).replace(tzinfo=None)
 
     if user is None:
@@ -367,19 +402,26 @@ async def login_with_feishu(
             last_login_at=login_at,
         )
         session.add(user)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            user = await _get_feishu_user_by_open_id(session, info.open_id)
+            if user is None:
+                raise BusinessError(
+                    ErrorCode.FEISHU_UPSTREAM_ERROR,
+                    "Feishu user provisioning conflict",
+                    http_status=502,
+                ) from None
+            _prepare_existing_feishu_user(user, info, login_at=login_at)
+            await session.commit()
     else:
-        if user.status == UserStatus.DISABLED:
-            raise BusinessError(
-                ErrorCode.ACCOUNT_DISABLED,
-                "Account disabled",
-                http_status=401,
-            )
-        _sync_feishu_profile(user, info, login_at=login_at)
+        _prepare_existing_feishu_user(user, info, login_at=login_at)
+        await session.commit()
 
-    await session.commit()
     await session.refresh(user)
     tokens = await issue_token_pair(redis, user)
-    return tokens.access_token, tokens.refresh_token, user
+    return LoginResult(tokens=tokens, user=user)
 
 
 async def rotate_refresh_token(
