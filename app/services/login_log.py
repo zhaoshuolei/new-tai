@@ -1,7 +1,7 @@
 """登录日志写入服务。"""
 
 from app.core.best_effort import run_best_effort
-from app.core.request_context import RequestMeta
+from app.core.request_context import RequestMeta, bounded_request_id
 from app.db.session import session_factory
 from app.models.login_log import LoginLog, LoginResultEnum, LoginType
 from app.repositories import login_log as login_log_repository
@@ -29,7 +29,9 @@ async def record_login_log(
             ip=request_meta.ip if request_meta is not None else None,
             user_agent=(request_meta.user_agent if request_meta is not None else None),
             device_id=device_id,
-            request_id=request_meta.request_id if request_meta is not None else "",
+            request_id=bounded_request_id(
+                request_meta.request_id if request_meta is not None else ""
+            ),
         )
         async with session_factory() as session:
             await login_log_repository.add(session, row)

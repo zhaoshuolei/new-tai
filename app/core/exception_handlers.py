@@ -1,5 +1,4 @@
 import logging
-from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -14,6 +13,7 @@ from app.core.request_context import (
     USER_AGENT_MAX_LENGTH,
     RequestMeta,
     current_request_meta,
+    normalize_request_id,
 )
 from app.models.audit_log import AuditResult
 from app.models.exception_log import ExceptionLevel
@@ -44,11 +44,7 @@ def _request_id(request: Request) -> str:
     if context_request_id:
         return context_request_id
 
-    header_request_id = request.headers.get("X-Request-Id")
-    if header_request_id:
-        return header_request_id
-
-    return str(uuid4())
+    return normalize_request_id(request.headers.get("X-Request-Id"))
 
 
 def _request_user_id(request: Request) -> int | None:

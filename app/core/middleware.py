@@ -1,6 +1,5 @@
 import logging
 from time import perf_counter
-from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -16,6 +15,7 @@ from app.core.logging import (
 from app.core.request_context import (
     USER_AGENT_MAX_LENGTH,
     RequestMeta,
+    normalize_request_id,
     reset_request_meta,
     set_request_meta,
 )
@@ -44,7 +44,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        request_id = request.headers.get("X-Request-Id") or str(uuid4())
+        request_id = normalize_request_id(request.headers.get("X-Request-Id"))
         request.state.request_id = request_id
         request_id_token = set_request_id(request_id)
         user_agent = request.headers.get("user-agent")

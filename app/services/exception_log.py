@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from app.core.best_effort import run_best_effort
 from app.core.logging import current_request_id, mask_sensitive_text
-from app.core.request_context import RequestMeta
+from app.core.request_context import RequestMeta, bounded_request_id
 from app.db.session import session_factory
 from app.models.exception_log import ExceptionLevel, ExceptionLog
 from app.repositories import exception_log as exception_log_repository
@@ -71,7 +71,7 @@ async def record_exception(
         traceback_text=traceback_text,
     )
     occurred_at = datetime.now(UTC).replace(tzinfo=None)
-    request_id = (
+    request_id = bounded_request_id(
         request_meta.request_id if request_meta is not None else current_request_id()
     )
 

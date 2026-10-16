@@ -32,6 +32,8 @@ class SystemMetricRead(_SystemMetricFields):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    db_healthy: bool
+    redis_healthy: bool
 
 
 class CurrentSnapshotRead(_SystemMetricFields):

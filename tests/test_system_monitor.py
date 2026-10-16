@@ -390,7 +390,10 @@ async def test_history_endpoint_filters_and_pages() -> None:
 
         assert first_page.status_code == 200
         assert first_page.json()["data"]["total"] == 2
-        assert first_page.json()["data"]["items"][0]["id"] == rows[2].id
+        first_item = first_page.json()["data"]["items"][0]
+        assert first_item["id"] == rows[2].id
+        assert first_item["db_healthy"] is True
+        assert first_item["redis_healthy"] is True
         assert second_page.status_code == 200
         assert second_page.json()["data"]["items"][0]["id"] == rows[1].id
     finally:

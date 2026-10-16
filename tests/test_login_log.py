@@ -1,6 +1,7 @@
 import os
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -226,6 +227,36 @@ async def test_local_invalid_credentials_records_failure(
     assert row.reason == ErrorCode.INVALID_CREDENTIALS.name
 
 
+async def test_overlong_request_id_is_bounded(
+    session: AsyncSession,
+    fake_redis: Any,
+    login_log_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    username = unique_username("login-log-long-request-id")
+    password = "correct-password1"
+    await add_local_user(
+        session,
+        username=username,
+        password=password,
+    )
+    request_id = f"{REQUEST_PREFIX}{'x' * 80}"
+
+    with request_context(request_id):
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=username,
+            password=password,
+            client_ip="203.0.113.18",
+            device_id="device-long-request-id",
+        )
+
+    rows = await login_rows(login_log_factory, request_id=request_id[:64])
+    assert len(rows) == 1
+    assert rows[0].request_id == request_id[:64]
+    assert len(rows[0].request_id) == 64
+
+
 async def test_disabled_local_account_records_failure(
     session: AsyncSession,
     fake_redis: Any,
@@ -436,3 +467,45 @@ async def test_list_login_logs_applies_filters(
     assert total >= 1
     assert len(matching_rows) == 1
     assert matching_rows[0].device_id == "device-list"
+
+
+async def test_list_login_logs_normalizes_aware_time_range(
+    login_log_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    username = unique_username("login-log-aware-time")
+    request_id = unique_request_id()
+    created_at = datetime(2050, 1, 2, 0, 0, 0)
+
+    async with login_log_factory() as write_session:
+        write_session.add(
+            LoginLog(
+                user_id=None,
+                username=username,
+                login_type=LoginType.LOCAL,
+                result=LoginResultEnum.SUCCESS,
+                request_id=request_id,
+                created_at=created_at,
+            )
+        )
+        await write_session.commit()
+
+    offset = timezone(timedelta(hours=8))
+    start_time = datetime(2050, 1, 2, 8, 0, 0, tzinfo=offset)
+    end_time = start_time + timedelta(seconds=1)
+
+    async with login_log_factory() as lookup_session:
+        rows, total = await login_log_repository.list_login_logs(
+            lookup_session,
+            page=1,
+            page_size=20,
+            user_id=None,
+            username=username,
+            login_type=None,
+            result=None,
+            ip=None,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    assert total == 1
+    assert [row.request_id for row in rows] == [request_id]

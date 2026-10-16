@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -123,6 +123,34 @@ async def test_success_audit_written(session: AsyncSession) -> None:
     assert row.method == "PATCH"
     assert row.path == "/api/v1/users/7"
     assert row.ip == "127.0.0.1"
+
+
+async def test_overlong_request_id_is_bounded(session: AsyncSession) -> None:
+    request_id = "x" * 96
+    meta = RequestMeta(
+        request_id=request_id,
+        method="PATCH",
+        path="/api/v1/users/7",
+        ip="127.0.0.1",
+        user_agent="pytest",
+    )
+    token = set_request_meta(meta)
+    try:
+        await audit_service.record_audit_entry(
+            action="audit:test:long-request-id",
+            resource_type="audit_test",
+            resource_id=7,
+            result=AuditResult.SUCCESS,
+            reason=None,
+            actor=None,
+            request_meta=meta,
+        )
+    finally:
+        reset_request_meta(token)
+
+    row = (await session.scalars(select(AuditLog))).one()
+    assert row.request_id == request_id[:64]
+    assert len(row.request_id) == 64
 
 
 async def test_denied_audit_survives_rollback(session: AsyncSession) -> None:
@@ -381,3 +409,47 @@ async def test_list_audit_logs_filters_and_paginates(session: AsyncSession) -> N
     )
     assert latest_total == 3
     assert [row.request_id for row in latest] == ["r3", "r2", "r1"]
+
+
+async def test_list_audit_logs_normalizes_aware_time_range(
+    session: AsyncSession,
+) -> None:
+    created_at = datetime(2050, 1, 3, 0, 0, 0)
+    session.add(
+        AuditLog(
+            user_id=1,
+            actor_username="alice",
+            actor_nickname="管理员",
+            action="audit:test:aware-time",
+            resource_type="audit_test",
+            resource_id=7,
+            result=AuditResult.SUCCESS,
+            reason=None,
+            method="PATCH",
+            path="/api/v1/users/7",
+            ip="127.0.0.1",
+            request_id="aware-time",
+            created_at=created_at,
+        )
+    )
+    await session.commit()
+
+    offset = timezone(timedelta(hours=8))
+    start_time = datetime(2050, 1, 3, 8, 0, 0, tzinfo=offset)
+    end_time = start_time + timedelta(seconds=1)
+    rows, total = await list_audit_logs(
+        session,
+        page=1,
+        page_size=20,
+        user_id=None,
+        action=None,
+        resource_type=None,
+        resource_id=None,
+        result=None,
+        start_time=start_time,
+        end_time=end_time,
+        keyword=None,
+    )
+
+    assert total == 1
+    assert [row.request_id for row in rows] == ["aware-time"]

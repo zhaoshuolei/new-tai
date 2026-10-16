@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 import pytest
 from fastapi import FastAPI
@@ -42,6 +43,27 @@ async def test_inbound_request_id_is_preserved() -> None:
         )
 
     assert response.headers["X-Request-Id"] == request_id
+
+
+@pytest.mark.parametrize("inbound_request_id", ["x" * 65, "invalid request id"])
+async def test_invalid_inbound_request_id_is_replaced(
+    inbound_request_id: str,
+) -> None:
+    test_app = create_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/health/live",
+            headers={"X-Request-Id": inbound_request_id},
+        )
+
+    generated_request_id = response.headers["X-Request-Id"]
+    assert generated_request_id != inbound_request_id
+    assert len(generated_request_id) <= 64
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", generated_request_id)
 
 
 async def test_request_id_context_is_available_to_route() -> None:

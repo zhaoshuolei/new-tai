@@ -12,6 +12,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.datetime_utils import to_utc_naive
 from app.core.redis import redis_client
 from app.db.session import session_factory
 from app.models.audit_log import AuditLog
@@ -199,15 +200,9 @@ async def list_history(
         session,
         page=page,
         page_size=page_size,
-        start_time=_to_utc_naive(start_time),
-        end_time=_to_utc_naive(end_time),
+        start_time=to_utc_naive(start_time),
+        end_time=to_utc_naive(end_time),
     )
-
-
-def _to_utc_naive(value: datetime | None) -> datetime | None:
-    if value is None or value.tzinfo is None:
-        return value
-    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 __all__: tuple[str, ...] = (

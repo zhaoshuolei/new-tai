@@ -6,6 +6,7 @@ from sqlalchemy import Row, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.datetime_utils import to_utc_naive
 from app.models.exception_log import ExceptionLevel, ExceptionLog
 
 
@@ -33,10 +34,12 @@ async def list_exceptions(
         conditions.append(ExceptionLog.level == level)
     if acknowledged is not None:
         conditions.append(ExceptionLog.acknowledged == acknowledged)
-    if start_time is not None:
-        conditions.append(ExceptionLog.occurred_at >= start_time)
-    if end_time is not None:
-        conditions.append(ExceptionLog.occurred_at <= end_time)
+    normalized_start_time = to_utc_naive(start_time)
+    normalized_end_time = to_utc_naive(end_time)
+    if normalized_start_time is not None:
+        conditions.append(ExceptionLog.occurred_at >= normalized_start_time)
+    if normalized_end_time is not None:
+        conditions.append(ExceptionLog.occurred_at <= normalized_end_time)
 
     total_statement = select(func.count()).select_from(ExceptionLog).where(*conditions)
     total = await session.scalar(total_statement)
@@ -59,10 +62,12 @@ async def summary_by_fingerprint(
     end_time: datetime | None,
 ) -> list[Row[str, str, ExceptionLevel, int, datetime, bool]]:
     conditions: list[ColumnElement[bool]] = []
-    if start_time is not None:
-        conditions.append(ExceptionLog.occurred_at >= start_time)
-    if end_time is not None:
-        conditions.append(ExceptionLog.occurred_at <= end_time)
+    normalized_start_time = to_utc_naive(start_time)
+    normalized_end_time = to_utc_naive(end_time)
+    if normalized_start_time is not None:
+        conditions.append(ExceptionLog.occurred_at >= normalized_start_time)
+    if normalized_end_time is not None:
+        conditions.append(ExceptionLog.occurred_at <= normalized_end_time)
 
     statement = (
         select(

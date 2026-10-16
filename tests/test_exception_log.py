@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest_asyncio
@@ -8,11 +8,12 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
 from app.core.errors import BusinessError, ErrorCode
+from app.core.request_context import RequestMeta
 from app.db.session import session_factory
 from app.main import create_app
 from app.models.exception_log import ExceptionLevel, ExceptionLog
 from app.repositories import exception_log as exception_log_repository
-from app.services.exception_log import build_fingerprint
+from app.services.exception_log import build_fingerprint, record_exception
 
 REQUEST_PREFIX = "test-exception-log-"
 
@@ -82,6 +83,28 @@ async def test_unhandled_exception_is_recorded() -> None:
     assert row.path == "/boom"
     assert row.occurred_at is not None
     assert row.acknowledged is False
+
+
+async def test_overlong_request_id_is_bounded() -> None:
+    request_id = f"{REQUEST_PREFIX}{'x' * 80}"
+    await record_exception(
+        exc=RuntimeError("boom"),
+        level=ExceptionLevel.ERROR,
+        request_meta=RequestMeta(
+            request_id=request_id,
+            method="GET",
+            path="/boom",
+            ip="127.0.0.1",
+            user_agent="pytest",
+        ),
+        user_id=None,
+        status_code=500,
+    )
+
+    rows = await exception_rows(request_id[:64])
+    assert len(rows) == 1
+    assert rows[0].request_id == request_id[:64]
+    assert len(rows[0].request_id) == 64
 
 
 async def test_exception_records_authenticated_user_id() -> None:
@@ -207,6 +230,53 @@ async def test_business_error_4xx_is_not_recorded() -> None:
 
     assert response.status_code == 404
     assert await exception_rows(request_id) == []
+
+
+async def test_list_exceptions_normalizes_aware_time_range() -> None:
+    request_id = unique_request_id()
+    fingerprint = uuid4().hex
+    occurred_at = datetime(2050, 1, 4, 0, 0, 0)
+    async with session_factory() as session:
+        session.add(
+            ExceptionLog(
+                exception_type="RuntimeError",
+                message="boom",
+                fingerprint=fingerprint,
+                level=ExceptionLevel.ERROR,
+                request_id=request_id,
+                method="GET",
+                path="/boom",
+                user_id=None,
+                status_code=500,
+                occurred_at=occurred_at,
+            )
+        )
+        await session.commit()
+
+    offset = timezone(timedelta(hours=8))
+    start_time = datetime(2050, 1, 4, 8, 0, 0, tzinfo=offset)
+    end_time = start_time + timedelta(seconds=1)
+    async with session_factory() as session:
+        rows, total = await exception_log_repository.list_exceptions(
+            session,
+            page=1,
+            page_size=20,
+            exception_type=None,
+            level=None,
+            acknowledged=None,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        summaries = await exception_log_repository.summary_by_fingerprint(
+            session,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    assert total == 1
+    assert [row.request_id for row in rows] == [request_id]
+    summary = next(item for item in summaries if item.fingerprint == fingerprint)
+    assert summary.count == 1
 
 
 def test_build_fingerprint_normalizes_digits() -> None:
