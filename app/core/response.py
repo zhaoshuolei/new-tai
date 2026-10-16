@@ -1,6 +1,9 @@
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+MAX_PAGE_SIZE = 100
+PageNumber = Annotated[int, Field(ge=1, le=MAX_PAGE_SIZE)]
 
 
 def success(data: Any = None, message: str = "ok") -> dict[str, Any]:
@@ -10,8 +13,8 @@ def success(data: Any = None, message: str = "ok") -> dict[str, Any]:
 class Page[T](BaseModel):
     items: list[T]
     total: int
-    page: int
-    page_size: int
+    page: PageNumber
+    page_size: PageNumber
 
 
-__all__: tuple[str, ...] = ("Page", "success")
+__all__: tuple[str, ...] = ("MAX_PAGE_SIZE", "Page", "success")

@@ -14,9 +14,13 @@ _HTTP_ERROR_CODES: dict[int, ErrorCode] = {
     400: ErrorCode.INVALID_PARAMETER,
     401: ErrorCode.UNAUTHENTICATED,
     403: ErrorCode.FORBIDDEN,
+    404: ErrorCode.NOT_FOUND,
+    409: ErrorCode.CONFLICT,
     422: ErrorCode.INVALID_PARAMETER,
     429: ErrorCode.RATE_LIMITED,
 }
+
+_INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error"
 
 
 def _request_id(request: Request) -> str:
@@ -70,10 +74,16 @@ async def http_exception_handler(
     if not isinstance(exc, HTTPException):
         raise exc
 
+    if exc.status_code >= 500:
+        logger.error("HTTP server exception", exc_info=exc)
+        message = _INTERNAL_SERVER_ERROR_MESSAGE
+    else:
+        message = str(exc.detail)
+
     return _error_response(
         request,
         code=_HTTP_ERROR_CODES.get(exc.status_code, ErrorCode.INTERNAL_ERROR),
-        message=str(exc.detail),
+        message=message,
         status_code=exc.status_code,
     )
 
@@ -101,7 +111,7 @@ async def unhandled_exception_handler(
     return _error_response(
         request,
         code=ErrorCode.INTERNAL_ERROR,
-        message="Internal server error",
+        message=_INTERNAL_SERVER_ERROR_MESSAGE,
         status_code=500,
     )
 
