@@ -838,6 +838,17 @@ git commit -m "feat: expose customer and tianyancha integration endpoints"
 
 ---
 
+### Task 12.5: 天眼查按用户限流（补充记录）
+
+设计第 13 节要求把限流阈值记录在计划中。接口层已按用户实施固定窗口限流：
+
+- 检索 `GET /customers/search`：每用户 20 次 / 60 秒。
+- 回填 `POST /customers/import`：每用户 10 次 / 3600 秒。
+- 超出阈值返回错误码 `RATE_LIMITED`（1005），HTTP 429。
+- 实现位于 `app/core/rate_limit.py`（常量 `SEARCH_MAX_REQUESTS` / `SEARCH_WINDOW_SECONDS`、`IMPORT_MAX_REQUESTS` / `IMPORT_WINDOW_SECONDS`），由 `app/api/customers.py` 调用。
+
+---
+
 ### Task 13: 菜单与权限码种子
 
 **Files:**
