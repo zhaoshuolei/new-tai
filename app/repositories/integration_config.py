@@ -28,4 +28,6 @@ async def upsert(
     config.secret_ciphertext = ciphertext
     config.updated_by = updated_by
     await session.flush()
+    # 刷新以加载数据库生成的 created_at/updated_at，避免惰性读取触发 MissingGreenlet。
+    await session.refresh(config)
     return config
