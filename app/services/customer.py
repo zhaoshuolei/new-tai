@@ -1,6 +1,6 @@
 """客户业务逻辑：检索、天眼查回填、CRUD 与负责人转移。
 
-服务层不 commit，事务边界由调用方控制；只 flush。
+写用例由服务层自行 commit，事务边界归服务所有；读用例只查询不 commit。
 """
 
 import re
@@ -288,6 +288,8 @@ async def import_from_tianyancha(
         credit_code=code,
         context=context,
     )
+    # 写用例由服务层负责事务边界，与其他写服务一致。
+    await session.commit()
     return customer
 
 
@@ -335,6 +337,7 @@ async def create_customer(
         credit_code=code,
         context=context,
     )
+    await session.commit()
     return customer
 
 
@@ -408,6 +411,7 @@ async def update_customer(
     # 刷新以加载服务端更新的 updated_at，避免序列化时异步懒加载
     # 触发 MissingGreenlet。
     await session.refresh(customer)
+    await session.commit()
     return customer
 
 
@@ -425,6 +429,7 @@ async def delete_customer(
     customer = await _require_scoped_customer(session, customer_id, context)
     await customer_repository.delete(session, customer)
     await session.flush()
+    await session.commit()
 
 
 @audited(
@@ -457,6 +462,7 @@ async def transfer_owner(
     # 刷新以加载服务端更新的 updated_at，避免序列化时异步懒加载
     # 触发 MissingGreenlet。
     await session.refresh(customer)
+    await session.commit()
     return customer
 
 

@@ -11,16 +11,23 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.clients.tianyancha import Candidate, RegistrationInfo
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
+from app.models.audit_log import AuditLog
 from app.models.customer import Customer, CustomerSource
 from app.models.department import Department, DepartmentStatus
+from app.models.integration_config import IntegrationConfig
 from app.models.role import DataScope
 from app.models.user import User, UserStatus
+from app.repositories.integration_config import get_by_provider
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services import customer as customer_service
 from app.services.customer import (
@@ -32,6 +39,7 @@ from app.services.customer import (
     transfer_owner,
     update_customer,
 )
+from app.services.integration import save_tianyancha_token
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -623,6 +631,113 @@ async def test_create_blank_credit_code_becomes_none(session: AsyncSession) -> N
     )
 
     assert customer.credit_code is None
+
+
+async def test_created_customer_persists_after_service_returns() -> None:
+    """真实 session：服务层自行 commit，session1 关闭后新 session 仍能读到客户。"""
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    name = f"persist-check-{uuid4().hex}"
+    customer_id: int | None = None
+    user_id: int | None = None
+    department_id: int | None = None
+    try:
+        async with factory() as session1:
+            department = Department(
+                parent_id=None,
+                name=f"persist-dept-{uuid4().hex[:8]}",
+                path="",
+                sort_order=0,
+                status=DepartmentStatus.ACTIVE,
+                is_system=False,
+            )
+            session1.add(department)
+            await session1.flush()
+            department.path = f"/{department.id}/"
+            user = User(
+                username=f"persist-user-{uuid4().hex[:12]}",
+                password_hash=None,
+                status=UserStatus.ACTIVE,
+                token_version=0,
+                department_id=department.id,
+            )
+            session1.add(user)
+            await session1.commit()
+
+            customer = await create_customer(
+                session1,
+                CustomerCreate(name=name),
+                context=make_context(user),
+            )
+            customer_id = customer.id
+            user_id = user.id
+            department_id = department.id
+        # session1 已关闭且未额外 commit，持久化只能来自服务层内部的 commit。
+
+        async with factory() as session2:
+            found = await session2.scalar(select(Customer).where(Customer.name == name))
+            assert found is not None
+            assert found.id == customer_id
+    finally:
+        async with factory() as cleanup:
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.id == customer_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(AuditLog).where(AuditLog.user_id == user_id)
+                )
+                await cleanup.execute(delete(User).where(User.id == user_id))
+            if department_id is not None:
+                await cleanup.execute(
+                    delete(Department).where(Department.id == department_id)
+                )
+            await cleanup.commit()
+        await engine.dispose()
+
+
+async def test_saved_tianyancha_token_persists_after_service_returns() -> None:
+    """真实 session：服务层自行 commit，session1 关闭后新 session 仍能读到配置。"""
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id = 1_000_000_000 + uuid4().int % 900_000_000
+    context = AuthContext(
+        user_id=user_id,
+        role_id=None,
+        department_id=None,
+        data_scope=None,
+        custom_department_ids=frozenset(),
+        include_children=False,
+        permission_codes=frozenset(),
+        is_super_admin=False,
+    )
+
+    async def clean() -> None:
+        async with factory() as cleanup:
+            await cleanup.execute(
+                delete(IntegrationConfig).where(
+                    IntegrationConfig.provider == "tianyancha"
+                )
+            )
+            await cleanup.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+            await cleanup.commit()
+
+    try:
+        await clean()
+        async with factory() as session1:
+            await save_tianyancha_token(
+                session1, "persist-token-value", context=context
+            )
+        # session1 已关闭且未额外 commit。
+
+        async with factory() as session2:
+            row = await get_by_provider(session2, "tianyancha")
+            assert row is not None
+            assert row.updated_by == user_id
+    finally:
+        await clean()
+        await engine.dispose()
 
 
 async def test_create_duplicate_credit_code_is_rejected(

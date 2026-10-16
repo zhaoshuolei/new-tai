@@ -44,7 +44,7 @@ async def save_tianyancha_token(
 ) -> None:
     """加密保存天眼查 token。
 
-    空值（含纯空白）按参数错误处理。仅 flush 不 commit，事务边界由调用方控制。
+    空值（含纯空白）按参数错误处理。写用例由服务层负责事务边界，自行 commit。
     """
     token = api_key.strip()
     if not token:
@@ -56,6 +56,8 @@ async def save_tianyancha_token(
 
     ciphertext = encrypt_secret(token)
     await upsert(session, _PROVIDER, ciphertext, updated_by=context.user_id)
+    # 写用例由服务层负责事务边界，与其他写服务一致。
+    await session.commit()
 
 
 async def get_tianyancha_client(session: AsyncSession) -> TianyanchaClient:
