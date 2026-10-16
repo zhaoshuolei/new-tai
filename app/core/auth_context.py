@@ -13,6 +13,8 @@ class AuthContext:
     include_children: bool
     permission_codes: frozenset[str]
     is_super_admin: bool
+    username: str | None = None
+    nickname: str | None = None
 
 
 __all__: tuple[str, ...] = ("AuthContext",)

@@ -589,6 +589,8 @@ async def build_auth_context(
             include_children=False,
             permission_codes=frozenset(),
             is_super_admin=False,
+            username=user.username,
+            nickname=user.nickname,
         )
 
     custom_department_ids: frozenset[int] = frozenset()
@@ -611,6 +613,8 @@ async def build_auth_context(
         include_children=role.data_scope_include_children,
         permission_codes=await list_role_permission_codes(session, role),
         is_super_admin=role.code == "super_admin" and role.is_system,
+        username=user.username,
+        nickname=user.nickname,
     )
 
 
