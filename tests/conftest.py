@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from cryptography.fernet import Fernet
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -10,6 +11,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("JWT_SECRET", "test-secret")
+os.environ.setdefault("CONFIG_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.core.config import Settings
 
@@ -84,4 +86,5 @@ def test_settings() -> Settings:
         ),
         redis_url="redis://localhost:6379/15",
         jwt_secret="test-secret",
+        config_encryption_key=os.environ["CONFIG_ENCRYPTION_KEY"],
     )

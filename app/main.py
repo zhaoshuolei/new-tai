@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -26,9 +27,19 @@ OPENAPI_TAGS: list[dict[str, str]] = [
 
 
 def _validate_critical_settings() -> None:
-    for field_name in ("database_url", "redis_url", "jwt_secret"):
+    required_fields = (
+        "database_url",
+        "redis_url",
+        "jwt_secret",
+        "config_encryption_key",
+    )
+    for field_name in required_fields:
         if not getattr(settings, field_name).strip():
             raise RuntimeError(f"Missing required setting: {field_name}")
+    try:
+        Fernet(settings.config_encryption_key)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Invalid config_encryption_key") from exc
 
 
 async def _cleanup_resources(

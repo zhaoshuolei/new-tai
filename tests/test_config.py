@@ -17,3 +17,12 @@ def test_required_settings_fail_without_values(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_config_encryption_key_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://u:p@h/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("JWT_SECRET", "s")
+    monkeypatch.delenv("CONFIG_ENCRYPTION_KEY", raising=False)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
