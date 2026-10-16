@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
+from app.core.audit_meta import ActorSnapshot
 from app.core.auth_context import AuthContext
 from app.core.best_effort import run_best_effort
 from app.core.errors import BusinessError, ErrorCode
@@ -34,6 +35,17 @@ def is_denial(error: BusinessError) -> bool:
     return error.http_status == 403 or error.code in DENIED_ERROR_CODES
 
 
+def actor_from_context(context: AuthContext | None) -> ActorSnapshot | None:
+    """Build an actor snapshot from an auth context, or None when unauthenticated."""
+    if context is None:
+        return None
+    return ActorSnapshot(
+        user_id=context.user_id,
+        username=context.username,
+        nickname=context.nickname,
+    )
+
+
 async def record_audit_entry(
     *,
     action: str,
@@ -41,16 +53,16 @@ async def record_audit_entry(
     resource_id: int | None,
     result: AuditResult,
     reason: str | None,
-    context: AuthContext | None,
+    actor: ActorSnapshot | None,
     request_meta: RequestMeta | None,
 ) -> None:
     """Persist one audit row in an independent best-effort transaction."""
 
     async def write_entry() -> None:
         row = AuditLog(
-            user_id=context.user_id if context is not None else None,
-            actor_username=context.username if context is not None else None,
-            actor_nickname=context.nickname if context is not None else None,
+            user_id=actor.user_id if actor is not None else None,
+            actor_username=actor.username if actor is not None else None,
+            actor_nickname=actor.nickname if actor is not None else None,
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -133,7 +145,7 @@ def audited(
                         ),
                         result=AuditResult.DENIED,
                         reason=_error_reason(error),
-                        context=context,
+                        actor=actor_from_context(context),
                         request_meta=request_meta,
                     )
                     setattr(error, "audit_recorded", True)  # noqa: B010
@@ -150,7 +162,7 @@ def audited(
                 ),
                 result=AuditResult.SUCCESS,
                 reason=None,
-                context=context,
+                actor=actor_from_context(context),
                 request_meta=request_meta,
             )
             return result
@@ -162,6 +174,7 @@ def audited(
 
 __all__: tuple[str, ...] = (
     "DENIED_ERROR_CODES",
+    "actor_from_context",
     "audited",
     "is_denial",
     "record_audit_entry",

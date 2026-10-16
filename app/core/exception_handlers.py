@@ -109,13 +109,14 @@ async def _record_dependency_denial(
     if meta is None:
         return
 
+    actor = getattr(request.state, "actor", None)
     await record_audit_entry(
         action=meta.action,
         resource_type=meta.resource_type,
         resource_id=_path_resource_id(request),
         result=AuditResult.DENIED,
         reason=_error_reason(exc),
-        context=None,
+        actor=actor,
         request_meta=current_request_meta(),
     )
     setattr(exc, "audit_recorded", True)  # noqa: B010

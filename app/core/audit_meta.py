@@ -9,6 +9,13 @@ class RouteAuditMeta:
     resource_type: str
 
 
+@dataclass(frozen=True)
+class ActorSnapshot:
+    user_id: int | None
+    username: str | None
+    nickname: str | None
+
+
 _registry: dict[tuple[str, str], RouteAuditMeta] = {}
 
 
@@ -32,6 +39,7 @@ def get_audit_route_meta(method: str, route_path: str) -> RouteAuditMeta | None:
 
 
 __all__: tuple[str, ...] = (
+    "ActorSnapshot",
     "RouteAuditMeta",
     "get_audit_route_meta",
     "register_audit_route",

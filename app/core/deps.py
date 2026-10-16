@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_meta import ActorSnapshot
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.core.security import decode_access_token
@@ -61,6 +62,11 @@ async def get_current_context(
 
     context = await build_auth_context(session, user)
     request.state.user_id = context.user_id
+    request.state.actor = ActorSnapshot(
+        user_id=context.user_id,
+        username=context.username,
+        nickname=context.nickname,
+    )
     return context
 
 

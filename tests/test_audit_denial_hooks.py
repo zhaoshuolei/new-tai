@@ -16,19 +16,28 @@ from starlette.requests import Request
 
 from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
+from app.core.config import settings
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.core.exception_handlers import business_error_handler
 from app.core.permissions import require_permission
+from app.core.security import create_access_token
+from app.db.session import get_session
 from app.main import create_app
 from app.models.audit_log import AuditLog, AuditResult
 from app.models.role import DataScope
+from app.models.user import User
 from app.services import audit as audit_service
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
 )
+
+
+@pytest.fixture(autouse=True)
+def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jwt_secret", "test-secret-" + "x" * 32)
 
 
 @pytest_asyncio.fixture
@@ -50,6 +59,24 @@ async def audit_session_factory(
     finally:
         await clear_rows()
         await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session() -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        test_session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield test_session
+        finally:
+            await test_session.close()
+            await transaction.rollback()
+    await engine.dispose()
 
 
 def context_with_permissions(*permission_codes: str) -> AuthContext:
@@ -133,6 +160,9 @@ async def test_service_denial_recorded_once(
     assert rows[0].resource_type == "user"
     assert rows[0].resource_id == 7
     assert rows[0].reason == "CANNOT_MODIFY_SELF"
+    assert rows[0].user_id == 1
+    assert rows[0].actor_username == "admin"
+    assert rows[0].actor_nickname == "管理员"
 
 
 async def test_dependency_denial_recorded(
@@ -170,6 +200,64 @@ async def test_dependency_denial_recorded(
     assert rows[0].resource_type == "user"
     assert rows[0].resource_id == 9
     assert rows[0].reason == "FORBIDDEN"
+    # No authenticated actor was placed on request.state by the override.
+    assert rows[0].user_id is None
+    assert rows[0].actor_username is None
+    assert rows[0].actor_nickname is None
+
+
+async def test_authenticated_dependency_denial_records_actor(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(
+        username="denied-actor",
+        nickname="拒绝操作员",
+        password_hash=None,
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    token = create_access_token(user.id, user.token_version)
+
+    app = create_app()
+
+    @app.patch(
+        "/audit-authenticated-dependency/{user_id}",
+        dependencies=[Depends(require_permission("user:update"))],
+    )
+    async def authenticated_dependency_route(user_id: int) -> dict[str, int]:
+        return {"code": 0, "user_id": user_id}
+
+    register_audit_route(
+        "PATCH",
+        "/audit-authenticated-dependency/{user_id}",
+        action="user:update",
+        resource_type="user",
+    )
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.patch(
+            "/audit-authenticated-dependency/11",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 403
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.DENIED
+    assert rows[0].resource_id == 11
+    assert rows[0].user_id == user.id
+    assert rows[0].actor_username == "denied-actor"
+    assert rows[0].actor_nickname == "拒绝操作员"
 
 
 async def test_non_denial_not_recorded(
