@@ -22,6 +22,7 @@ from app.clients.tianyancha import Candidate, RegistrationInfo
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
+from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
 from app.models.audit_log import AuditLog
@@ -30,6 +31,7 @@ from app.models.role import DataScope
 from app.models.user import User, UserStatus
 from app.services import audit as audit_service
 from app.services import customer as customer_service
+from tests.conftest import FakeRedis
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -45,6 +47,8 @@ class FakeTianyanchaClient:
     def __init__(self) -> None:
         self.pages: dict[int, list[Candidate]] = {}
         self.total = 0
+        self.search_calls = 0
+        self.registration_calls = 0
         self.registration = RegistrationInfo(
             name="乐视网信息技术（北京）股份有限公司",
             credit_code=REQUESTED_CREDIT_CODE,
@@ -59,9 +63,11 @@ class FakeTianyanchaClient:
     async def search_candidates(
         self, keyword: str, *, page: int, page_size: int
     ) -> tuple[list[Candidate], int]:
+        self.search_calls += 1
         return self.pages.get(page, []), self.total
 
     async def fetch_registration(self, credit_code: str) -> RegistrationInfo:
+        self.registration_calls += 1
         if self.registration_error is not None:
             raise self.registration_error
         return self.registration
@@ -163,6 +169,7 @@ ALL_CUSTOMER_PERMISSIONS = (
 async def api_client(
     session: AsyncSession,
     context: AuthContext,
+    fake_redis: FakeRedis | None = None,
 ) -> AsyncIterator[AsyncClient]:
     application = create_app()
 
@@ -172,8 +179,10 @@ async def api_client(
     async def override_context() -> AuthContext:
         return context
 
+    redis_stub = fake_redis if fake_redis is not None else FakeRedis()
     application.dependency_overrides[get_session] = override_session
     application.dependency_overrides[get_current_context] = override_context
+    application.dependency_overrides[get_redis] = lambda: redis_stub
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),
@@ -360,3 +369,101 @@ async def test_list_customers_returns_paginated_envelope(
     assert data["page_size"] == 20
     assert data["total"] == 1
     assert [item["id"] for item in data["items"]] == [customer.id]
+
+
+async def test_search_rate_limited_after_limit(
+    session: AsyncSession,
+    caller: User,
+    fake_client: FakeTianyanchaClient,
+    fake_redis: FakeRedis,
+) -> None:
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context, fake_redis) as client:
+        for _ in range(20):
+            response = await client.get(
+                "/api/v1/customers/search",
+                params={"keyword": "乐视网"},
+            )
+            assert response.status_code == 200, response.text
+
+        calls_before_rejected = fake_client.search_calls
+        rejected = await client.get(
+            "/api/v1/customers/search",
+            params={"keyword": "乐视网"},
+        )
+
+    assert rejected.status_code == 429
+    assert rejected.json()["code"] == ErrorCode.RATE_LIMITED
+    assert fake_client.search_calls == calls_before_rejected
+
+
+async def test_import_rate_limited_after_limit(
+    session: AsyncSession,
+    caller: User,
+    fake_client: FakeTianyanchaClient,
+    fake_redis: FakeRedis,
+) -> None:
+    # 让上游在每次被调用时都报错，避免真正的导入落库掩盖限流计数；
+    # 被限流的第 11 次请求必须在触达上游之前被拒绝。
+    fake_client.registration_error = BusinessError(
+        ErrorCode.TIANYANCHA_UNAVAILABLE,
+        "Tianyancha unavailable",
+        http_status=502,
+    )
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context, fake_redis) as client:
+        for _ in range(10):
+            await client.post(
+                "/api/v1/customers/import",
+                json={"credit_code": REQUESTED_CREDIT_CODE},
+            )
+
+        calls_before_rejected = fake_client.registration_calls
+        rejected = await client.post(
+            "/api/v1/customers/import",
+            json={"credit_code": REQUESTED_CREDIT_CODE},
+        )
+
+    assert calls_before_rejected == 10
+    assert rejected.status_code == 429
+    assert rejected.json()["code"] == ErrorCode.RATE_LIMITED
+    assert fake_client.registration_calls == calls_before_rejected
+
+
+async def test_rate_limit_is_per_user(
+    session: AsyncSession,
+    caller: User,
+    fake_client: FakeTianyanchaClient,
+    fake_redis: FakeRedis,
+) -> None:
+    other = User(
+        username=f"api-{uuid4().hex[:12]}",
+        password_hash=None,
+        status=UserStatus.ACTIVE,
+        token_version=0,
+    )
+    session.add(other)
+    await session.flush()
+
+    context_a = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    context_b = _context(other, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context_a, fake_redis) as client_a:
+        for _ in range(20):
+            response = await client_a.get(
+                "/api/v1/customers/search",
+                params={"keyword": "乐视网"},
+            )
+            assert response.status_code == 200, response.text
+        rejected = await client_a.get(
+            "/api/v1/customers/search",
+            params={"keyword": "乐视网"},
+        )
+        assert rejected.status_code == 429
+
+    async with api_client(session, context_b, fake_redis) as client_b:
+        response = await client_b.get(
+            "/api/v1/customers/search",
+            params={"keyword": "乐视网"},
+        )
+
+    assert response.status_code == 200, response.text

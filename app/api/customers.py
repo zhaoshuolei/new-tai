@@ -9,6 +9,15 @@ from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
+from app.core.rate_limit import (
+    IMPORT_MAX_REQUESTS,
+    IMPORT_WINDOW_SECONDS,
+    SEARCH_MAX_REQUESTS,
+    SEARCH_WINDOW_SECONDS,
+    enforce_rate_limit,
+    tianyancha_rate_limit_key,
+)
+from app.core.redis import Redis, get_redis
 from app.core.response import MAX_PAGE_SIZE, Page, SuccessEnvelope, success
 from app.db.session import get_session
 from app.models.customer import CustomerSource
@@ -85,10 +94,18 @@ async def create_customer(
 async def search_candidates(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
     keyword: Annotated[str, Query(min_length=1)],
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=SEARCH_PAGE_SIZE_LIMIT)] = 20,
 ) -> dict[str, Any]:
+    await enforce_rate_limit(
+        redis,
+        (tianyancha_rate_limit_key("search", str(context.user_id)),),
+        window_seconds=SEARCH_WINDOW_SECONDS,
+        max_requests=SEARCH_MAX_REQUESTS,
+        message="Too many company searches; wait before retrying",
+    )
     result = await customer_service.search_candidates(
         session,
         keyword,
@@ -109,7 +126,15 @@ async def import_customer(
     payload: CustomerImportRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
+    await enforce_rate_limit(
+        redis,
+        (tianyancha_rate_limit_key("import", str(context.user_id)),),
+        window_seconds=IMPORT_WINDOW_SECONDS,
+        max_requests=IMPORT_MAX_REQUESTS,
+        message="Too many customer imports; wait before retrying",
+    )
     customer = await customer_service.import_from_tianyancha(
         session,
         payload.credit_code,
