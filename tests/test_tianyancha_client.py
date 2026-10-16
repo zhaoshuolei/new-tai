@@ -100,10 +100,29 @@ def test_parse_search_table_ignores_non_data_rows() -> None:
     assert candidates[0].company_id == "42"
 
 
-def test_empty_result_text_is_zero_candidates() -> None:
-    candidates, total = parse_search_table(
-        "# 企业候选列表\n\n> 空结果：未发现该维度记录\n"
+def test_empty_result_marker_overrides_any_table_rows() -> None:
+    # 空结果标记必须压过任何可解析的表格行：去掉空结果守卫后，此输入会
+    # 解析出非空候选列表，因此该断言能真正约束该行为。
+    markdown = (
+        "# 企业候选列表\n\n"
+        "> 展示条数：总数 111 条；本次原始返回 0 条。\n\n"
+        "> 空结果：未发现该维度记录\n\n"
+        "| # | 企业名称 | 统一社会信用代码 | 登记状态 | 法定代表人 | 注册资本 "
+        "| 成立日期 | 企业类型 | 成立日期 | 企业ID | 匹配类型 |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "| 1 | 乐视网信息技术（北京）股份有限公司 | 911100007693890511 | 存续 "
+        "| 刘延峰 | 398944.0192万人民币 | 2004-11-10 00:00:00.0 | 1 "
+        "| 2004-11-10 00:00:00.0 | 14427175 | 公司名称匹配 |\n"
     )
+
+    candidates, total = parse_search_table(markdown)
+
+    assert candidates == []
+    assert total == 0
+
+
+def test_empty_result_text_is_zero_candidates() -> None:
+    candidates, total = parse_search_table("空结果：未发现该维度记录")
 
     assert candidates == []
     assert total == 0
