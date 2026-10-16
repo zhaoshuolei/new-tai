@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
@@ -73,7 +74,7 @@ async def create_user(
     session: Annotated[AsyncSession, Depends(get_session)],
     _context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.create_local_user(session, payload)
+    user = await user_service.create_local_user(session, payload, context=_context)
     return success(UserRead.model_validate(user), message="created")
 
 
@@ -217,6 +218,50 @@ async def reset_user_password(
         redis=redis,
     )
     return success(UserRead.model_validate(user), message="password reset")
+
+
+register_audit_route(
+    "POST",
+    "/users",
+    action="user:create",
+    resource_type="user",
+)
+register_audit_route(
+    "PATCH",
+    "/users/{user_id}",
+    action="user:update",
+    resource_type="user",
+)
+register_audit_route(
+    "DELETE",
+    "/users/{user_id}",
+    action="user:delete",
+    resource_type="user",
+)
+register_audit_route(
+    "PATCH",
+    "/users/{user_id}/role",
+    action="user:assign",
+    resource_type="user",
+)
+register_audit_route(
+    "PATCH",
+    "/users/{user_id}/department",
+    action="user:assign",
+    resource_type="user",
+)
+register_audit_route(
+    "PATCH",
+    "/users/{user_id}/status",
+    action="user:update",
+    resource_type="user",
+)
+register_audit_route(
+    "POST",
+    "/users/{user_id}/password/reset",
+    action="user:update",
+    resource_type="user",
+)
 
 
 __all__: tuple[str, ...] = (
