@@ -13,6 +13,7 @@ from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
 from app.models.user import User, UserStatus
 from app.services import auth as auth_service
+from app.services.menu import _is_valid_parent_type
 from scripts.init_data import init_data
 
 TEST_DATABASE_URL = os.environ.get(
@@ -155,6 +156,15 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
     menus_by_code = {
         menu.permission_code: menu for menu in menus if menu.permission_code is not None
     }
+    menus_by_id = {menu.id: menu for menu in menus}
+    for menu in menus:
+        parent = (
+            menus_by_id.get(menu.parent_id) if menu.parent_id is not None else None
+        )
+        assert _is_valid_parent_type(
+            menu.type,
+            parent.type if parent is not None else None,
+        ), f"invalid parent for seed menu: {menu.name}"
     root = await session.scalar(
         select(Menu).where(
             Menu.type == MenuType.DIR,
@@ -227,7 +237,7 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
     assert menus_by_code["audit:read"].parent_id == logs_directory.id
     assert menus_by_code["login_log:read"].parent_id == logs_directory.id
     assert monitor_menu.parent_id == root.id
-    assert exceptions_menu.parent_id == monitor_menu.id
+    assert exceptions_menu.parent_id == root.id
     assert exceptions_ack.type == MenuType.BUTTON
     assert exceptions_ack.parent_id == exceptions_menu.id
 

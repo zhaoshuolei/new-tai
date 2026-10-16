@@ -146,26 +146,44 @@ async def run_retention(session: AsyncSession) -> dict[str, int]:
     return deleted
 
 
-async def run_sampler(interval_seconds: int) -> None:
+async def _run_retention_once() -> None:
+    try:
+        async with session_factory() as session:
+            await run_retention(session)
+    except Exception:
+        logger.warning("Log retention cleanup failed", exc_info=True)
+
+
+async def run_sampler(interval_seconds: float) -> None:
     """Sample forever until the owning lifespan task is cancelled."""
     next_retention_at = time.monotonic()
-    while True:
-        try:
-            async with session_factory() as session:
-                await sample_once(session)
-        except Exception:
-            logger.warning("System metric sampling failed", exc_info=True)
+    retention_task: asyncio.Task[None] | None = None
 
-        now = time.monotonic()
-        if now >= next_retention_at:
+    try:
+        while True:
             try:
                 async with session_factory() as session:
-                    await run_retention(session)
+                    await sample_once(session)
             except Exception:
-                logger.warning("Log retention cleanup failed", exc_info=True)
-            next_retention_at = now + _RETENTION_INTERVAL_SECONDS
+                logger.warning("System metric sampling failed", exc_info=True)
 
-        await asyncio.sleep(interval_seconds)
+            if retention_task is not None and retention_task.done():
+                await asyncio.gather(retention_task, return_exceptions=True)
+                retention_task = None
+
+            now = time.monotonic()
+            if retention_task is None and now >= next_retention_at:
+                retention_task = asyncio.create_task(
+                    _run_retention_once(),
+                    name="log-retention-cleanup",
+                )
+                next_retention_at = now + _RETENTION_INTERVAL_SECONDS
+
+            await asyncio.sleep(interval_seconds)
+    finally:
+        if retention_task is not None:
+            retention_task.cancel()
+            await asyncio.gather(retention_task, return_exceptions=True)
 
 
 async def list_history(

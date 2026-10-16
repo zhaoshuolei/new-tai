@@ -208,6 +208,60 @@ async def test_sampler_task_cancelled_on_shutdown(
     assert calls == 1
 
 
+async def test_sampler_retention_does_not_delay_sampling_or_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retention_started = asyncio.Event()
+    second_sample_started = asyncio.Event()
+    retention_cancelled = asyncio.Event()
+    sample_calls = 0
+    retention_calls = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    async def fake_sample_once(session: object) -> None:
+        nonlocal sample_calls
+        sample_calls += 1
+        if sample_calls == 2:
+            second_sample_started.set()
+
+    async def slow_run_retention(session: object) -> dict[str, int]:
+        nonlocal retention_calls
+        retention_calls += 1
+        retention_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retention_cancelled.set()
+        return {}
+
+    monkeypatch.setattr(
+        monitor_service,
+        "session_factory",
+        lambda: FakeSessionContext(),
+    )
+    monkeypatch.setattr(monitor_service, "sample_once", fake_sample_once)
+    monkeypatch.setattr(monitor_service, "run_retention", slow_run_retention)
+    monkeypatch.setattr(monitor_service, "_RETENTION_INTERVAL_SECONDS", 0)
+
+    sampler_task = asyncio.create_task(monitor_service.run_sampler(0.05))
+    try:
+        await asyncio.wait_for(retention_started.wait(), timeout=1)
+        await asyncio.wait_for(second_sample_started.wait(), timeout=0.5)
+    finally:
+        sampler_task.cancel()
+        await asyncio.gather(sampler_task, return_exceptions=True)
+
+    assert sample_calls >= 2
+    assert retention_calls == 1
+    assert retention_cancelled.is_set()
+
+
 async def test_sampler_survives_transient_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

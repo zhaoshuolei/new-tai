@@ -250,12 +250,12 @@ _MENU_SEEDS = (
     ),
     _MenuSeed(
         key="exceptions",
-        parent_key="monitor",
+        parent_key="system",
         menu_type=MenuType.MENU,
         name="异常监控",
         path="/system/monitor/exceptions",
         permission_code="exception:read",
-        sort_order=10,
+        sort_order=70,
     ),
     _MenuSeed(
         key="exceptions-ack",
