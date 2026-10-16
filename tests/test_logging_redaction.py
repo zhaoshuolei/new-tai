@@ -4,8 +4,11 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.logging import configure_logging, mask_sensitive_text
+from app.db.session import engine
 
 
 @dataclass
@@ -161,3 +164,28 @@ def test_nested_pydantic_model_never_reaches_handler_unredacted() -> None:
     assert "secret-pydantic-password" not in output
     assert "secret-nested-dataclass" not in output
     assert "***" in output
+
+
+async def test_database_exception_hides_argon2_parameter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    configure_logging("test")
+    argon2_hash = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$c29tZWhhc2g"
+
+    with pytest.raises(SQLAlchemyError) as error:
+        async with engine.connect() as connection:
+            await connection.execute(
+                text(
+                    "SELECT * FROM definitely_missing_table "
+                    "WHERE password_hash = :password_hash"
+                ),
+                {"password_hash": argon2_hash},
+            )
+
+    logger = logging.getLogger("tests.redaction.sqlalchemy")
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        logger.exception("database operation failed", exc_info=error.value)
+
+    assert engine.sync_engine.hide_parameters is True
+    assert "database operation failed" in caplog.text
+    assert argon2_hash not in caplog.text

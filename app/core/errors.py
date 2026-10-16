@@ -33,6 +33,7 @@ class ErrorCode(IntEnum):
     DEPT_HAS_USERS = 5002
     INVALID_DEPT_MOVE = 5003
     SYSTEM_DEPT_IMMUTABLE = 5004
+    DEPT_REFERENCED_BY_ROLE = 5005
 
 
 class BusinessError(Exception):

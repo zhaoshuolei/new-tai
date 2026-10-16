@@ -13,13 +13,13 @@ from app.schemas.department import (
 )
 
 
-def _is_user_delete_fk_error(error: IntegrityError) -> bool:
+def _is_delete_fk_error(error: IntegrityError, table_name: str) -> bool:
     args = getattr(error.orig, "args", ())
     return bool(
         args
         and args[0] == 1451
         and "foreign key" in str(error.orig).lower()
-        and "`user`" in str(error.orig).lower()
+        and f"`{table_name}`" in str(error.orig).lower()
     )
 
 
@@ -217,16 +217,31 @@ async def delete_department(
             ErrorCode.DEPT_HAS_USERS,
             "Department has users",
         )
+    if await department_repository.has_role_data_scope_references(
+        session,
+        department_id,
+    ):
+        raise BusinessError(
+            ErrorCode.DEPT_REFERENCED_BY_ROLE,
+            "部门被角色自定义数据范围引用，无法删除",
+            http_status=409,
+        )
 
     await session.delete(department)
     try:
         await session.commit()
     except IntegrityError as error:
         await session.rollback()
-        if _is_user_delete_fk_error(error):
+        if _is_delete_fk_error(error, "user"):
             raise BusinessError(
                 ErrorCode.DEPT_HAS_USERS,
                 "Department has users",
+            ) from error
+        if _is_delete_fk_error(error, "role_department"):
+            raise BusinessError(
+                ErrorCode.DEPT_REFERENCED_BY_ROLE,
+                "部门被角色自定义数据范围引用，无法删除",
+                http_status=409,
             ) from error
         raise
 

@@ -4,6 +4,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.department import Department, DepartmentStatus
+from app.models.role_department import RoleDepartment
 from app.models.user import User
 
 
@@ -46,6 +47,18 @@ async def has_children(session: AsyncSession, department_id: int) -> bool:
 
 async def has_users(session: AsyncSession, department_id: int) -> bool:
     statement = select(User.id).where(User.department_id == department_id).limit(1)
+    return await session.scalar(statement) is not None
+
+
+async def has_role_data_scope_references(
+    session: AsyncSession,
+    department_id: int,
+) -> bool:
+    statement = (
+        select(RoleDepartment.c.role_id)
+        .where(RoleDepartment.c.department_id == department_id)
+        .limit(1)
+    )
     return await session.scalar(statement) is not None
 
 
@@ -102,6 +115,7 @@ __all__: tuple[str, ...] = (
     "cascade_path_prefix",
     "get_by_id",
     "has_children",
+    "has_role_data_scope_references",
     "has_users",
     "list_all",
     "list_by_path_prefix",

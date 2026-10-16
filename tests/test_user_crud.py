@@ -13,10 +13,11 @@ from app.core.security import verify_password
 from app.db.session import get_session
 from app.main import create_app
 from app.models.department import DepartmentStatus
-from app.models.role import RoleStatus
+from app.models.role import DataScope, RoleStatus
 from app.models.user import User, UserStatus
+from app.repositories import department as department_repository
 from app.schemas.department import DepartmentCreate
-from app.schemas.role import RoleCreate
+from app.schemas.role import RoleCreate, RoleDataScopeUpdate
 from app.schemas.user import (
     UserCreate,
     UserDepartmentUpdate,
@@ -26,7 +27,7 @@ from app.schemas.user import (
     UserUpdate,
 )
 from app.services.department import create_department, delete_department
-from app.services.role import create_role, delete_role
+from app.services.role import create_role, delete_role, set_role_data_scope
 from app.services.user import (
     assign_user_department,
     assign_user_role,
@@ -290,6 +291,35 @@ async def test_delete_role_with_real_user_returns_3002(
 
     assert error.value.code == ErrorCode.ROLE_IN_USE
     assert await get_user(session, user.id) is not None
+
+
+async def test_delete_department_referenced_by_custom_role_scope_returns_5005(
+    session: AsyncSession,
+) -> None:
+    department = await create_department(
+        session,
+        DepartmentCreate(name="角色自定义范围部门"),
+    )
+    role = await create_role(
+        session,
+        RoleCreate(code=unique_username("custom-scope-role"), name="自定义范围角色"),
+    )
+    await set_role_data_scope(
+        session,
+        role.id,
+        RoleDataScopeUpdate(
+            data_scope=DataScope.CUSTOM,
+            department_ids=[department.id],
+        ),
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await delete_department(session, department.id)
+
+    assert error.value.code == ErrorCode.DEPT_REFERENCED_BY_ROLE
+    assert error.value.http_status == 409
+    assert "角色" in error.value.message
+    assert await department_repository.get_by_id(session, department.id) is not None
 
 
 async def test_user_api_crud_and_extra_fields_are_rejected(

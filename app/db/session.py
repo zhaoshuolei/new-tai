@@ -14,6 +14,8 @@ engine = create_async_engine(
     pool_recycle=1800,
     pool_size=10,
     max_overflow=20,
+    # 数据库异常可能包含密码哈希等绑定参数，禁止 SQLAlchemy 输出原始参数。
+    hide_parameters=True,
 )
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
