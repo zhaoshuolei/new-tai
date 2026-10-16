@@ -166,7 +166,7 @@ Python 版本注记：当前机器为 Python 3.14。若依赖链尚不完整，�
 - `POST /auth/logout`：删除当前设备的 refresh token。
 - `POST /auth/logout-all`：删除该用户全部 refresh token。
 
-即时失效（本次决定）：JWT 不是纯无状态。每个认证请求按主键回源数据库读取用户行，比对 `status` 与 token 中的 `token_version`，并从用户行实时组装授权上下文；不使用任何 Redis 授权快照或权限码缓存。用户状态、角色、部门等安全变更与 `token_version` 递增在同一数据库事务内提交，提交后旧 access token 立即失效，同时清理该用户全部 refresh token，不再等待 30 分钟自然过期。Redis 只承载 refresh token、登录限流与登出簿记。30 人规模下这次按主键查询成本可忽略。
+即时失效（本次决定）：JWT 不是纯无状态。每个认证请求按主键回源数据库读取用户行，比对 `status` 与 token 中的 `token_version`，并从用户行实时组装授权上下文；不使用任何 Redis 授权快照或权限码缓存。用户状态、角色、部门等安全变更与 `token_version` 递增在同一个数据库事务内提交；旧 access token 的即时失效由每次请求的数据库 `token_version` 比对权威保证，不依赖任何 Redis 操作。事务提交后再尽力清理该用户全部 refresh token（失败仅记日志，不回滚已提交的安全变更），不再等待 30 分钟自然过期。Redis 只承载 refresh token、登录限流与登出簿记。30 人规模下这次按主键查询成本可忽略。
 
 ### 8.3 本地应急账号
 
@@ -244,7 +244,7 @@ Python 版本注记：当前机器为 Python 3.14。若依赖链尚不完整，�
 
 - 数据范围是横切关注点，会渗透到每个列表/详情接口。构建者应抽出统一的过滤条件生成函数，禁止各接口各写一套。
 - `department.path` 必须在部门移动时级联更新所有后代；这是最容易出错的地方，需有专门测试。
-- 用户角色/部门等安全变更必须在同一数据库事务内递增 `token_version` 并清理 refresh token；授权完全以数据库为准，无缓存可失效，否则权限变更不即时生效属于安全缺陷。
+- 用户角色/部门等安全变更必须在同一个数据库事务内递增 `token_version`；授权完全以数据库为准，无缓存可失效，否则权限变更不即时生效属于安全缺陷。refresh token 的清理在事务提交之后执行且为尽力而为（失败仅记日志）；旧 access token 的即时失效由每次请求的数据库 `token_version` 比对保证，而非由 Redis 清理保证。
 - 飞书 API 的字段与错误码需以官方文档为准，构建时核对，不凭记忆实现。
 - Python 3.14 的依赖可用性需实测。
 
@@ -301,7 +301,7 @@ tests/
 - Redis 封装为单一 async 客户端，键名统一 `{app}:{env}:{domain}:{ident}`。
 - 授权为数据库权威：每次认证请求回源用户行并实时计算权限码集合，不缓存用户认证快照，也不缓存角色权限码集合；因此不存在需要显式失效的授权缓存。
 - Redis 只保存 refresh token、登录限流计数与登出簿记；这些键均设 TTL，写入与清理集中在 service 层。
-- 安全变更（状态、角色、部门、密码）在同一数据库事务内递增 `token_version` 并清理 refresh token，实现旧 access token 即时失效。
+- 安全变更（状态、角色、部门、密码）在同一个数据库事务内递增 `token_version`；事务提交后尽力清理 refresh token（失败仅记日志，不回滚安全变更）。旧 access token 的即时失效由每次请求的数据库 `token_version` 比对权威保证，不依赖 Redis 清理。
 
 ### 12.6 安全基线
 

@@ -256,6 +256,27 @@ def _collect_menu_names(nodes: list[dict[str, Any]]) -> set[str]:
     return names
 
 
+def _visible_menu_names_for(
+    nodes: list[dict[str, Any]],
+    menu_id: int,
+) -> set[str] | None:
+    """按非按钮祖先路径推导某个已授权菜单的实际可见名称集合。
+
+    与 `GET /me/menus` 的实现一致：只保留路径上的非按钮节点，
+    因此结果完全来自真实菜单树，而不是写死的猜测。
+    """
+    for node in nodes:
+        if int(node["id"]) == menu_id:
+            return {node["name"]} if node["type"] != "BUTTON" else set()
+        child_names = _visible_menu_names_for(node.get("children", []), menu_id)
+        if child_names is None:
+            continue
+        if node["type"] == "BUTTON":
+            return child_names
+        return {node["name"], *child_names}
+    return None
+
+
 async def test_full_flow_from_seed_to_scoped_admin_operations(
     client: AsyncClient,
     session: AsyncSession,
@@ -307,8 +328,9 @@ async def test_full_flow_from_seed_to_scoped_admin_operations(
 
     menu_response = await client.get("/api/v1/menus/tree", headers=super_headers)
     assert menu_response.status_code == 200, menu_response.text
+    full_menu_tree = menu_response.json()["data"]
     user_read_menu_id = _find_permission_menu_id(
-        menu_response.json()["data"],
+        full_menu_tree,
         "user:read",
     )
     assert user_read_menu_id is not None
@@ -395,7 +417,10 @@ async def test_full_flow_from_seed_to_scoped_admin_operations(
     )
     assert menus_response.status_code == 200, menus_response.text
     menu_names = _collect_menu_names(menus_response.json()["data"])
-    assert {"系统管理", "用户管理"} <= menu_names
+    expected_menu_names = _visible_menu_names_for(full_menu_tree, user_read_menu_id)
+    assert expected_menu_names == {"系统管理", "用户管理"}
+    assert menu_names == expected_menu_names
+    assert menu_names.isdisjoint({"角色管理", "菜单管理", "部门管理", "个人资料"})
 
     list_response = await client.get(
         "/api/v1/users",
