@@ -19,6 +19,7 @@ from app.models.role import DataScope
 from app.models.user import User, UserStatus
 from app.schemas.department import DepartmentCreate
 from app.schemas.user import UserCreate
+from app.services import data_scope as data_scope_service
 from app.services.department import create_department
 from app.services.user import create_local_user
 
@@ -26,6 +27,36 @@ TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
 )
+
+# 重构前由 build_user_scope_filter(DEPT, department_id=3) 生成的编译结果，逐字固定。
+EXPECTED_USER_DEPT_SQL = (
+    "(EXISTS (SELECT department.id \n"
+    "FROM department \n"
+    "WHERE department.id = 3 AND department.is_system IS false)) "
+    'AND "user".department_id = 3'
+)
+
+
+def _ctx(
+    data_scope: DataScope | None = None,
+    *,
+    user_id: int = 7,
+    department_id: int | None = 3,
+    custom_department_ids: frozenset[int] = frozenset(),
+    include_children: bool = True,
+    role_id: int | None = 7001,
+    is_super_admin: bool = False,
+) -> AuthContext:
+    return AuthContext(
+        user_id=user_id,
+        role_id=role_id,
+        department_id=department_id,
+        data_scope=data_scope,
+        custom_department_ids=custom_department_ids,
+        include_children=include_children,
+        permission_codes=frozenset(),
+        is_super_admin=is_super_admin,
+    )
 
 
 @dataclass(frozen=True)
@@ -429,3 +460,49 @@ async def test_users_endpoint_default_context_is_unauthenticated(
 
     assert response.status_code == 401
     assert response.json()["code"] == ErrorCode.UNAUTHENTICATED
+
+
+def _compiled(expr: Any) -> str:
+    return str(expr.compile(compile_kwargs={"literal_binds": True}))
+
+
+def test_user_scope_filter_unchanged_after_refactor() -> None:
+    ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
+
+    sql = _compiled(data_scope_service.build_user_scope_filter(ctx))
+
+    assert sql == EXPECTED_USER_DEPT_SQL
+
+
+def test_customer_scope_self_matches_owner_user_id() -> None:
+    ctx = _ctx(data_scope=DataScope.SELF, user_id=7)
+
+    sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
+
+    assert "customer.owner_user_id = 7" in sql
+
+
+def test_customer_scope_dept_uses_owner_department_column() -> None:
+    ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
+
+    sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
+
+    assert "customer.owner_department_id" in sql
+
+
+def test_customer_scope_null_department_is_invisible_for_dept_scope() -> None:
+    ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
+
+    sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
+
+    # owner_department_id 为 NULL 的行不满足 =/:IN 谓词，故此处不能退化为 true。
+    assert sql.strip().lower() != "true"
+    assert "customer.owner_department_id" in sql
+
+
+def test_customer_scope_all_returns_true() -> None:
+    ctx = _ctx(data_scope=DataScope.ALL, department_id=3)
+
+    sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
+
+    assert sql.strip().lower() == "true"
