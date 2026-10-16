@@ -289,6 +289,7 @@ async def reset_user_password(
     payload: UserPasswordReset,
     *,
     context: AuthContext,
+    redis: Redis | None = None,
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
     current_role = await _get_current_role(session, user)
@@ -300,7 +301,7 @@ async def reset_user_password(
         )
 
     user.password_hash = hash_password(payload.new_password)
-    await session.commit()
+    await _commit_user_security_change(session, user.id, redis)
     await session.refresh(user)
     return user
 

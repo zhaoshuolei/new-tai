@@ -198,12 +198,14 @@ async def reset_user_password(
     payload: UserPasswordReset,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     user = await user_service.reset_user_password(
         session,
         user_id,
         payload,
         context=context,
+        redis=redis,
     )
     return success(UserRead.model_validate(user), message="password reset")
 

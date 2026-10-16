@@ -102,6 +102,13 @@ class FakeRedis:
         keys = args[:numkeys]
         values = args[numkeys:]
 
+        if "local epoch" in script:
+            epoch_key = keys[0]
+            epoch = int(self.values.get(epoch_key, "0")) + 1
+            self.values[epoch_key] = str(epoch)
+            self.expirations[epoch_key] = int(values[0])
+            return epoch
+
         if "redis.call('INCR'" in script:
             ttl = int(values[0])
             threshold = int(values[1])
@@ -115,12 +122,13 @@ class FakeRedis:
                     exceeded = 1
             return exceeded
 
-        if "redis.call('EXISTS'" in script:
-            invalidation_key, snapshot_key = keys
-            if self.values.get(invalidation_key) is not None:
+        if "local current_epoch" in script:
+            epoch_key, snapshot_key = keys
+            current_epoch = self.values.get(epoch_key, "0")
+            if current_epoch != values[0]:
                 return 0
-            self.values[snapshot_key] = values[0]
-            self.expirations[snapshot_key] = int(values[1])
+            self.values[snapshot_key] = values[1]
+            self.expirations[snapshot_key] = int(values[2])
             return 1
 
         if len(keys) != 1:
@@ -482,8 +490,10 @@ async def test_auth_snapshot_cache_is_populated_and_invalidated(
         "token_version": user.token_version,
         "role_id": None,
         "department_id": None,
+        "epoch": "0",
     }
     assert fake_redis.expirations[snapshot_key] == 600
+    assert key("auth", "epoch", str(user.id)) not in fake_redis.values
 
     await auth_service.invalidate_auth_snapshot(fake_redis, user.id)
 
