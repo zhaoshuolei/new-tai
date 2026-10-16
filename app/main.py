@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from app.api.health import router as health_router
 from app.core.config import settings
 
 OPENAPI_TAGS: list[dict[str, str]] = [
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         openapi_tags=OPENAPI_TAGS,
     )
+    application.include_router(health_router)
     return application
 
 
