@@ -389,6 +389,11 @@ async def init_data(
 ) -> None:
     """创建运行所需的基础数据；已有系统数据不会被重复创建。"""
     try:
+        normalize_username(superadmin_username)
+    except ValueError as error:
+        raise ValueError(f"Invalid initial superadmin username: {error}") from error
+
+    try:
         validate_password_policy(superadmin_password)
     except ValueError as error:
         raise ValueError(f"Invalid initial superadmin password: {error}") from error

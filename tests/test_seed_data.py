@@ -327,6 +327,34 @@ async def test_init_rejects_superadmin_password_below_policy(
     assert counts_after == counts_before
 
 
+@pytest.mark.parametrize("invalid_username", ["   ", " a ", "a" * 65])
+async def test_init_rejects_superadmin_username_invalid_after_normalization(
+    session: AsyncSession,
+    invalid_username: str,
+) -> None:
+    counts_before = (
+        await _count(session, Department),
+        await _count(session, Role),
+        await _count(session, Menu),
+        await _count(session, User),
+    )
+
+    with pytest.raises(ValueError, match="username"):
+        await init_data(
+            session,
+            superadmin_username=invalid_username,
+            superadmin_password="abc12345",
+        )
+
+    counts_after = (
+        await _count(session, Department),
+        await _count(session, Role),
+        await _count(session, Menu),
+        await _count(session, User),
+    )
+    assert counts_after == counts_before
+
+
 async def test_init_normalizes_superadmin_username(
     session: AsyncSession,
 ) -> None:

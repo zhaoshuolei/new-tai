@@ -30,6 +30,8 @@ from app.repositories import user as user_repository
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 64
 _PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 
 logger = logging.getLogger(__name__)
@@ -92,8 +94,21 @@ def _refresh_key_pattern(user_id: int) -> str:
 
 
 def normalize_username(username: str) -> str:
-    """统一登录、创建与初始化时的用户名规范。"""
-    return username.strip().casefold()
+    """规范化并校验用户名，返回用于存储和查询的规范值。"""
+    normalized = username.strip().casefold()
+    if not normalized:
+        raise ValueError("Username cannot be empty after normalization")
+    if len(normalized) < USERNAME_MIN_LENGTH:
+        raise ValueError(
+            f"Username must be at least {USERNAME_MIN_LENGTH} characters "
+            "after normalization"
+        )
+    if len(normalized) > USERNAME_MAX_LENGTH:
+        raise ValueError(
+            f"Username must be at most {USERNAME_MAX_LENGTH} characters "
+            "after normalization"
+        )
+    return normalized
 
 
 def _login_ip_key(client_ip: str) -> str:
@@ -184,7 +199,15 @@ async def authenticate_local_user(
     username: str,
     password: str,
 ) -> User:
-    normalized_username = normalize_username(username)
+    try:
+        normalized_username = normalize_username(username)
+    except ValueError as error:
+        raise BusinessError(
+            ErrorCode.INVALID_CREDENTIALS,
+            "Invalid username or password",
+            http_status=401,
+        ) from error
+
     user = await user_repository.get_by_username(session, normalized_username)
     password_hash = (
         user.password_hash
@@ -291,13 +314,22 @@ async def login_local_user(
     client_ip: str,
     device_id: str | None = None,
 ) -> LoginResult:
+    try:
+        normalized_username = normalize_username(username)
+    except ValueError as error:
+        raise BusinessError(
+            ErrorCode.INVALID_CREDENTIALS,
+            "Invalid username or password",
+            http_status=401,
+        ) from error
+
     await enforce_login_rate_limit(
         redis,
         client_ip=client_ip,
-        username=username,
+        username=normalized_username,
     )
-    user = await authenticate_local_user(session, username, password)
-    await clear_login_account_failures(redis, username=username)
+    user = await authenticate_local_user(session, normalized_username, password)
+    await clear_login_account_failures(redis, username=normalized_username)
     tokens = await issue_token_pair(redis, user, device_id=device_id)
     return LoginResult(tokens=tokens, user=user)
 
@@ -599,5 +631,6 @@ __all__: tuple[str, ...] = (
     "login_local_user",
     "login_with_feishu",
     "logout_refresh_token",
+    "normalize_username",
     "rotate_refresh_token",
 )

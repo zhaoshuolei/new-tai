@@ -47,9 +47,20 @@ def _validate_local_password(password: str) -> None:
         ) from error
 
 
+def _validate_local_username(username: str) -> str:
+    try:
+        return auth_service.normalize_username(username)
+    except ValueError as error:
+        raise BusinessError(
+            ErrorCode.INVALID_PARAMETER,
+            str(error),
+            http_status=422,
+        ) from error
+
+
 async def create_local_user(session: AsyncSession, payload: UserCreate) -> User:
     _validate_local_password(payload.password)
-    normalized_username = auth_service.normalize_username(payload.username)
+    normalized_username = _validate_local_username(payload.username)
     existing = await user_repository.get_by_username(session, normalized_username)
     if existing is not None:
         raise _username_exists_error()

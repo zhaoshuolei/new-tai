@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.auth_context import AuthContext
@@ -146,6 +147,43 @@ async def test_duplicate_username_check_uses_normalization(
         )
 
     assert error.value.code == ErrorCode.USERNAME_EXISTS
+
+
+@pytest.mark.parametrize("invalid_username", ["   ", " a ", "a" * 65])
+async def test_user_creation_rejects_invalid_normalized_username(
+    session: AsyncSession,
+    invalid_username: str,
+) -> None:
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    async def override_context() -> AuthContext:
+        return ALL_SCOPE_CONTEXT
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/users",
+                json={
+                    "username": invalid_username,
+                    "password": "initial-password1",
+                },
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.INVALID_PARAMETER
+    assert "Username" in response.json()["message"]
+    normalized = invalid_username.strip().casefold()
+    assert await session.scalar(select(User).where(User.username == normalized)) is None
 
 
 async def test_create_user_without_role_or_department_is_allowed(
