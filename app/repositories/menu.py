@@ -1,0 +1,60 @@
+"""菜单数据访问。"""
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.menu import Menu, MenuStatus
+
+
+async def get_by_id(session: AsyncSession, menu_id: int) -> Menu | None:
+    return await session.get(Menu, menu_id)
+
+
+async def get_by_permission_code(
+    session: AsyncSession,
+    permission_code: str,
+) -> Menu | None:
+    statement = select(Menu).where(Menu.permission_code == permission_code)
+    return await session.scalar(statement)
+
+
+async def add(session: AsyncSession, menu: Menu) -> Menu:
+    session.add(menu)
+    await session.flush()
+    return menu
+
+
+async def list_all(
+    session: AsyncSession,
+    *,
+    include_disabled: bool,
+) -> list[Menu]:
+    statement = select(Menu)
+    if not include_disabled:
+        statement = statement.where(Menu.status == MenuStatus.ACTIVE)
+    statement = statement.order_by(Menu.sort_order, Menu.id)
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
+async def list_children(session: AsyncSession, menu_id: int) -> list[Menu]:
+    statement = (
+        select(Menu).where(Menu.parent_id == menu_id).order_by(Menu.sort_order, Menu.id)
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
+async def has_children(session: AsyncSession, menu_id: int) -> bool:
+    statement = select(Menu.id).where(Menu.parent_id == menu_id).limit(1)
+    return await session.scalar(statement) is not None
+
+
+__all__: tuple[str, ...] = (
+    "add",
+    "get_by_id",
+    "get_by_permission_code",
+    "has_children",
+    "list_all",
+    "list_children",
+)
