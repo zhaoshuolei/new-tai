@@ -12,6 +12,7 @@ from app.models.role import DataScope, Role, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import department as department_repository
 from app.repositories import role as role_repository
+from app.services.data_scope import apply_user_scope
 
 
 def _forbidden(message: str) -> BusinessError:
@@ -74,38 +75,29 @@ def assert_not_self(
         )
 
 
-def assert_target_visible(
+async def assert_target_visible(
+    session: AsyncSession,
     ctx: AuthContext,
     target_user: User,
 ) -> None:
-    """对已加载的目标做数据范围判断。
+    """复用统一数据范围谓词校验目标用户是否可见。"""
+    statement = apply_user_scope(
+        select(User.id).where(User.id == target_user.id),
+        ctx,
+    )
+    visible_user_id = await session.scalar(statement)
+    if visible_user_id != target_user.id:
+        raise _forbidden("User is outside the current data scope")
 
-    用户写入路径仍先使用带数据范围过滤的查询读取目标；此函数为不依赖
-    数据库路径信息的上下文提供集中校验。
-    """
-    if ctx.is_super_admin or ctx.data_scope == DataScope.ALL:
-        return
-    if ctx.user_id == target_user.id:
-        return
-    if ctx.data_scope == DataScope.DEPT:
-        if (
-            ctx.department_id is not None
-            and target_user.department_id == ctx.department_id
-        ):
-            return
-        raise _forbidden("User is outside the current data scope")
-    if ctx.data_scope == DataScope.DEPT_AND_CHILD:
-        if (
-            ctx.department_id is not None
-            and target_user.department_id == ctx.department_id
-        ):
-            return
-        raise _forbidden("User is outside the current data scope")
-    if ctx.data_scope == DataScope.CUSTOM:
-        if target_user.department_id in ctx.custom_department_ids:
-            return
-        raise _forbidden("User is outside the current data scope")
-    raise _forbidden("User is outside the current data scope")
+
+def assert_can_reset_password(
+    ctx: AuthContext,
+    target_user: User,
+    target_role: Role | None,
+) -> None:
+    """系统超管密码只能由超管重置，保护本地应急账号接管路径。"""
+    if is_system_super_admin(target_role) and not ctx.is_super_admin:
+        raise _cannot_grant_super_admin()
 
 
 async def assert_can_assign_department(
@@ -211,6 +203,29 @@ async def assert_can_reduce_super_admin(
     await assert_super_admin_remains(session, operation)
 
 
+async def assert_can_revoke_super_admin(
+    session: AsyncSession,
+    ctx: AuthContext,
+    target_user: User,
+    current_role: Role | None,
+    target_role: Role | None,
+    operation: str = "demote",
+) -> None:
+    """集中校验超管撤销权限、本地应急账号与最后超管保护。"""
+    if current_role is None or not is_system_super_admin(current_role):
+        return
+    if target_role is not None and target_role.id == current_role.id:
+        return
+    if not ctx.is_super_admin:
+        raise _cannot_grant_super_admin()
+    await assert_can_reduce_super_admin(
+        session,
+        target_user,
+        current_role,
+        operation,
+    )
+
+
 def assert_can_manage_super_admin_role(
     ctx: AuthContext,
     role: Role,
@@ -224,6 +239,8 @@ __all__: tuple[str, ...] = (
     "assert_can_assign_role",
     "assert_can_manage_super_admin_role",
     "assert_can_reduce_super_admin",
+    "assert_can_reset_password",
+    "assert_can_revoke_super_admin",
     "assert_not_self",
     "assert_super_admin_remains",
     "assert_target_visible",

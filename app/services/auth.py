@@ -206,12 +206,30 @@ async def invalidate_user_sessions(
     await invalidate_refresh_tokens(redis, user_id)
 
 
-async def bump_token_version(
+async def invalidate_user_sessions_before_commit(
+    session: AsyncSession,
+    user_id: int,
+    redis: Redis,
+) -> None:
+    """提交安全变更前清除会话；失败则回滚数据库并关闭授权。"""
+    try:
+        await invalidate_user_sessions(redis, user_id)
+    except Exception as error:
+        await session.rollback()
+        raise BusinessError(
+            ErrorCode.INTERNAL_ERROR,
+            "Session invalidation failed; database change rolled back",
+            http_status=503,
+        ) from error
+
+
+async def bump_token_version_in_transaction(
     session: AsyncSession,
     user_id: int,
     *,
-    redis: Redis | None = None,
+    redis: Redis,
 ) -> None:
+    """在当前事务内递增版本，并在提交前完成会话失效。"""
     statement = (
         update(User)
         .where(User.id == user_id)
@@ -219,13 +237,32 @@ async def bump_token_version(
     )
     result = cast(CursorResult[Any], await session.execute(statement))
     if result.rowcount != 1:
+        await session.rollback()
         raise BusinessError(
             ErrorCode.USER_NOT_FOUND,
             "User not found",
             http_status=404,
         )
-    await session.commit()
-    await invalidate_user_sessions(redis or default_redis_client, user_id)
+    await invalidate_user_sessions_before_commit(session, user_id, redis)
+
+
+async def bump_token_version(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    redis: Redis | None = None,
+) -> None:
+    resolved_redis = redis or default_redis_client
+    await bump_token_version_in_transaction(
+        session,
+        user_id,
+        redis=resolved_redis,
+    )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def authenticate_local_user(
@@ -503,12 +540,14 @@ __all__: tuple[str, ...] = (
     "authenticate_local_user",
     "build_auth_context",
     "bump_token_version",
+    "bump_token_version_in_transaction",
     "clear_login_account_failures",
     "enforce_login_rate_limit",
     "get_auth_snapshot",
     "invalidate_auth_snapshot",
     "invalidate_refresh_tokens",
     "invalidate_user_sessions",
+    "invalidate_user_sessions_before_commit",
     "issue_token_pair",
     "login_local_user",
     "logout_refresh_token",

@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.auth_context import AuthContext
@@ -17,12 +18,19 @@ from app.models.department import Department, DepartmentStatus
 from app.models.role import DataScope, Role, RoleStatus
 from app.models.user import User, UserStatus
 from app.schemas.role import RoleUpdate
-from app.schemas.user import UserDepartmentUpdate, UserRoleUpdate, UserStatusUpdate
-from app.services.authorization import assignable_role_ids
+from app.schemas.user import (
+    UserCreate,
+    UserDepartmentUpdate,
+    UserRoleUpdate,
+    UserStatusUpdate,
+)
+from app.services import auth as auth_service
+from app.services.authorization import assert_target_visible, assignable_role_ids
 from app.services.role import delete_role, update_role
 from app.services.user import (
     assign_user_department,
     assign_user_role,
+    create_local_user,
     delete_user,
     update_user_status,
 )
@@ -35,6 +43,27 @@ TEST_DATABASE_URL = os.environ.get(
 ALL_USER_PERMISSIONS = frozenset(
     {"user:read", "user:update", "user:delete", "user:assign"}
 )
+
+
+class FailingRedis:
+    async def delete(self, *names: str) -> int:
+        raise RuntimeError("redis unavailable")
+
+
+class InspectingFailingRedis(FailingRedis):
+    def __init__(self, session: AsyncSession, user_id: int) -> None:
+        self.session = session
+        self.user_id = user_id
+        self.observed: tuple[int | None, int] | None = None
+
+    async def delete(self, *names: str) -> int:
+        row = (
+            await self.session.execute(
+                select(User.role_id, User.token_version).where(User.id == self.user_id)
+            )
+        ).one()
+        self.observed = (row.role_id, row.token_version)
+        return await super().delete(*names)
 
 
 class RecordingRedis:
@@ -181,14 +210,16 @@ def context_for(
     *,
     is_super_admin: bool = False,
     data_scope: DataScope = DataScope.ALL,
+    custom_department_ids: frozenset[int] = frozenset(),
+    include_children: bool = True,
 ) -> AuthContext:
     return AuthContext(
         user_id=user.id,
         role_id=role.id if role is not None else None,
         department_id=user.department_id,
         data_scope=data_scope,
-        custom_department_ids=frozenset(),
-        include_children=True,
+        custom_department_ids=custom_department_ids,
+        include_children=include_children,
         permission_codes=ALL_USER_PERMISSIONS,
         is_super_admin=is_super_admin,
     )
@@ -669,3 +700,191 @@ async def test_non_super_admin_cannot_update_or_delete_super_admin_role(
     assert delete_error.value.http_status == 403
     await session.refresh(super_admin)
     assert super_admin.description is None
+
+
+async def test_non_super_admin_cannot_reset_local_emergency_superadmin_password(
+    session: AsyncSession,
+) -> None:
+    caller_role = await add_role(session)
+    caller = await add_user(session, role=caller_role)
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    username = unique_code("emergency")
+    old_password = "emergency-old-password"
+    emergency = await create_local_user(
+        session,
+        UserCreate(username=username, password=old_password),
+    )
+    emergency.role_id = super_admin.id
+    await session.commit()
+    await session.refresh(emergency)
+
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    async def override_context() -> AuthContext:
+        return context_for(caller, caller_role)
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                f"/api/v1/users/{emergency.id}/password/reset",
+                json={"new_password": "attacker-password"},
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert response.status_code == 403
+    assert response.json()["code"] == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
+    authenticated = await auth_service.authenticate_local_user(
+        session,
+        username,
+        old_password,
+    )
+    assert authenticated.id == emergency.id
+    with pytest.raises(BusinessError) as error:
+        await auth_service.authenticate_local_user(
+            session,
+            username,
+            "attacker-password",
+        )
+    assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+
+
+async def test_invalidation_failure_rolls_back_department_change(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session)
+    department = await add_department(session)
+
+    with pytest.raises(BusinessError) as error:
+        await assign_user_department(
+            session,
+            target.id,
+            UserDepartmentUpdate(department_id=department.id),
+            context=context_for(caller, role),
+            redis=FailingRedis(),
+        )
+
+    assert error.value.code == ErrorCode.INTERNAL_ERROR
+    assert error.value.http_status == 503
+    assert "roll" in error.value.message.lower()
+    await session.refresh(target)
+    assert target.department_id is None
+    assert target.token_version == 0
+
+
+async def test_role_change_and_token_bump_are_in_one_transaction_before_invalidation(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session)
+    assigned_role = await add_role(session)
+    assigned_role_id = assigned_role.id
+    inspecting_redis = InspectingFailingRedis(session, target.id)
+
+    with pytest.raises(BusinessError) as error:
+        await assign_user_role(
+            session,
+            target.id,
+            UserRoleUpdate(role_id=assigned_role_id),
+            context=context_for(caller, role),
+            redis=inspecting_redis,
+        )
+
+    assert error.value.code == ErrorCode.INTERNAL_ERROR
+    assert inspecting_redis.observed == (assigned_role_id, 1)
+    await session.refresh(target)
+    assert target.role_id is None
+    assert target.token_version == 0
+
+
+async def test_non_super_admin_cannot_revoke_super_admin(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    regular_role = await add_role(session)
+    caller = await add_user(session, role=regular_role)
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    target = await add_user(session, role=super_admin, feishu=True)
+
+    with pytest.raises(BusinessError) as error:
+        await assign_user_role(
+            session,
+            target.id,
+            UserRoleUpdate(role_id=regular_role.id),
+            context=context_for(caller, regular_role),
+            redis=redis,
+        )
+
+    assert error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
+    assert error.value.http_status == 403
+    await session.refresh(target)
+    assert target.role_id == super_admin.id
+
+
+async def test_target_visibility_uses_dept_child_and_custom_semantics(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    parent = await add_department(session)
+    child = Department(
+        parent_id=parent.id,
+        name=unique_code("child"),
+        path="",
+        sort_order=0,
+        status=DepartmentStatus.ACTIVE,
+        is_system=False,
+    )
+    session.add(child)
+    await session.flush()
+    child.path = f"{parent.path}{child.id}/"
+    await session.commit()
+    await session.refresh(child)
+    caller = await add_user(session, role=role, department=parent)
+    target = await add_user(session, department=child)
+
+    dept_child_context = context_for(
+        caller,
+        role,
+        data_scope=DataScope.DEPT_AND_CHILD,
+    )
+    await assert_target_visible(session, dept_child_context, target)
+
+    custom_without_children = context_for(
+        caller,
+        role,
+        data_scope=DataScope.CUSTOM,
+        custom_department_ids=frozenset({parent.id}),
+        include_children=False,
+    )
+    with pytest.raises(BusinessError) as error:
+        await assert_target_visible(session, custom_without_children, target)
+    assert error.value.code == ErrorCode.FORBIDDEN
+    assert error.value.http_status == 403
+
+    custom_with_children = context_for(
+        caller,
+        role,
+        data_scope=DataScope.CUSTOM,
+        custom_department_ids=frozenset({parent.id}),
+        include_children=True,
+    )
+    await assert_target_visible(session, custom_with_children, target)

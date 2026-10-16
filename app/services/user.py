@@ -102,21 +102,15 @@ async def _get_writable_user(
     user_id: int,
     context: AuthContext,
 ) -> User:
-    user = await _get_scoped_user(session, user_id, context)
-    if user is not None:
-        return user
-
-    if await user_repository.get_by_id(session, user_id) is None:
+    user = await user_repository.get_by_id(session, user_id)
+    if user is None:
         raise BusinessError(
             ErrorCode.USER_NOT_FOUND,
             "User not found",
             http_status=404,
         )
-    raise BusinessError(
-        ErrorCode.FORBIDDEN,
-        "User is outside the current data scope",
-        http_status=403,
-    )
+    await authorization_service.assert_target_visible(session, context, user)
+    return user
 
 
 async def _get_current_role(
@@ -134,11 +128,16 @@ async def _bump_user_token_version(
     redis: Redis | None,
 ) -> None:
     async with redis_scope(redis) as resolved_redis:
-        await auth_service.bump_token_version(
+        await auth_service.bump_token_version_in_transaction(
             session,
             user_id,
             redis=resolved_redis,
         )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def list_users(
@@ -203,29 +202,18 @@ async def assign_user_role(
             )
         authorization_service.assert_can_assign_role(context, target_role)
 
-    if (
-        current_role is not None
-        and authorization_service.is_system_super_admin(current_role)
-        and (target_role is None or target_role.id != current_role.id)
-    ):
-        if not context.is_super_admin:
-            raise BusinessError(
-                ErrorCode.CANNOT_GRANT_SUPER_ADMIN,
-                "Only a super administrator can revoke super administrator",
-                http_status=403,
-            )
-        await authorization_service.assert_can_reduce_super_admin(
-            session,
-            user,
-            current_role,
-            "demote",
-        )
+    await authorization_service.assert_can_revoke_super_admin(
+        session,
+        context,
+        user,
+        current_role,
+        target_role,
+    )
 
     if user.role_id == payload.role_id:
         return user
 
     user.role_id = payload.role_id
-    await session.commit()
     await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
@@ -263,7 +251,6 @@ async def assign_user_department(
         return user
 
     user.department_id = payload.department_id
-    await session.commit()
     await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
@@ -293,7 +280,6 @@ async def update_user_status(
         return user
 
     user.status = payload.status
-    await session.commit()
     await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
@@ -307,6 +293,8 @@ async def reset_user_password(
     context: AuthContext,
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
+    current_role = await _get_current_role(session, user)
+    authorization_service.assert_can_reset_password(context, user, current_role)
     if user.feishu_open_id is not None:
         raise BusinessError(
             ErrorCode.INVALID_PARAMETER,
@@ -337,10 +325,17 @@ async def delete_user(
     )
 
     await user_repository.delete(session, user)
-    await session.commit()
-
     async with redis_scope(redis) as resolved_redis:
-        await auth_service.invalidate_user_sessions(resolved_redis, user_id)
+        await auth_service.invalidate_user_sessions_before_commit(
+            session,
+            user_id,
+            resolved_redis,
+        )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
 
 
 __all__: tuple[str, ...] = (
