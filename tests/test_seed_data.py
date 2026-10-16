@@ -45,6 +45,12 @@ EXPECTED_PERMISSION_CODES = {
     "monitor:read",
     "exception:read",
     "exception:update",
+    "customer:read",
+    "customer:create",
+    "customer:update",
+    "customer:delete",
+    "integration:read",
+    "integration:update",
 }
 
 
@@ -240,6 +246,87 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
     assert exceptions_ack.parent_id == exceptions_menu.id
 
 
+async def test_integration_update_button_is_under_integration_menu(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    update_button = await session.scalar(
+        select(Menu).where(Menu.permission_code == "integration:update")
+    )
+    integration_menu = await session.scalar(
+        select(Menu).where(Menu.permission_code == "integration:read")
+    )
+
+    assert update_button is not None
+    assert integration_menu is not None
+    assert update_button.type == MenuType.BUTTON
+    assert update_button.parent_id == integration_menu.id
+
+
+async def test_customer_buttons_are_under_customer_list(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    customer_list = await session.scalar(
+        select(Menu).where(Menu.permission_code == "customer:read")
+    )
+
+    assert customer_list is not None
+    assert customer_list.type == MenuType.MENU
+
+    for code in ("customer:create", "customer:update", "customer:delete"):
+        button = await session.scalar(
+            select(Menu).where(Menu.permission_code == code)
+        )
+        assert button is not None
+        assert button.type == MenuType.BUTTON
+        assert button.parent_id == customer_list.id
+
+
+async def test_default_role_has_no_customer_permissions(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    default = await session.scalar(select(Role).where(Role.code == "default"))
+    assert default is not None
+
+    assigned_codes = set(
+        (
+            await session.scalars(
+                select(Menu.permission_code)
+                .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                .where(RoleMenu.c.role_id == default.id)
+            )
+        ).all()
+    )
+
+    assert assigned_codes.isdisjoint(
+        {
+            "customer:read",
+            "customer:create",
+            "customer:update",
+            "customer:delete",
+            "integration:read",
+            "integration:update",
+        }
+    )
+
+
 async def test_init_creates_local_emergency_superadmin(
     session: AsyncSession,
 ) -> None:
@@ -287,7 +374,7 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 26
+    assert await _count(session, Menu) == 33
     assert await _count(session, User) == 1
     assert await _count(session, RoleMenu) == 1
     assert (
