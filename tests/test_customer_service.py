@@ -80,6 +80,7 @@ class FakeTianyanchaClient:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.search_calls: list[tuple[int, int]] = []
         self.pages: dict[int, list[Candidate]] = {}
         self.total = 0
         self.registration = RegistrationInfo(
@@ -98,6 +99,7 @@ class FakeTianyanchaClient:
         self, keyword: str, *, page: int, page_size: int
     ) -> tuple[list[Candidate], int]:
         self.calls.append(f"search:{page}:{page_size}")
+        self.search_calls.append((page, page_size))
         return self.pages.get(page, []), self.total
 
     async def fetch_registration(self, credit_code: str) -> RegistrationInfo:
@@ -482,6 +484,7 @@ async def test_search_pages_do_not_overlap(
     ids_second = {item["company_id"] for item in second["items"]}
     assert ids_first.isdisjoint(ids_second)
     assert first["total"] == second["total"] == 4
+    assert fake_client.search_calls == [(1, 2), (2, 2)]
 
 
 @pytest.mark.parametrize("operation", ["get", "update", "delete"])
@@ -547,6 +550,29 @@ async def test_transfer_to_user_outside_scope_is_rejected(
         await transfer_owner(session, customer.id, other.id, context=context)
 
     assert exc.value.code == ErrorCode.CUSTOMER_OWNER_UNAVAILABLE
+
+
+async def test_transfer_owner_invisible_customer_returns_not_found(
+    session: AsyncSession,
+) -> None:
+    caller_department = await make_department(session)
+    other_department = await make_department(session)
+    caller = await make_user(session, department=caller_department)
+    context = make_context(caller, data_scope=DataScope.DEPT)
+    other_owner = await make_user(session, department=other_department)
+    hidden_customer = await make_customer_row(session, owner=other_owner)
+    target = await make_user(session, department=caller_department)
+
+    with pytest.raises(BusinessError) as exc:
+        await transfer_owner(
+            session,
+            hidden_customer.id,
+            target.id,
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_NOT_FOUND
+    assert exc.value.http_status == 404
 
 
 async def test_transfer_resnapshots_owner_department(session: AsyncSession) -> None:
@@ -683,6 +709,34 @@ async def test_update_duplicate_credit_code_is_rejected(
     assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
     assert exc.value.http_status == 409
     assert exc.value.extra == {"existing_customer_id": first.id}
+
+
+async def test_update_duplicate_hidden_customer_omits_existing_id(
+    session: AsyncSession,
+) -> None:
+    caller_department = await make_department(session)
+    other_department = await make_department(session)
+    caller = await make_user(session, department=caller_department)
+    context = make_context(caller, data_scope=DataScope.DEPT)
+    other_owner = await make_user(session, department=other_department)
+    hidden = await make_customer_row(
+        session,
+        owner=other_owner,
+        credit_code=REQUESTED_CREDIT_CODE,
+    )
+    visible = await make_customer_row(session, owner=caller)
+
+    with pytest.raises(BusinessError) as exc:
+        await update_customer(
+            session,
+            visible.id,
+            CustomerUpdate(credit_code=hidden.credit_code),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra is None
 
 
 async def test_update_translates_concurrent_credit_code_conflict(
