@@ -57,7 +57,7 @@ async def summary_by_fingerprint(
     *,
     start_time: datetime | None,
     end_time: datetime | None,
-) -> list[Row[str, int, datetime, bool]]:
+) -> list[Row[str, str, ExceptionLevel, int, datetime, bool]]:
     conditions: list[ColumnElement[bool]] = []
     if start_time is not None:
         conditions.append(ExceptionLog.occurred_at >= start_time)
@@ -67,8 +67,11 @@ async def summary_by_fingerprint(
     statement = (
         select(
             ExceptionLog.fingerprint.label("fingerprint"),
+            func.min(ExceptionLog.exception_type).label("exception_type"),
+            # level is stable per fingerprint in practice; agg keeps one row per group.
+            func.min(ExceptionLog.level).label("level"),
             func.count().label("count"),
-            func.max(ExceptionLog.occurred_at).label("latest_occurred_at"),
+            func.max(ExceptionLog.occurred_at).label("last_occurred_at"),
             # min() over a boolean column is true only when every row is true.
             func.min(ExceptionLog.acknowledged).label("acknowledged"),
         )

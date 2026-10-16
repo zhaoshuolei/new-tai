@@ -274,7 +274,7 @@ async def test_summary_and_ack_roundtrip() -> None:
         summary = next(item for item in summaries if item.fingerprint == fingerprint)
         assert summary.count == 2
         assert not summary.acknowledged
-        assert summary.latest_occurred_at is not None
+        assert summary.last_occurred_at is not None
 
         ack_at = datetime.now(UTC).replace(tzinfo=None)
         for matched in matching:
