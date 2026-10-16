@@ -13,6 +13,12 @@ from app.core.logging import (
     reset_request_id,
     set_request_id,
 )
+from app.core.request_context import (
+    USER_AGENT_MAX_LENGTH,
+    RequestMeta,
+    reset_request_meta,
+    set_request_meta,
+)
 
 logger = logging.getLogger("app.request")
 
@@ -41,6 +47,20 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         request_id = request.headers.get("X-Request-Id") or str(uuid4())
         request.state.request_id = request_id
         request_id_token = set_request_id(request_id)
+        user_agent = request.headers.get("user-agent")
+        request_meta_token = set_request_meta(
+            RequestMeta(
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                ip=request.client.host if request.client is not None else None,
+                user_agent=(
+                    user_agent[:USER_AGENT_MAX_LENGTH]
+                    if user_agent is not None
+                    else None
+                ),
+            ),
+        )
         started_at = perf_counter()
         status_code = 500
 
@@ -69,6 +89,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     },
                 )
             finally:
+                reset_request_meta(request_meta_token)
                 reset_request_id(request_id_token)
 
 
