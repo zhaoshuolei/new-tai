@@ -18,19 +18,19 @@ router = APIRouter(prefix="/departments", tags=["部门"])
 
 
 async def require_dept_read() -> None:
-    """Placeholder for the Task 15 dept:read permission dependency."""
+    """Task 15 接入部门读取权限前的占位依赖。"""
 
 
 async def require_dept_create() -> None:
-    """Placeholder for the Task 15 dept:create permission dependency."""
+    """Task 15 接入部门创建权限前的占位依赖。"""
 
 
 async def require_dept_update() -> None:
-    """Placeholder for the Task 15 dept:update permission dependency."""
+    """Task 15 接入部门更新权限前的占位依赖。"""
 
 
 async def require_dept_delete() -> None:
-    """Placeholder for the Task 15 dept:delete permission dependency."""
+    """Task 15 接入部门删除权限前的占位依赖。"""
 
 
 @router.get(

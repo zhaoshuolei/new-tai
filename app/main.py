@@ -5,8 +5,8 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.api.departments import router as departments_router
 from app.api.health import router as health_router
+from app.api.router import api_v1_router
 from app.core.config import settings
 from app.core.exception_handlers import register_exception_handlers
 from app.core.logging import configure_logging
@@ -98,7 +98,7 @@ def create_app() -> FastAPI:
     application.add_middleware(RequestContextMiddleware)
     register_exception_handlers(application)
     application.include_router(health_router)
-    application.include_router(departments_router)
+    application.include_router(api_v1_router)
     return application
 
 

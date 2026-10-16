@@ -59,25 +59,62 @@ async def get_tree(
     session: AsyncSession,
     include_disabled: bool = False,
 ) -> list[DepartmentNode]:
-    departments = await department_repository.list_all(
+    all_departments = await department_repository.list_all(
         session,
-        include_disabled=include_disabled,
+        include_disabled=True,
     )
+    visible_departments = (
+        all_departments
+        if include_disabled
+        else [
+            department
+            for department in all_departments
+            if department.status == DepartmentStatus.ACTIVE
+        ]
+    )
+    departments_by_id = {department.id: department for department in all_departments}
     nodes = {
         department.id: DepartmentNode.model_validate(department)
-        for department in departments
+        for department in visible_departments
     }
     roots: list[DepartmentNode] = []
 
-    for department in departments:
+    for department in visible_departments:
         node = nodes[department.id]
-        parent = nodes.get(department.parent_id) if department.parent_id else None
-        if parent is None:
+        parent_node = _nearest_visible_ancestor(
+            department,
+            departments_by_id,
+            nodes,
+        )
+        if parent_node is None:
             roots.append(node)
         else:
-            parent.children.append(node)
+            parent_node.children.append(node)
 
     return roots
+
+
+def _nearest_visible_ancestor(
+    department: Department,
+    departments_by_id: dict[int, Department],
+    nodes: dict[int, DepartmentNode],
+) -> DepartmentNode | None:
+    ancestor_id = department.parent_id
+    visited: set[int] = set()
+
+    while ancestor_id is not None and ancestor_id not in visited:
+        visited.add(ancestor_id)
+        ancestor = departments_by_id.get(ancestor_id)
+        if ancestor is None:
+            return None
+
+        parent_node = nodes.get(ancestor.id)
+        if parent_node is not None:
+            return parent_node
+
+        ancestor_id = ancestor.parent_id
+
+    return None
 
 
 async def update_department(

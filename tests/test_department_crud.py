@@ -4,13 +4,13 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.errors import BusinessError, ErrorCode
 from app.db.session import get_session
 from app.main import create_app
 from app.models.department import Department, DepartmentStatus
+from app.repositories import department as department_repository
 from app.schemas.department import DepartmentCreate, DepartmentUpdate
 from app.services.department import (
     create_department,
@@ -27,7 +27,7 @@ TEST_DATABASE_URL = os.environ.get(
 
 
 @pytest_asyncio.fixture
-async def session(user_probe_table: None) -> AsyncIterator[AsyncSession]:
+async def session() -> AsyncIterator[AsyncSession]:
     engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     async with engine.connect() as connection:
         transaction = await connection.begin()
@@ -42,37 +42,6 @@ async def session(user_probe_table: None) -> AsyncIterator[AsyncSession]:
             await test_session.close()
             await transaction.rollback()
     await engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def user_probe_table() -> AsyncIterator[None]:
-    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
-    created = False
-    async with engine.begin() as connection:
-        created = not await connection.run_sync(
-            lambda sync_connection: inspect(sync_connection).has_table("user")
-        )
-        if created:
-            await connection.execute(
-                text(
-                    """
-                    CREATE TABLE `user` (
-                        id BIGINT NOT NULL AUTO_INCREMENT,
-                        department_id BIGINT NULL,
-                        PRIMARY KEY (id),
-                        KEY ix_user_department_id (department_id)
-                    ) ENGINE=InnoDB
-                    """
-                )
-            )
-
-    try:
-        yield
-    finally:
-        if created:
-            async with engine.begin() as connection:
-                await connection.execute(text("DROP TABLE `user`"))
-        await engine.dispose()
 
 
 async def add_system_department(
@@ -151,17 +120,32 @@ async def test_delete_department_with_children_returns_5001(
 
 async def test_delete_department_with_users_returns_5002(
     session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     department = await create_department(session, DepartmentCreate(name="总部"))
-    await session.execute(
-        text("INSERT INTO `user` (department_id) VALUES (:department_id)"),
-        {"department_id": department.id},
-    )
+
+    async def has_users(
+        _session: AsyncSession,
+        department_id: int,
+    ) -> bool:
+        return department_id == department.id
+
+    monkeypatch.setattr(department_repository, "has_users", has_users)
 
     with pytest.raises(BusinessError) as error:
         await delete_department(session, department.id)
 
     assert error.value.code == ErrorCode.DEPT_HAS_USERS
+
+
+async def test_delete_department_without_users_succeeds(
+    session: AsyncSession,
+) -> None:
+    department = await create_department(session, DepartmentCreate(name="总部"))
+
+    await delete_department(session, department.id)
+
+    assert await department_repository.get_by_id(session, department.id) is None
 
 
 async def test_system_department_cannot_be_renamed_or_deleted(
@@ -259,6 +243,30 @@ async def test_get_tree_filters_disabled_departments_by_default(
     assert {node.id for node in full_tree} == {active.id, disabled.id}
 
 
+async def test_get_tree_attaches_child_to_nearest_visible_ancestor(
+    session: AsyncSession,
+) -> None:
+    root = await create_department(session, DepartmentCreate(name="总部"))
+    hidden = await create_department(
+        session,
+        DepartmentCreate(name="停用中间层", parent_id=root.id),
+    )
+    child = await create_department(
+        session,
+        DepartmentCreate(name="活跃子部门", parent_id=hidden.id),
+    )
+    await update_department(
+        session,
+        hidden.id,
+        DepartmentUpdate(status=DepartmentStatus.DISABLED),
+    )
+
+    tree = await get_tree(session)
+
+    assert [node.id for node in tree] == [root.id]
+    assert [node.id for node in tree[0].children] == [child.id]
+
+
 async def test_department_endpoints_return_success_envelope(
     session: AsyncSession,
 ) -> None:
@@ -274,10 +282,11 @@ async def test_department_endpoints_return_success_envelope(
             base_url="http://test",
         ) as client:
             create_response = await client.post(
-                "/departments",
+                "/api/v1/departments",
                 json={"name": "总部"},
             )
-            tree_response = await client.get("/departments/tree")
+            tree_response = await client.get("/api/v1/departments/tree")
+            health_response = await client.get("/health/live")
     finally:
         application.dependency_overrides.clear()
 
@@ -287,3 +296,13 @@ async def test_department_endpoints_return_success_envelope(
     assert tree_response.status_code == 200
     assert tree_response.json()["code"] == 0
     assert tree_response.json()["data"][0]["name"] == "总部"
+    assert health_response.status_code == 200
+
+
+def test_openapi_uses_api_v1_prefix_for_business_routes() -> None:
+    paths = create_app().openapi()["paths"]
+
+    assert "/api/v1/departments/tree" in paths
+    assert "/departments/tree" not in paths
+    assert "/health/live" in paths
+    assert "/health/ready" in paths
