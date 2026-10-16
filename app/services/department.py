@@ -137,6 +137,55 @@ async def update_department(
     return department
 
 
+async def move_department(
+    session: AsyncSession,
+    dept_id: int,
+    new_parent_id: int | None,
+) -> Department:
+    department = await _require_department(session, dept_id)
+    if department.is_system:
+        raise BusinessError(
+            ErrorCode.SYSTEM_DEPT_IMMUTABLE,
+            "System department is immutable",
+        )
+
+    parent: Department | None = None
+    if new_parent_id is not None:
+        parent = await _require_department(session, new_parent_id)
+
+    if new_parent_id == dept_id:
+        raise BusinessError(
+            ErrorCode.INVALID_DEPT_MOVE,
+            "Cannot move a department under itself",
+        )
+
+    if parent is not None and parent.path.startswith(department.path):
+        raise BusinessError(
+            ErrorCode.INVALID_DEPT_MOVE,
+            "Cannot move a department under its descendant",
+        )
+
+    if parent is not None and parent.status == DepartmentStatus.DISABLED:
+        raise BusinessError(
+            ErrorCode.INVALID_DEPT_MOVE,
+            "Cannot move a department under a disabled department",
+        )
+
+    old_path = department.path
+    department.parent_id = new_parent_id
+    department.path = f"{parent.path if parent is not None else '/'}{department.id}/"
+    await session.flush()
+    await department_repository.cascade_path_prefix(
+        session,
+        old_prefix=old_path,
+        new_prefix=department.path,
+        exclude_id=department.id,
+    )
+    await session.commit()
+    await session.refresh(department)
+    return department
+
+
 async def delete_department(
     session: AsyncSession,
     department_id: int,
@@ -179,5 +228,6 @@ __all__: tuple[str, ...] = (
     "delete_department",
     "get_tree",
     "list_subtree_ids",
+    "move_department",
     "update_department",
 )

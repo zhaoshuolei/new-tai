@@ -21,6 +21,12 @@ class DepartmentUpdate(BaseModel):
     status: DepartmentStatus | None = None
 
 
+class DepartmentMove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_parent_id: int | None
+
+
 class DepartmentNode(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -39,6 +45,7 @@ DepartmentNode.model_rebuild()
 
 __all__: tuple[str, ...] = (
     "DepartmentCreate",
+    "DepartmentMove",
     "DepartmentNode",
     "DepartmentUpdate",
 )

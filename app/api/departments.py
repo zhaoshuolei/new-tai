@@ -9,6 +9,7 @@ from app.core.response import success
 from app.db.session import get_session
 from app.schemas.department import (
     DepartmentCreate,
+    DepartmentMove,
     DepartmentNode,
     DepartmentUpdate,
 )
@@ -81,6 +82,23 @@ async def update_department(
     return success(DepartmentNode.model_validate(department))
 
 
+@router.patch(
+    "/{department_id}/move",
+    dependencies=[Depends(require_dept_update)],
+)
+async def move_department(
+    department_id: int,
+    payload: DepartmentMove,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    department = await department_service.move_department(
+        session,
+        department_id,
+        payload.new_parent_id,
+    )
+    return success(DepartmentNode.model_validate(department))
+
+
 @router.delete(
     "/{department_id}",
     dependencies=[Depends(require_dept_delete)],
@@ -97,6 +115,7 @@ __all__: tuple[str, ...] = (
     "create_department",
     "delete_department",
     "get_department_tree",
+    "move_department",
     "router",
     "update_department",
 )

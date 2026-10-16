@@ -1,6 +1,6 @@
 """部门数据访问。"""
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import Base
@@ -88,8 +88,44 @@ async def list_by_path_prefix(
     return list(result.all())
 
 
+async def cascade_path_prefix(
+    session: AsyncSession,
+    *,
+    old_prefix: str,
+    new_prefix: str,
+    exclude_id: int,
+) -> None:
+    loaded_descendant_ids = [
+        item.id
+        for item in session.identity_map.values()
+        if isinstance(item, Department)
+        and item.id != exclude_id
+        and item.path.startswith(old_prefix)
+    ]
+    suffix = func.substr(Department.path, len(old_prefix) + 1)
+    statement = (
+        update(Department)
+        .where(
+            Department.path.startswith(old_prefix),
+            Department.id != exclude_id,
+        )
+        .values(path=func.concat(new_prefix, suffix))
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(statement)
+
+    if loaded_descendant_ids:
+        refresh_statement = (
+            select(Department)
+            .where(Department.id.in_(loaded_descendant_ids))
+            .execution_options(populate_existing=True)
+        )
+        await session.scalars(refresh_statement)
+
+
 __all__: tuple[str, ...] = (
     "add",
+    "cascade_path_prefix",
     "get_by_id",
     "has_children",
     "has_users",
