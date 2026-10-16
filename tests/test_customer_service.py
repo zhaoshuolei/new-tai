@@ -658,3 +658,65 @@ async def test_update_visible_customer_changes_fields(session: AsyncSession) -> 
 
     assert updated.name == "新名称"
     assert updated.remark == "备注"
+
+
+async def test_update_duplicate_credit_code_is_rejected(
+    session: AsyncSession,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    first = await make_customer_row(
+        session,
+        owner=caller,
+        credit_code=REQUESTED_CREDIT_CODE,
+    )
+    second = await make_customer_row(session, owner=caller)
+
+    with pytest.raises(BusinessError) as exc:
+        await update_customer(
+            session,
+            second.id,
+            CustomerUpdate(credit_code=first.credit_code),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": first.id}
+
+
+async def test_update_translates_concurrent_credit_code_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    first = await make_customer_row(
+        session,
+        owner=caller,
+        credit_code=REQUESTED_CREDIT_CODE,
+    )
+    second = await make_customer_row(session, owner=caller)
+
+    # 模拟并发：主动查重看不到冲突行（返回 None），但表里其实已有该信用代码，
+    # 于是 flush 触发唯一索引冲突，由 SAVEPOINT 捕获并转为 7002。
+    async def _proactive_lookup_none(
+        _session: AsyncSession, _credit_code: str
+    ) -> Customer | None:
+        return None
+
+    monkeypatch.setattr(
+        customer_service, "get_by_credit_code", _proactive_lookup_none
+    )
+
+    with pytest.raises(BusinessError) as exc:
+        await update_customer(
+            session,
+            second.id,
+            CustomerUpdate(credit_code=REQUESTED_CREDIT_CODE),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": first.id}

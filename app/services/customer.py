@@ -16,6 +16,7 @@ from app.core.errors import BusinessError, ErrorCode
 from app.models.customer import Customer, CustomerSource
 from app.models.user import User, UserStatus
 from app.repositories import customer as customer_repository
+from app.repositories.customer import get_by_credit_code
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services.customer_scope_text import resolve_full_business_scope
 from app.services.data_scope import (
@@ -351,23 +352,43 @@ async def update_customer(
             raise _invalid_field_error("Customer name is required")
         changes["name"] = name
 
+    updated_credit_code: str | None = None
     if "credit_code" in changes:
         code = _normalize_optional_credit_code(changes["credit_code"])
         changes["credit_code"] = code
         if code is not None and code != customer.credit_code:
-            existing = await customer_repository.get_by_credit_code(session, code)
+            existing = await get_by_credit_code(session, code)
             if existing is not None and existing.id != customer.id:
                 duplicate = await _duplicate_error(session, existing, context)
                 raise duplicate
+        updated_credit_code = code
 
     for field_name in _STRING_UPDATE_FIELDS:
         if field_name in changes:
             changes[field_name] = _clean_optional(changes[field_name])
 
-    for field_name, value in changes.items():
-        setattr(customer, field_name, value)
-
-    await session.flush()
+    if updated_credit_code is not None:
+        # 主动查重与写入之间可能有并发提交；用 SAVEPOINT 把唯一约束冲突
+        # 转为 7002，避免裸 IntegrityError 冒泡为 500（与 _insert_customer 对齐）。
+        # 赋值与 flush 同在 SAVEPOINT 内，回滚后对象恢复旧值，不会在随后的
+        # 冲突查重中再次 autoflush 触发同一异常。
+        try:
+            async with session.begin_nested():
+                for field_name, value in changes.items():
+                    setattr(customer, field_name, value)
+                await session.flush()
+        except IntegrityError as error:
+            conflicting = await customer_repository.get_by_credit_code(
+                session, updated_credit_code
+            )
+            if conflicting is not None:
+                duplicate = await _duplicate_error(session, conflicting, context)
+                raise duplicate from error
+            raise
+    else:
+        for field_name, value in changes.items():
+            setattr(customer, field_name, value)
+        await session.flush()
     return customer
 
 
