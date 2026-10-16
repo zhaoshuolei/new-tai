@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.auth_context import AuthContext
@@ -14,12 +15,14 @@ from app.core.deps import get_current_context
 from app.core.errors import ErrorCode
 from app.db.session import get_session
 from app.main import create_app
+from app.models.customer import Customer, CustomerSource
 from app.models.department import Department, DepartmentStatus
 from app.models.role import DataScope
 from app.models.user import User, UserStatus
 from app.schemas.department import DepartmentCreate
 from app.schemas.user import UserCreate
 from app.services import data_scope as data_scope_service
+from app.services.data_scope import build_customer_scope_filter
 from app.services.department import create_department
 from app.services.user import create_local_user
 
@@ -488,16 +491,7 @@ def test_customer_scope_dept_uses_owner_department_column() -> None:
     sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
 
     assert "customer.owner_department_id" in sql
-
-
-def test_customer_scope_null_department_is_invisible_for_dept_scope() -> None:
-    ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
-
-    sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
-
-    # owner_department_id 为 NULL 的行不满足 =/:IN 谓词，故此处不能退化为 true。
-    assert sql.strip().lower() != "true"
-    assert "customer.owner_department_id" in sql
+    assert "customer.owner_department_id = 3" in sql
 
 
 def test_customer_scope_all_returns_true() -> None:
@@ -506,3 +500,93 @@ def test_customer_scope_all_returns_true() -> None:
     sql = _compiled(data_scope_service.build_customer_scope_filter(ctx))
 
     assert sql.strip().lower() == "true"
+
+
+async def _create_null_department_customer(
+    session: AsyncSession,
+    *,
+    owner_user_id: int,
+) -> Customer:
+    customer = Customer(
+        name="无部门客户",
+        source=CustomerSource.MANUAL,
+        owner_user_id=owner_user_id,
+        owner_department_id=None,
+    )
+    session.add(customer)
+    await session.flush()
+    return customer
+
+
+async def _visible_customer_ids(
+    session: AsyncSession,
+    ctx: AuthContext,
+) -> set[int]:
+    customers = await session.scalars(
+        select(Customer).where(build_customer_scope_filter(ctx))
+    )
+    return {customer.id for customer in customers}
+
+
+async def test_customer_scope_null_department_is_invisible_for_dept_scope(
+    session: AsyncSession,
+    scope_data: ScopeData,
+) -> None:
+    customer = await _create_null_department_customer(
+        session,
+        owner_user_id=scope_data.users["alice"].id,
+    )
+    ctx = _ctx(
+        data_scope=DataScope.DEPT,
+        user_id=scope_data.users["alice"].id,
+        department_id=scope_data.engineering.id,
+    )
+
+    visible = await _visible_customer_ids(session, ctx)
+
+    # D4：owner_department_id 为 NULL 的客户在 DEPT 档位不可见。
+    assert customer.id not in visible
+
+
+async def test_customer_scope_null_department_is_visible_for_all(
+    session: AsyncSession,
+    scope_data: ScopeData,
+) -> None:
+    customer = await _create_null_department_customer(
+        session,
+        owner_user_id=scope_data.users["alice"].id,
+    )
+    ctx = _ctx(
+        data_scope=DataScope.ALL,
+        user_id=scope_data.users["alice"].id,
+        department_id=scope_data.engineering.id,
+    )
+
+    visible = await _visible_customer_ids(session, ctx)
+
+    # D4：owner_department_id 为 NULL 的客户在 ALL 档位可见。
+    assert customer.id in visible
+
+
+async def test_customer_scope_null_department_self_matches_only_owner(
+    session: AsyncSession,
+    scope_data: ScopeData,
+) -> None:
+    customer = await _create_null_department_customer(
+        session,
+        owner_user_id=scope_data.users["alice"].id,
+    )
+    owner_ctx = _ctx(
+        data_scope=DataScope.SELF,
+        user_id=scope_data.users["alice"].id,
+        department_id=None,
+    )
+    other_ctx = _ctx(
+        data_scope=DataScope.SELF,
+        user_id=scope_data.users["bob"].id,
+        department_id=None,
+    )
+
+    # D4：NULL 部门客户对负责人本人（SELF）可见，对其他用户不可见。
+    assert customer.id in await _visible_customer_ids(session, owner_ctx)
+    assert customer.id not in await _visible_customer_ids(session, other_ctx)
