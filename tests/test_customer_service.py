@@ -356,6 +356,25 @@ async def test_import_without_scope_match_keeps_truncated_flag(
     assert customer.business_scope_truncated is True
 
 
+async def test_import_without_history_keeps_truncated_scope(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    fake_client.historical_text = ""
+
+    customer = await import_from_tianyancha(
+        session,
+        REQUESTED_CREDIT_CODE,
+        None,
+        context=context,
+    )
+
+    assert customer.business_scope == TRUNCATED_SCOPE
+    assert customer.business_scope_truncated is True
+
+
 async def test_search_blank_keyword_is_rejected(
     session: AsyncSession,
     fake_client: FakeTianyanchaClient,

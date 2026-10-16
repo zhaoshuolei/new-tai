@@ -465,7 +465,8 @@ class TianyanchaClient:
             },
         )
         if EMPTY_RESULT_MARKER in text:
-            raise _not_found_error()
+            # 无历史工商记录不是错误，返回空文本，由调用方回退为截断标记。
+            return ""
         return text
 
 

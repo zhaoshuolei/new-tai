@@ -520,6 +520,27 @@ async def test_fetch_historical_registration_text_returns_raw_markdown() -> None
     )
 
 
+async def test_fetch_historical_registration_empty_result_returns_empty_string() -> (
+    None
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
+            )
+        return httpx.Response(
+            200,
+            json=_tools_result(body["id"], "> 空结果：未发现该维度记录"),
+        )
+
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
+
+    text = await client.fetch_historical_registration_text("91000000000000000X")
+
+    assert text == ""
+
+
 async def test_connection_invokes_tools_call() -> None:
     methods: list[str] = []
 
