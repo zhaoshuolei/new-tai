@@ -20,12 +20,15 @@ from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import key
 from app.core.redis import redis_client as default_redis_client
+from app.core.request_context import current_request_meta
 from app.core.security import create_access_token, verify_password
 from app.models.department import Department
+from app.models.login_log import LoginResultEnum, LoginType
 from app.models.role import DataScope, Role, RoleDepartment, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
+from app.services.login_log import record_login_log
 
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
@@ -305,7 +308,68 @@ async def issue_token_pair(
     )
 
 
+def _login_error_reason(error: BusinessError) -> str:
+    try:
+        return ErrorCode(error.code).name
+    except ValueError:
+        return str(error.code)
+
+
 async def login_local_user(
+    session: AsyncSession,
+    redis: Redis,
+    *,
+    username: str,
+    password: str,
+    client_ip: str,
+    device_id: str | None = None,
+) -> LoginResult:
+    request_meta = current_request_meta()
+    try:
+        result = await _login_local_user(
+            session,
+            redis,
+            username=username,
+            password=password,
+            client_ip=client_ip,
+            device_id=device_id,
+        )
+    except BusinessError as error:
+        await record_login_log(
+            user_id=None,
+            username=username,
+            login_type=LoginType.LOCAL,
+            result=LoginResultEnum.FAILURE,
+            reason=_login_error_reason(error),
+            request_meta=request_meta,
+            device_id=device_id,
+        )
+        raise
+    except Exception:
+        await record_login_log(
+            user_id=None,
+            username=username,
+            login_type=LoginType.LOCAL,
+            result=LoginResultEnum.FAILURE,
+            reason=ErrorCode.INTERNAL_ERROR.name,
+            request_meta=request_meta,
+            device_id=device_id,
+        )
+        raise
+
+    await record_login_log(
+        user_id=result.user.id,
+        username=username,
+        login_type=LoginType.LOCAL,
+        result=LoginResultEnum.SUCCESS,
+        reason=None,
+        request_meta=request_meta,
+        device_id=device_id,
+    )
+    return result
+
+
+async def _login_local_user(
     session: AsyncSession,
     redis: Redis,
     *,
@@ -406,6 +470,55 @@ def _prepare_existing_feishu_user(
 
 
 async def login_with_feishu(
+    session: AsyncSession,
+    redis: Redis,
+    code: str,
+    *,
+    client_ip: str,
+    client: FeishuClient | None = None,
+) -> LoginResult:
+    request_meta = current_request_meta()
+    try:
+        result = await _login_with_feishu(
+            session,
+            redis,
+            code,
+            client_ip=client_ip,
+            client=client,
+        )
+    except BusinessError as error:
+        await record_login_log(
+            user_id=None,
+            username=None,
+            login_type=LoginType.FEISHU,
+            result=LoginResultEnum.FAILURE,
+            reason=_login_error_reason(error),
+            request_meta=request_meta,
+        )
+        raise
+    except Exception:
+        await record_login_log(
+            user_id=None,
+            username=None,
+            login_type=LoginType.FEISHU,
+            result=LoginResultEnum.FAILURE,
+            reason=ErrorCode.INTERNAL_ERROR.name,
+            request_meta=request_meta,
+        )
+        raise
+
+    await record_login_log(
+        user_id=result.user.id,
+        username=None,
+        login_type=LoginType.FEISHU,
+        result=LoginResultEnum.SUCCESS,
+        reason=None,
+        request_meta=request_meta,
+    )
+    return result
+
+
+async def _login_with_feishu(
     session: AsyncSession,
     redis: Redis,
     code: str,
