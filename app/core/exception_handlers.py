@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
 from app.core.errors import BusinessError, ErrorCode
+from app.core.logging import current_request_id
+from app.core.middleware import SECURITY_HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,10 @@ def _request_id(request: Request) -> str:
     if isinstance(request_id, str) and request_id:
         return request_id
 
+    context_request_id = current_request_id()
+    if context_request_id:
+        return context_request_id
+
     header_request_id = request.headers.get("X-Request-Id")
     if header_request_id:
         return header_request_id
@@ -42,12 +48,17 @@ def _error_response(
     message: str,
     status_code: int,
 ) -> JSONResponse:
+    request_id = _request_id(request)
     return JSONResponse(
         status_code=status_code,
         content={
             "code": code,
             "message": message,
-            "request_id": _request_id(request),
+            "request_id": request_id,
+        },
+        headers={
+            "X-Request-Id": request_id,
+            **SECURITY_HEADERS,
         },
     )
 
