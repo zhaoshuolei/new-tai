@@ -1,4 +1,4 @@
-"""Local authentication, token lifecycle and request auth snapshots."""
+"""本地认证、令牌生命周期与请求认证快照。"""
 
 import json
 import re
@@ -31,7 +31,24 @@ REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 
+_DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$0sQwzdi5vx9ycTTSD1oUBA$"
+    "UMXfsnrib5tjjU2VjKDaHA1v1ltjclIuw/27FiUvE9k"
+)
 _DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_LOGIN_RATE_LIMIT_SCRIPT = """
+local exceeded = 0
+for _, rate_key in ipairs(KEYS) do
+    local count = redis.call('INCR', rate_key)
+    if count == 1 then
+        redis.call('EXPIRE', rate_key, ARGV[1])
+    end
+    if count > tonumber(ARGV[2]) then
+        exceeded = 1
+    end
+end
+return exceeded
+"""
 _ROTATE_REFRESH_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if not current or current ~= ARGV[1] then
@@ -123,12 +140,16 @@ def _refresh_key_pattern(user_id: int) -> str:
     return key("auth", "refresh", str(user_id), "*")
 
 
+def _normalize_account(username: str) -> str:
+    return username.strip().casefold()
+
+
 def _login_ip_key(client_ip: str) -> str:
     return key("auth", "login", "ip", client_ip)
 
 
 def _login_account_key(username: str) -> str:
-    return key("auth", "login", "account", username)
+    return key("auth", "login", "account", _normalize_account(username))
 
 
 async def get_auth_snapshot(
@@ -136,7 +157,7 @@ async def get_auth_snapshot(
     redis: Redis,
     user_id: int,
 ) -> AuthSnapshot:
-    """Return the cached per-user auth snapshot, loading it on a miss."""
+    """返回用户认证快照；缓存未命中时回源数据库并写回。"""
     snapshot_key = _snapshot_key(user_id)
     cached = await redis.get(snapshot_key)
     if isinstance(cached, str):
@@ -212,12 +233,15 @@ async def authenticate_local_user(
     username: str,
     password: str,
 ) -> User:
-    user = await user_repository.get_by_username(session, username)
-    if (
-        user is None
-        or user.password_hash is None
-        or not verify_password(password, user.password_hash)
-    ):
+    normalized_username = _normalize_account(username)
+    user = await user_repository.get_by_username(session, normalized_username)
+    password_hash = (
+        user.password_hash
+        if user is not None and user.password_hash is not None
+        else _DUMMY_PASSWORD_HASH
+    )
+    password_matches = verify_password(password, password_hash)
+    if user is None or user.password_hash is None or not password_matches:
         raise BusinessError(
             ErrorCode.INVALID_CREDENTIALS,
             "Invalid username or password",
@@ -321,22 +345,8 @@ async def login_local_user(
         client_ip=client_ip,
         username=username,
     )
-    try:
-        user = await authenticate_local_user(session, username, password)
-    except BusinessError as error:
-        if error.code == ErrorCode.INVALID_CREDENTIALS:
-            await record_login_failure(
-                redis,
-                client_ip=client_ip,
-                username=username,
-            )
-        raise
-
-    await clear_login_failures(
-        redis,
-        client_ip=client_ip,
-        username=username,
-    )
+    user = await authenticate_local_user(session, username, password)
+    await clear_login_account_failures(redis, username=username)
     tokens = await issue_token_pair(redis, user, device_id=device_id)
     return LoginResult(tokens=tokens, user=user)
 
@@ -408,51 +418,30 @@ async def enforce_login_rate_limit(
     client_ip: str,
     username: str,
 ) -> None:
-    for rate_limit_key in (
+    """原子预占 IP 与账号两个限流桶，超过阈值时拒绝登录。"""
+    exceeded = await redis.eval(
+        _LOGIN_RATE_LIMIT_SCRIPT,
+        2,
         _login_ip_key(client_ip),
         _login_account_key(username),
-    ):
-        raw_count = await redis.get(rate_limit_key)
-        try:
-            count = int(raw_count or 0)
-        except ValueError:
-            count = 0
-        if count >= LOGIN_RATE_LIMIT_ATTEMPTS:
-            raise BusinessError(
-                ErrorCode.RATE_LIMITED,
-                "Too many login attempts",
-                http_status=429,
-            )
-
-
-async def record_login_failure(
-    redis: Redis,
-    *,
-    client_ip: str,
-    username: str,
-) -> None:
-    for rate_limit_key in (
-        _login_ip_key(client_ip),
-        _login_account_key(username),
-    ):
-        count = await redis.incr(rate_limit_key)
-        if count == 1:
-            await redis.expire(
-                rate_limit_key,
-                LOGIN_RATE_LIMIT_WINDOW_SECONDS,
-            )
-
-
-async def clear_login_failures(
-    redis: Redis,
-    *,
-    client_ip: str,
-    username: str,
-) -> None:
-    await redis.delete(
-        _login_ip_key(client_ip),
-        _login_account_key(username),
+        str(LOGIN_RATE_LIMIT_WINDOW_SECONDS),
+        str(LOGIN_RATE_LIMIT_ATTEMPTS),
     )
+    if exceeded != 0:
+        raise BusinessError(
+            ErrorCode.RATE_LIMITED,
+            "Too many login attempts",
+            http_status=429,
+        )
+
+
+async def clear_login_account_failures(
+    redis: Redis,
+    *,
+    username: str,
+) -> None:
+    """登录成功后只清理账号维度；共享 IP 桶保留给其他账号。"""
+    await redis.delete(_login_account_key(username))
 
 
 async def build_auth_context(
@@ -508,7 +497,7 @@ __all__: tuple[str, ...] = (
     "authenticate_local_user",
     "build_auth_context",
     "bump_token_version",
-    "clear_login_failures",
+    "clear_login_account_failures",
     "enforce_login_rate_limit",
     "get_auth_snapshot",
     "invalidate_auth_snapshot",
@@ -517,6 +506,5 @@ __all__: tuple[str, ...] = (
     "issue_token_pair",
     "login_local_user",
     "logout_refresh_token",
-    "record_login_failure",
     "rotate_refresh_token",
 )

@@ -1,4 +1,4 @@
-"""FastAPI request dependencies for the authenticated request context."""
+"""认证请求上下文的 FastAPI 依赖。"""
 
 from typing import Annotated
 
@@ -20,6 +20,7 @@ async def get_current_context(
     redis: Annotated[Redis, Depends(get_redis)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> AuthContext:
+    """校验 Bearer token 与认证快照并组装请求上下文。"""
     if authorization is None:
         raise BusinessError(
             ErrorCode.UNAUTHENTICATED,

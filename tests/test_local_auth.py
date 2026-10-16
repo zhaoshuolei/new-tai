@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -8,11 +9,12 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Response
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.config import settings
 from app.core.deps import get_current_context
-from app.core.errors import ErrorCode
+from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis, key
 from app.core.security import decode_access_token
 from app.db.session import get_session
@@ -99,6 +101,20 @@ class FakeRedis:
     async def eval(self, script: str, numkeys: int, *args: Any) -> int:
         keys = args[:numkeys]
         values = args[numkeys:]
+
+        if "redis.call('INCR'" in script:
+            ttl = int(values[0])
+            threshold = int(values[1])
+            exceeded = 0
+            for redis_key in keys:
+                count = int(self.values.get(redis_key, "0")) + 1
+                self.values[redis_key] = str(count)
+                if count == 1:
+                    self.expirations[redis_key] = ttl
+                if count > threshold:
+                    exceeded = 1
+            return exceeded
+
         if len(keys) != 1:
             raise NotImplementedError
         redis_key = keys[0]
@@ -155,6 +171,39 @@ async def client(
 
     application.dependency_overrides[get_session] = override_session
     application.dependency_overrides[get_redis] = lambda: fake_redis
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        application.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def real_redis() -> AsyncIterator[Redis]:
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    await redis.ping()
+    try:
+        yield redis
+    finally:
+        await redis.aclose()
+
+
+@pytest_asyncio.fixture
+async def live_client(
+    session: AsyncSession,
+    real_redis: Redis,
+) -> AsyncIterator[AsyncClient]:
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_redis] = lambda: real_redis
 
     try:
         async with AsyncClient(
@@ -494,6 +543,265 @@ async def test_login_rate_limit_returns_1005_after_threshold(
 
     assert response.status_code == 429
     assert response.json()["code"] == ErrorCode.RATE_LIMITED
+
+
+async def test_account_rate_limit_normalizes_case_and_whitespace(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    username = unique_username("rate-case")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="correct-password"),
+    )
+    variants = [
+        username.upper(),
+        username.lower(),
+        username.title(),
+        f" {username} ",
+        f"\t{username.upper()} ",
+    ]
+
+    for index, variant in enumerate(variants):
+        with pytest.raises(BusinessError) as error:
+            await auth_service.login_local_user(
+                session,
+                fake_redis,
+                username=variant,
+                password="wrong-password",
+                client_ip=f"198.51.100.{index + 1}",
+                device_id=f"device-{index}",
+            )
+        assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=f" {username.casefold()} ",
+            password="wrong-password",
+            client_ip="203.0.113.1",
+            device_id="device-threshold",
+        )
+
+    assert error.value.code == ErrorCode.RATE_LIMITED
+    assert error.value.http_status == 429
+
+
+async def test_rate_limit_reservation_is_atomic_for_concurrent_attempts(
+    fake_redis: FakeRedis,
+) -> None:
+    username = unique_username("rate-atomic")
+    client_ip = "198.51.100.99"
+
+    async def attempt() -> int | None:
+        try:
+            await auth_service.enforce_login_rate_limit(
+                fake_redis,
+                client_ip=client_ip,
+                username=username,
+            )
+        except BusinessError as error:
+            return error.code
+        return None
+
+    results = await asyncio.gather(*(attempt() for _ in range(10)))
+
+    assert results.count(None) == auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
+    assert results.count(ErrorCode.RATE_LIMITED) == (
+        10 - auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
+    )
+
+
+async def test_rate_limit_reservation_uses_real_redis_lua(
+    real_redis: Redis,
+) -> None:
+    username = unique_username("rate-live")
+    client_ip = "203.0.113.250"
+    ip_key = key("auth", "login", "ip", client_ip)
+    account_key = key("auth", "login", "account", username.casefold())
+    await real_redis.delete(ip_key, account_key)
+
+    try:
+        for _ in range(auth_service.LOGIN_RATE_LIMIT_ATTEMPTS):
+            await auth_service.enforce_login_rate_limit(
+                real_redis,
+                client_ip=client_ip,
+                username=username,
+            )
+
+        with pytest.raises(BusinessError) as error:
+            await auth_service.enforce_login_rate_limit(
+                real_redis,
+                client_ip=client_ip,
+                username=username,
+            )
+
+        assert error.value.code == ErrorCode.RATE_LIMITED
+        assert await real_redis.get(account_key) == str(
+            auth_service.LOGIN_RATE_LIMIT_ATTEMPTS + 1
+        )
+        assert (
+            0
+            < await real_redis.ttl(account_key)
+            <= (auth_service.LOGIN_RATE_LIMIT_WINDOW_SECONDS)
+        )
+    finally:
+        await real_redis.delete(ip_key, account_key)
+
+
+async def test_rate_limit_increments_before_password_verification(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    username = unique_username("rate-order")
+    await create_local_user(
+        session,
+        UserCreate(username=username, password="correct-password"),
+    )
+    client_ip = "198.51.100.100"
+    observed_counts: dict[str, str | None] = {}
+
+    def observing_verify_password(plain: str, hashed: str) -> bool:
+        assert plain == "wrong-password"
+        assert hashed
+        observed_counts["ip"] = fake_redis.values.get(
+            key("auth", "login", "ip", client_ip)
+        )
+        observed_counts["account"] = fake_redis.values.get(
+            key("auth", "login", "account", username.casefold())
+        )
+        return False
+
+    monkeypatch.setattr(auth_service, "verify_password", observing_verify_password)
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=username,
+            password="wrong-password",
+            client_ip=client_ip,
+            device_id="device-rate-order",
+        )
+
+    assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+    assert observed_counts == {"ip": "1", "account": "1"}
+
+
+async def test_successful_login_clears_only_account_rate_limit(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    username = unique_username("rate-clear")
+    password = "correct-password"
+    client_ip = "198.51.100.200"
+    await create_local_user(
+        session,
+        UserCreate(username=username, password=password),
+    )
+    ip_key = key("auth", "login", "ip", client_ip)
+    account_key = key("auth", "login", "account", username.casefold())
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=f" {username.upper()} ",
+            password="wrong-password",
+            client_ip=client_ip,
+            device_id="device-rate-clear",
+        )
+    assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+
+    result = await auth_service.login_local_user(
+        session,
+        fake_redis,
+        username=username,
+        password=password,
+        client_ip=client_ip,
+        device_id="device-rate-clear",
+    )
+
+    assert result.tokens.refresh_token
+    assert await fake_redis.get(account_key) is None
+    assert await fake_redis.get(ip_key) == "2"
+    assert (
+        fake_redis.expirations[ip_key] == auth_service.LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    )
+
+
+async def test_missing_user_still_runs_dummy_password_verification(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verified_hashes: list[str] = []
+
+    def observing_verify_password(plain: str, hashed: str) -> bool:
+        assert plain == "wrong-password"
+        verified_hashes.append(hashed)
+        return False
+
+    monkeypatch.setattr(auth_service, "verify_password", observing_verify_password)
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=unique_username("missing-user"),
+            password="wrong-password",
+            client_ip="198.51.100.201",
+            device_id="device-missing-user",
+        )
+
+    assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+    assert verified_hashes == [auth_service._DUMMY_PASSWORD_HASH]
+
+
+async def test_refresh_rotation_uses_real_redis_lua_and_resets_ttl(
+    live_client: AsyncClient,
+    session: AsyncSession,
+    real_redis: Redis,
+) -> None:
+    username = unique_username("live-refresh")
+    device_id = f"live-{uuid4().hex}"
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password="password"),
+    )
+    login_response = await login(
+        live_client,
+        username,
+        "password",
+        device_id=device_id,
+    )
+    old_refresh_token = login_response.json()["data"]["refresh_token"]
+    refresh_key = key("auth", "refresh", str(user.id), device_id)
+    rate_limit_keys = (
+        key("auth", "login", "ip", "127.0.0.1"),
+        key("auth", "login", "account", username.casefold()),
+    )
+
+    try:
+        initial_ttl = await real_redis.ttl(refresh_key)
+        assert 0 < initial_ttl <= auth_service.REFRESH_TOKEN_TTL_SECONDS
+
+        rotated = await refresh(live_client, old_refresh_token)
+
+        assert rotated.status_code == 200
+        new_refresh_token = rotated.json()["data"]["refresh_token"]
+        assert new_refresh_token != old_refresh_token
+        rotated_ttl = await real_redis.ttl(refresh_key)
+        assert 0 < rotated_ttl <= auth_service.REFRESH_TOKEN_TTL_SECONDS
+
+        reused = await refresh(live_client, old_refresh_token)
+
+        assert reused.status_code == 401
+        assert reused.json()["code"] == ErrorCode.TOKEN_INVALID
+    finally:
+        await real_redis.delete(refresh_key, *rate_limit_keys)
 
 
 async def test_malformed_access_token_returns_1004(
