@@ -3,10 +3,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.api.health import router as health_router
 from app.core.config import settings
+from app.core.redis import redis_client
+from app.db.session import engine
 
 OPENAPI_TAGS: list[dict[str, str]] = [
     {"name": "认证", "description": "认证与会话管理"},
@@ -55,22 +57,17 @@ def _raise_cleanup_errors(errors: list[Exception]) -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    redis_client: Redis | None = None
-    db_engine: AsyncEngine | None = None
     application.state.redis_client = None
     application.state.db_engine = None
 
     try:
         _validate_critical_settings()
-        redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
         application.state.redis_client = redis_client
-        assert redis_client is not None
+        application.state.db_engine = engine
         await redis_client.ping()
-        db_engine = create_async_engine(settings.database_url, pool_pre_ping=True)
-        application.state.db_engine = db_engine
         yield
     except BaseException as primary_error:
-        cleanup_errors = await _cleanup_resources(redis_client, db_engine)
+        cleanup_errors = await _cleanup_resources(redis_client, engine)
         application.state.redis_client = None
         application.state.db_engine = None
         if cleanup_errors:
@@ -80,7 +77,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             ) from primary_error
         raise
     else:
-        cleanup_errors = await _cleanup_resources(redis_client, db_engine)
+        cleanup_errors = await _cleanup_resources(redis_client, engine)
         application.state.redis_client = None
         application.state.db_engine = None
         _raise_cleanup_errors(cleanup_errors)

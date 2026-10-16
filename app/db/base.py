@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, func
+from sqlalchemy import BigInteger, func
+from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -11,13 +12,13 @@ class Base(DeclarativeBase):
         autoincrement=True,
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        server_default=func.now(),
+        DATETIME(fsp=6),
+        server_default=func.utc_timestamp(6),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        server_default=func.now(),
-        onupdate=func.now(),
+        DATETIME(fsp=6),
+        server_default=func.utc_timestamp(6),
+        onupdate=func.utc_timestamp(6),
     )
 
 

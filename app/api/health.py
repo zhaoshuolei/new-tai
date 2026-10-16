@@ -21,7 +21,8 @@ async def readiness(
 ) -> dict[str, str]:
     try:
         await session.execute(select(1))
-        await redis_client.ping()
+        if not await redis_client.ping():
+            raise RuntimeError("Redis ping failed")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Service unavailable") from exc
 

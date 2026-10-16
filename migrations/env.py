@@ -5,6 +5,8 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# 导入模型包以触发模型注册，供 Alembic 自动生成迁移使用。
+import app.models  # noqa: F401
 from app.core.config import settings
 from app.db.base import Base
 
