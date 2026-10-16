@@ -8,8 +8,11 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.2
+  - repo: local
     hooks:
-      - id: mypy
+      - id: mypy-project
+        name: mypy (project environment)
+        entry: .venv/bin/mypy app
+        language: system
+        pass_filenames: false
         files: ^app/

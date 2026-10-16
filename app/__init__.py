@@ -1,1 +1,1 @@
-"""Tianxiadmin application package."""
+"""天玺管理后台应用包。"""

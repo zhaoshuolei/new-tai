@@ -1,1 +1,1 @@
-"""Application-wide configuration and infrastructure primitives."""
+"""应用级配置与基础设施原语。"""

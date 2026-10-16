@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.core.config import settings
 
@@ -23,20 +23,66 @@ def _validate_critical_settings() -> None:
             raise RuntimeError(f"Missing required setting: {field_name}")
 
 
+async def _cleanup_resources(
+    redis_client: Redis | None,
+    db_engine: AsyncEngine | None,
+) -> list[Exception]:
+    errors: list[Exception] = []
+
+    if redis_client is not None:
+        try:
+            await redis_client.aclose()
+        except Exception as exc:
+            errors.append(exc)
+
+    if db_engine is not None:
+        try:
+            await db_engine.dispose()
+        except Exception as exc:
+            errors.append(exc)
+
+    return errors
+
+
+def _raise_cleanup_errors(errors: list[Exception]) -> None:
+    if not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    raise ExceptionGroup("Application resource cleanup failed", errors)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    _validate_critical_settings()
-    redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
-    db_engine = create_async_engine(settings.database_url, pool_pre_ping=True)
-    application.state.redis_client = redis_client
-    application.state.db_engine = db_engine
+    redis_client: Redis | None = None
+    db_engine: AsyncEngine | None = None
+    application.state.redis_client = None
+    application.state.db_engine = None
+
     try:
+        _validate_critical_settings()
+        redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        application.state.redis_client = redis_client
+        assert redis_client is not None
+        await redis_client.ping()
+        db_engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+        application.state.db_engine = db_engine
         yield
-    finally:
-        await redis_client.aclose()
-        await db_engine.dispose()
+    except BaseException as primary_error:
+        cleanup_errors = await _cleanup_resources(redis_client, db_engine)
         application.state.redis_client = None
         application.state.db_engine = None
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "Application startup or request failed during cleanup",
+                [primary_error, *cleanup_errors],
+            ) from primary_error
+        raise
+    else:
+        cleanup_errors = await _cleanup_resources(redis_client, db_engine)
+        application.state.redis_client = None
+        application.state.db_engine = None
+        _raise_cleanup_errors(cleanup_errors)
 
 
 def create_app() -> FastAPI:
