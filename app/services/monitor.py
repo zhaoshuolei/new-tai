@@ -2,20 +2,27 @@
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
 import psutil
 from redis.asyncio import Redis
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.redis import redis_client
 from app.db.session import session_factory
+from app.models.audit_log import AuditLog
+from app.models.exception_log import ExceptionLog
+from app.models.login_log import LoginLog
 from app.models.system_metric import SystemMetric
 from app.repositories import system_metric as system_metric_repository
 from app.services.health import check_database, check_redis
 
 _BYTES_PER_MB = 1024 * 1024
+_RETENTION_INTERVAL_SECONDS = 60 * 60
 logger = logging.getLogger(__name__)
 
 
@@ -96,14 +103,68 @@ async def sample_once(session: AsyncSession) -> SystemMetric:
     return row
 
 
+async def run_retention(session: AsyncSession) -> dict[str, int]:
+    """Delete expired monitoring and log rows using each table's retention rule."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    deleted = {
+        "system_metric": 0,
+        "exception_log": 0,
+        "audit_log": 0,
+        "login_log": 0,
+    }
+
+    if settings.monitor_metric_retention_days > 0:
+        cutoff = now - timedelta(days=settings.monitor_metric_retention_days)
+        result = await session.execute(
+            delete(SystemMetric).where(SystemMetric.sampled_at < cutoff)
+        )
+        deleted["system_metric"] = int(getattr(result, "rowcount", 0) or 0)
+
+    if settings.exception_log_retention_days > 0:
+        cutoff = now - timedelta(days=settings.exception_log_retention_days)
+        result = await session.execute(
+            delete(ExceptionLog).where(ExceptionLog.occurred_at < cutoff)
+        )
+        deleted["exception_log"] = int(getattr(result, "rowcount", 0) or 0)
+
+    if settings.audit_log_retention_days > 0:
+        cutoff = now - timedelta(days=settings.audit_log_retention_days)
+        result = await session.execute(
+            delete(AuditLog).where(AuditLog.created_at < cutoff)
+        )
+        deleted["audit_log"] = int(getattr(result, "rowcount", 0) or 0)
+
+    if settings.login_log_retention_days > 0:
+        cutoff = now - timedelta(days=settings.login_log_retention_days)
+        result = await session.execute(
+            delete(LoginLog).where(LoginLog.created_at < cutoff)
+        )
+        deleted["login_log"] = int(getattr(result, "rowcount", 0) or 0)
+
+    if any(deleted.values()):
+        await session.commit()
+    return deleted
+
+
 async def run_sampler(interval_seconds: int) -> None:
     """Sample forever until the owning lifespan task is cancelled."""
+    next_retention_at = time.monotonic()
     while True:
         try:
             async with session_factory() as session:
                 await sample_once(session)
         except Exception:
             logger.warning("System metric sampling failed", exc_info=True)
+
+        now = time.monotonic()
+        if now >= next_retention_at:
+            try:
+                async with session_factory() as session:
+                    await run_retention(session)
+            except Exception:
+                logger.warning("Log retention cleanup failed", exc_info=True)
+            next_retention_at = now + _RETENTION_INTERVAL_SECONDS
+
         await asyncio.sleep(interval_seconds)
 
 
@@ -135,6 +196,7 @@ __all__: tuple[str, ...] = (
     "collect_live_snapshot",
     "collect_psutil_snapshot",
     "list_history",
+    "run_retention",
     "run_sampler",
     "sample_once",
 )

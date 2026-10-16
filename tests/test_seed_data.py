@@ -39,6 +39,11 @@ EXPECTED_PERMISSION_CODES = {
     "dept:read",
     "dept:update",
     "dept:delete",
+    "audit:read",
+    "login_log:read",
+    "monitor:read",
+    "exception:read",
+    "exception:update",
 }
 
 
@@ -185,7 +190,6 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
         action = code.split(":", 1)[1]
         if action == "read":
             assert menu.type == MenuType.MENU
-            assert menu.parent_id == root.id
         else:
             assert menu.type == MenuType.BUTTON
             assert menu.parent_id is not None
@@ -209,6 +213,23 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
             if code.startswith(f"{module}:") and not code.endswith(":read")
         }
         assert button_parent_ids == {module_menu.id}
+
+    logs_directory = await session.scalar(
+        select(Menu).where(Menu.path == "/system/logs")
+    )
+    monitor_menu = menus_by_code["monitor:read"]
+    exceptions_menu = menus_by_code["exception:read"]
+    exceptions_ack = menus_by_code["exception:update"]
+
+    assert logs_directory is not None
+    assert logs_directory.type == MenuType.DIR
+    assert logs_directory.parent_id == root.id
+    assert menus_by_code["audit:read"].parent_id == logs_directory.id
+    assert menus_by_code["login_log:read"].parent_id == logs_directory.id
+    assert monitor_menu.parent_id == root.id
+    assert exceptions_menu.parent_id == monitor_menu.id
+    assert exceptions_ack.type == MenuType.BUTTON
+    assert exceptions_ack.parent_id == exceptions_menu.id
 
 
 async def test_init_creates_local_emergency_superadmin(
@@ -258,7 +279,7 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 20
+    assert await _count(session, Menu) == 26
     assert await _count(session, User) == 1
     assert await _count(session, RoleMenu) == 1
     assert (
