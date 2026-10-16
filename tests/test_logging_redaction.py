@@ -86,6 +86,14 @@ def _capture_message_with_existing_handler(
     return handler.output
 
 
+def test_api_key_is_masked() -> None:
+    assert mask_sensitive_text("api_key=mcpk2_secret") == "api_key=***"
+
+
+def test_api_key_is_masked_in_json_style() -> None:
+    assert mask_sensitive_text('"api_key": "mcpk2_secret"') == '"api_key": "***"'
+
+
 @pytest.mark.parametrize(
     "text",
     [

@@ -40,6 +40,21 @@ def test_business_routes_expose_success_envelope_in_openapi() -> None:
             assert {"code", "message", "data"} <= set(schema["properties"])
 
 
+def test_customer_and_tianyancha_error_codes_are_stable() -> None:
+    assert ErrorCode.CUSTOMER_NOT_FOUND == 7001
+    assert ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS == 7002
+    assert ErrorCode.CUSTOMER_INVALID_FIELD == 7003
+    assert ErrorCode.CUSTOMER_OWNER_UNAVAILABLE == 7004
+    assert ErrorCode.TIANYANCHA_NOT_CONFIGURED == 8001
+    assert ErrorCode.TIANYANCHA_TOKEN_UNREADABLE == 8002
+    assert ErrorCode.TIANYANCHA_UNAVAILABLE == 8003
+    assert ErrorCode.TIANYANCHA_RATE_LIMITED == 8004
+    assert ErrorCode.TIANYANCHA_QUOTA_EXCEEDED == 8005
+    assert ErrorCode.TIANYANCHA_AUTH_FAILED == 8006
+    assert ErrorCode.TIANYANCHA_NOT_FOUND == 8007
+    assert ErrorCode.TIANYANCHA_MALFORMED_RESPONSE == 8008
+
+
 def test_page_serializes_pagination_metadata() -> None:
     page = Page[int](items=[1, 2], total=5, page=1, page_size=2)
 

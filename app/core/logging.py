@@ -16,6 +16,7 @@ SENSITIVE_KEYS = {
     "refresh_token",
     "code",
     "authorization",
+    "api_key",
 }
 MASK = "***"
 
@@ -26,7 +27,7 @@ _request_id_context: ContextVar[str | None] = ContextVar(
 
 _SENSITIVE_VALUE_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?P<key_quote>[\"']?)\b"
-    r"(?P<key>access_token|refresh_token|authorization|password|token|code)"
+    r"(?P<key>access_token|refresh_token|api_key|authorization|password|token|code)"
     r"(?P=key_quote)\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\\\])*\"|'(?:\\.|[^'\\\\])*'"
     r"|[^,\r\n}\]]+)",
@@ -48,11 +49,14 @@ def reset_request_id(token: Token[str | None]) -> None:
     _request_id_context.reset(token)
 
 
+def _mask_sensitive_match(match: re.Match[str]) -> str:
+    raw_value = match.group("value")
+    quote = raw_value[0] if raw_value[:1] in {'"', "'"} else ""
+    return f"{match.group('prefix')}{quote}{MASK}{quote}"
+
+
 def mask_sensitive_text(value: str) -> str:
-    return _SENSITIVE_VALUE_PATTERN.sub(
-        lambda match: f"{match.group('prefix')}{MASK}",
-        value,
-    )
+    return _SENSITIVE_VALUE_PATTERN.sub(_mask_sensitive_match, value)
 
 
 def _mapping_key(value: object) -> str:
