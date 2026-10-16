@@ -66,7 +66,8 @@ async def collect_live_snapshot(
     redis: Redis,
 ) -> LiveSnapshot:
     """Collect a live resource snapshot and both application probes."""
-    snapshot = collect_psutil_snapshot()
+    # psutil.cpu_percent(interval=0.1) blocks for ~100ms; keep it off the loop.
+    snapshot = await asyncio.to_thread(collect_psutil_snapshot)
     return LiveSnapshot(
         cpu_percent=snapshot["cpu_percent"],
         memory_percent=snapshot["memory_percent"],

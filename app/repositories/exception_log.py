@@ -2,12 +2,17 @@
 
 from datetime import datetime
 
-from sqlalchemy import Row, func, select
+from sqlalchemy import Row, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.datetime_utils import to_utc_naive
 from app.models.exception_log import ExceptionLevel, ExceptionLog
+
+# Cap the number of fingerprint groups a single summary request can return so an
+# unbounded table (no time range, retention disabled) cannot materialize an
+# unbounded result set.
+MAX_SUMMARY_GROUPS = 200
 
 
 async def add(session: AsyncSession, row: ExceptionLog) -> ExceptionLog:
@@ -83,6 +88,7 @@ async def summary_by_fingerprint(
         .where(*conditions)
         .group_by(ExceptionLog.fingerprint)
         .order_by(func.max(ExceptionLog.occurred_at).desc())
+        .limit(MAX_SUMMARY_GROUPS)
     )
     result_rows = await session.execute(statement)
     return list(result_rows.all())
@@ -97,19 +103,35 @@ async def get_by_id(
 
 async def ack(
     session: AsyncSession,
-    row: ExceptionLog,
+    exception_id: int,
     *,
     user_id: int,
     at: datetime,
-) -> ExceptionLog:
-    row.acknowledged = True
-    row.acknowledged_by = user_id
-    row.acknowledged_at = at
-    await session.flush()
-    return row
+) -> bool:
+    """Atomically acknowledge an unacknowledged row, returning whether it matched.
+
+    The guarded ``WHERE acknowledged = false`` clause makes concurrent acks
+    safe: only the first one updates the handler and timestamp, later acks match
+    zero rows and leave the original values intact.
+    """
+    statement = (
+        update(ExceptionLog)
+        .where(
+            ExceptionLog.id == exception_id,
+            ExceptionLog.acknowledged.is_(False),
+        )
+        .values(
+            acknowledged=True,
+            acknowledged_by=user_id,
+            acknowledged_at=at,
+        )
+    )
+    result = await session.execute(statement)
+    return bool(getattr(result, "rowcount", 0) or 0)
 
 
 __all__: tuple[str, ...] = (
+    "MAX_SUMMARY_GROUPS",
     "ack",
     "add",
     "get_by_id",

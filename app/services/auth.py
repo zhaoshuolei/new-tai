@@ -343,6 +343,7 @@ async def login_local_user(
             reason=_login_error_reason(error),
             request_meta=request_meta,
             device_id=device_id,
+            client_ip=client_ip,
         )
         raise
     except Exception:
@@ -354,6 +355,7 @@ async def login_local_user(
             reason=ErrorCode.INTERNAL_ERROR.name,
             request_meta=request_meta,
             device_id=device_id,
+            client_ip=client_ip,
         )
         raise
 
@@ -365,6 +367,7 @@ async def login_local_user(
         reason=None,
         request_meta=request_meta,
         device_id=device_id,
+        client_ip=client_ip,
     )
     return result
 
@@ -494,6 +497,7 @@ async def login_with_feishu(
             result=LoginResultEnum.FAILURE,
             reason=_login_error_reason(error),
             request_meta=request_meta,
+            client_ip=client_ip,
         )
         raise
     except Exception:
@@ -504,6 +508,7 @@ async def login_with_feishu(
             result=LoginResultEnum.FAILURE,
             reason=ErrorCode.INTERNAL_ERROR.name,
             request_meta=request_meta,
+            client_ip=client_ip,
         )
         raise
 
@@ -514,6 +519,7 @@ async def login_with_feishu(
         result=LoginResultEnum.SUCCESS,
         reason=None,
         request_meta=request_meta,
+        client_ip=client_ip,
     )
     return result
 

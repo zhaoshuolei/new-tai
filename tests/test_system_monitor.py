@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -138,6 +139,35 @@ async def test_health_probe_helpers_swallow_failures() -> None:
         )
         is False
     )
+
+
+async def test_collect_live_snapshot_offloads_psutil_to_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_thread = threading.get_ident()
+    seen_thread: dict[str, int] = {}
+
+    def fake_snapshot() -> dict[str, Any]:
+        seen_thread["id"] = threading.get_ident()
+        return {
+            "cpu_percent": 10.0,
+            "memory_percent": 20.0,
+            "memory_used_mb": 100.0,
+            "memory_total_mb": 200.0,
+            "disk_percent": 30.0,
+            "disk_used_mb": 40.0,
+            "disk_total_mb": 80.0,
+            "process_memory_mb": 5.0,
+        }
+
+    monkeypatch.setattr(monitor_service, "collect_psutil_snapshot", fake_snapshot)
+
+    snapshot = await monitor_service.collect_live_snapshot(FakeSession(), FakeRedis())
+
+    assert seen_thread["id"] != caller_thread
+    assert snapshot["cpu_percent"] == 10.0
+    assert snapshot["db_healthy"] is True
+    assert snapshot["redis_healthy"] is True
 
 
 async def test_sample_once_writes_row(monkeypatch: pytest.MonkeyPatch) -> None:

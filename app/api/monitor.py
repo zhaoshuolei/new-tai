@@ -140,6 +140,19 @@ async def acknowledge_exception(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
+    updated = await exception_log_repository.ack(
+        session,
+        exception_id,
+        user_id=context.user_id,
+        at=_utcnow(),
+    )
+    if updated:
+        await session.commit()
+    else:
+        # Already acknowledged (or missing): discard the no-op update and read
+        # the authoritative row so a concurrent ack's handler/time is preserved.
+        await session.rollback()
+
     row = await exception_log_repository.get_by_id(session, exception_id)
     if row is None:
         raise BusinessError(
@@ -147,15 +160,6 @@ async def acknowledge_exception(
             "Exception log not found",
             http_status=404,
         )
-    # Re-acking is a no-op so the original handler and timestamp are preserved.
-    if not row.acknowledged:
-        await exception_log_repository.ack(
-            session,
-            row,
-            user_id=context.user_id,
-            at=_utcnow(),
-        )
-        await session.commit()
     return success(ExceptionLogRead.model_validate(row))
 
 

@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, timezone
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from fastapi import HTTPException, Request
 from httpx import ASGITransport, AsyncClient
@@ -348,14 +349,15 @@ async def test_summary_and_ack_roundtrip() -> None:
 
         ack_at = datetime.now(UTC).replace(tzinfo=None)
         for matched in matching:
-            row = await exception_log_repository.get_by_id(session, matched.id)
-            assert row is not None
-            await exception_log_repository.ack(
+            expected_update = not matched.acknowledged
+            updated = await exception_log_repository.ack(
                 session,
-                row,
+                matched.id,
                 user_id=42,
                 at=ack_at,
             )
+            # The guarded UPDATE only matches rows that are not yet acknowledged.
+            assert updated is expected_update
         await session.commit()
 
     async with session_factory() as session:
@@ -366,3 +368,96 @@ async def test_summary_and_ack_roundtrip() -> None:
         )
         summary = next(item for item in summaries if item.fingerprint == fingerprint)
         assert summary.acknowledged
+
+
+async def test_ack_guard_leaves_already_acknowledged_row_untouched() -> None:
+    request_id = unique_request_id()
+    fingerprint = uuid4().hex
+    first_at = datetime(2050, 3, 1, 10, 0, 0)
+    second_at = datetime(2050, 3, 1, 11, 0, 0)
+    async with session_factory() as session:
+        row = ExceptionLog(
+            exception_type="RuntimeError",
+            message="boom",
+            fingerprint=fingerprint,
+            level=ExceptionLevel.ERROR,
+            request_id=request_id,
+            method="GET",
+            path="/boom",
+            user_id=None,
+            status_code=500,
+            occurred_at=first_at,
+        )
+        session.add(row)
+        await session.commit()
+        exception_id = row.id
+
+    async with session_factory() as session:
+        assert (
+            await exception_log_repository.ack(
+                session,
+                exception_id,
+                user_id=42,
+                at=first_at,
+            )
+            is True
+        )
+        await session.commit()
+
+    # A second concurrent ack must not match the guarded UPDATE, so the original
+    # handler and timestamp survive.
+    async with session_factory() as session:
+        assert (
+            await exception_log_repository.ack(
+                session,
+                exception_id,
+                user_id=77,
+                at=second_at,
+            )
+            is False
+        )
+        await session.rollback()
+
+    async with session_factory() as session:
+        stored = await exception_log_repository.get_by_id(session, exception_id)
+        assert stored is not None
+        assert stored.acknowledged is True
+        assert stored.acknowledged_by == 42
+        assert stored.acknowledged_at == first_at
+
+
+async def test_summary_is_bounded_by_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = unique_request_id()
+    occurred_at = datetime(2050, 3, 2, 0, 0, 0)
+    cap = 2
+    monkeypatch.setattr(exception_log_repository, "MAX_SUMMARY_GROUPS", cap)
+
+    async with session_factory() as session:
+        for index in range(cap + 3):
+            session.add(
+                ExceptionLog(
+                    exception_type="RuntimeError",
+                    message="boom",
+                    fingerprint=f"{request_id}-{index}",
+                    level=ExceptionLevel.ERROR,
+                    request_id=request_id,
+                    method="GET",
+                    path="/boom",
+                    user_id=None,
+                    status_code=500,
+                    occurred_at=occurred_at + timedelta(seconds=index),
+                )
+            )
+        await session.commit()
+
+    async with session_factory() as session:
+        summaries = await exception_log_repository.summary_by_fingerprint(
+            session,
+            start_time=None,
+            end_time=None,
+        )
+
+    matching = [item for item in summaries if item.fingerprint.startswith(request_id)]
+    assert len(matching) == cap

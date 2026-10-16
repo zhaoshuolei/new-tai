@@ -18,7 +18,9 @@ async def _discard_database_session(session: AsyncSession) -> None:
 
 async def _discard_redis_connection(client: Redis) -> None:
     try:
-        await client.connection_pool.disconnect(inuse_connections=True)
+        # Only drop idle pooled sockets: the pool is process-wide, so aborting
+        # in-use connections would cut off unrelated concurrent requests.
+        await client.connection_pool.disconnect(inuse_connections=False)
     except Exception:
         return
 

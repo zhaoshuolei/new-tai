@@ -17,3 +17,19 @@ def test_required_settings_fail_without_values(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_monitor_sample_interval_default_is_60(test_settings: Settings) -> None:
+    assert test_settings.monitor_sample_interval_seconds == 60
+
+
+@pytest.mark.parametrize("interval", [0, -1, -60])
+def test_monitor_sample_interval_must_be_positive(interval: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="mysql+asyncmy://u:p@localhost:3306/db",
+            redis_url="redis://localhost:6379/15",
+            jwt_secret="secret",
+            monitor_sample_interval_seconds=interval,
+            _env_file=None,
+        )

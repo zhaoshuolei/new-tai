@@ -16,6 +16,7 @@ async def record_login_log(
     reason: str | None,
     request_meta: RequestMeta | None,
     device_id: str | None = None,
+    client_ip: str | None = None,
 ) -> None:
     """Persist one login attempt in an independent best-effort transaction."""
 
@@ -26,7 +27,11 @@ async def record_login_log(
             login_type=login_type,
             result=result,
             reason=reason,
-            ip=request_meta.ip if request_meta is not None else None,
+            # The caller-provided client IP is authoritative; request meta is a
+            # fallback for callers that do not resolve it themselves.
+            ip=client_ip
+            if client_ip is not None
+            else (request_meta.ip if request_meta is not None else None),
             user_agent=(request_meta.user_agent if request_meta is not None else None),
             device_id=device_id,
             request_id=bounded_request_id(

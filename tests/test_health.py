@@ -64,9 +64,10 @@ class HangingSession:
 class FakeConnectionPool:
     def __init__(self) -> None:
         self.disconnected = False
+        self.inuse_connections: bool | None = None
 
     async def disconnect(self, *, inuse_connections: bool) -> None:
-        assert inuse_connections is True
+        self.inuse_connections = inuse_connections
         self.disconnected = True
 
 
@@ -104,6 +105,9 @@ async def test_hanging_probes_timeout_and_discard_connections(
     assert elapsed < 0.5
     assert session.invalidated is True
     assert redis.connection_pool.disconnected is True
+    # A failed shared probe must drop only idle connections; aborting in-use
+    # sockets would disconnect unrelated concurrent requests.
+    assert redis.connection_pool.inuse_connections is False
 
 
 @pytest.mark.asyncio

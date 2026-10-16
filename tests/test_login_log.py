@@ -192,7 +192,7 @@ async def test_local_login_success_records_one_success_row(
     assert row.login_type is LoginType.LOCAL
     assert row.result is LoginResultEnum.SUCCESS
     assert row.reason is None
-    assert row.ip == "198.51.100.44"
+    assert row.ip == "203.0.113.10"
     assert row.user_agent == "login-log-pytest"
     assert row.device_id == "device-1"
     assert result.user.id == user.id
@@ -458,7 +458,7 @@ async def test_list_login_logs_applies_filters(
             username=username,
             login_type=LoginType.LOCAL,
             result=LoginResultEnum.SUCCESS,
-            ip="198.51.100.44",
+            ip="203.0.113.17",
             start_time=None,
             end_time=None,
         )
@@ -509,3 +509,40 @@ async def test_list_login_logs_normalizes_aware_time_range(
 
     assert total == 1
     assert [row.request_id for row in rows] == [request_id]
+
+
+async def test_login_failure_without_request_meta_records_client_ip(
+    session: AsyncSession,
+    fake_redis: Any,
+    login_log_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    username = unique_username("login-log-authoritative-ip")
+    client_ip = "203.0.113.99"
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_local_user(
+            session,
+            fake_redis,
+            username=username,
+            password="wrong-password",
+            client_ip=client_ip,
+            device_id="device-authoritative-ip",
+        )
+
+    assert error.value.code == ErrorCode.INVALID_CREDENTIALS
+    async with login_log_factory() as lookup_session:
+        rows = list(
+            (
+                await lookup_session.scalars(
+                    select(LoginLog).where(LoginLog.username == username)
+                )
+            ).all()
+        )
+        await lookup_session.execute(
+            delete(LoginLog).where(LoginLog.username == username)
+        )
+        await lookup_session.commit()
+
+    assert len(rows) == 1
+    assert rows[0].ip == client_ip
+    assert rows[0].user_agent is None
