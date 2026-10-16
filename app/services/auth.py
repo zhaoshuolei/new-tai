@@ -78,7 +78,7 @@ return epoch
 _WRITE_SNAPSHOT_IF_EPOCH_MATCHES_SCRIPT = """
 local current_epoch = redis.call('GET', KEYS[1])
 if not current_epoch then
-    current_epoch = '0'
+    return 0
 end
 if current_epoch ~= ARGV[1] then
     return 0
@@ -190,15 +190,15 @@ def _login_account_key(username: str) -> str:
     return key("auth", "login", "account", _normalize_account(username))
 
 
-def _normalize_epoch(raw: str | bytes | None) -> str:
+def _normalize_epoch(raw: str | bytes | None) -> str | None:
     if raw is None:
-        return "0"
+        return None
     if isinstance(raw, bytes):
         return raw.decode()
     return raw
 
 
-async def _get_auth_epoch(redis: Redis, user_id: int) -> str:
+async def _get_auth_epoch(redis: Redis, user_id: int) -> str | None:
     return _normalize_epoch(await redis.get(_auth_epoch_key(user_id)))
 
 
@@ -220,17 +220,17 @@ async def get_auth_snapshot(
     """返回用户认证快照；缓存未命中时回源数据库并写回。"""
     snapshot_key = _snapshot_key(user_id)
     observed_epoch = await _get_auth_epoch(redis, user_id)
-    cached = await redis.get(snapshot_key)
-
-    if isinstance(cached, str):
-        snapshot = AuthSnapshot.from_cache(
-            cached,
-            expected_epoch=observed_epoch,
-        )
-        if snapshot is not None:
-            return snapshot
-        # 旧 epoch 或旧格式缓存一律丢弃，避免安全变更后继续信任旧授权。
-        await redis.delete(snapshot_key)
+    if observed_epoch is not None:
+        cached = await redis.get(snapshot_key)
+        if isinstance(cached, str):
+            snapshot = AuthSnapshot.from_cache(
+                cached,
+                expected_epoch=observed_epoch,
+            )
+            if snapshot is not None:
+                return snapshot
+            # 旧 epoch 或旧格式缓存一律丢弃，避免安全变更后继续信任旧授权。
+            await redis.delete(snapshot_key)
 
     user = await user_repository.get_by_id(session, user_id)
     if user is None:
@@ -246,6 +246,10 @@ async def get_auth_snapshot(
         role_id=user.role_id,
         department_id=user.department_id,
     )
+    if observed_epoch is None:
+        # epoch 缺失时禁止回填缓存，避免 epoch 过期后使用旧值信任快照。
+        return snapshot
+
     await redis.eval(
         _WRITE_SNAPSHOT_IF_EPOCH_MATCHES_SCRIPT,
         2,
@@ -317,15 +321,14 @@ async def commit_security_change(
 ) -> None:
     """提交安全变更并保证提交前后均完成会话失效。
 
-    顺序固定为：事务内改字段/版本、递增用户 epoch、第一次删除、提交、
-    第二次删除。第一次删除失败会回滚数据库；第二次删除失败不回滚已提交
-    变更，但 epoch 已递增，旧快照无法再通过 epoch 校验。
+    顺序固定为：事务内改字段/版本、第一次删除、提交、递增用户 epoch、
+    第二次删除。第一次删除失败会回滚数据库；提交后的 epoch 递增使观察
+    到旧 epoch 的并发读取者无法回填旧快照。
     """
     if increment_token_version:
         await _increment_token_version_in_transaction(session, user_id)
 
     try:
-        await _increment_auth_epoch(redis, user_id)
         await invalidate_user_sessions(redis, user_id)
     except Exception as error:
         await session.rollback()
@@ -341,6 +344,7 @@ async def commit_security_change(
         await session.rollback()
         raise
 
+    await _increment_auth_epoch(redis, user_id)
     await _finish_user_session_invalidation(redis, user_id)
 
 

@@ -158,13 +158,17 @@ class PostCommitDeleteFailingRedis(EpochRedis):
 
 
 class BlockingEpochRedis(EpochRedis):
-    def __init__(self) -> None:
+    def __init__(self, session: AsyncSession) -> None:
         super().__init__()
+        self.session = session
         self.reader_ready_to_write = asyncio.Event()
         self.release_reader = asyncio.Event()
         self._block_next_snapshot_write = True
+        self.epoch_increment_in_transaction: bool | None = None
 
     async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        if "local epoch" in script:
+            self.epoch_increment_in_transaction = self.session.in_transaction()
         if "local current_epoch" in script and self._block_next_snapshot_write:
             self._block_next_snapshot_write = False
             self.reader_ready_to_write.set()
@@ -944,7 +948,12 @@ async def test_aba_reader_cannot_persist_stale_snapshot_after_mutation(
     assigned_role = await add_role(session)
     snapshot_key = key("auth", "snapshot", str(target.id))
     epoch_key = key("auth", "epoch", str(target.id))
-    redis = BlockingEpochRedis()
+    redis = BlockingEpochRedis(session)
+    await redis.set(
+        epoch_key,
+        "0",
+        ex=auth_service.AUTH_EPOCH_TTL_SECONDS,
+    )
     reader_task = asyncio.create_task(
         auth_service.get_auth_snapshot(session, redis, target.id)
     )
@@ -961,6 +970,7 @@ async def test_aba_reader_cannot_persist_stale_snapshot_after_mutation(
     stale_reader_snapshot = await asyncio.wait_for(reader_task, timeout=2)
 
     assert stale_reader_snapshot.role_id == role.id
+    assert redis.epoch_increment_in_transaction is False
     assert redis.values[epoch_key] == "1"
     assert snapshot_key not in redis.values
 
@@ -968,6 +978,22 @@ async def test_aba_reader_cannot_persist_stale_snapshot_after_mutation(
     assert fresh_snapshot.role_id == assigned_role.id
     assert fresh_snapshot.token_version == updated.token_version
     assert snapshot_key in redis.values
+
+
+async def test_missing_epoch_does_not_create_snapshot_cache_entry(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    user = await add_user(session, role=role)
+    redis = RecordingRedis()
+    snapshot_key = key("auth", "snapshot", str(user.id))
+    epoch_key = key("auth", "epoch", str(user.id))
+
+    snapshot = await auth_service.get_auth_snapshot(session, redis, user.id)
+
+    assert snapshot.role_id == role.id
+    assert epoch_key not in redis.values
+    assert snapshot_key not in redis.values
 
 
 async def test_post_commit_delete_failure_epoch_blocks_stale_snapshot(

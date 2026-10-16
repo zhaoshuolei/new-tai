@@ -475,6 +475,12 @@ async def test_auth_snapshot_cache_is_populated_and_invalidated(
     login_response = await login(client, username, "password")
     access_token = login_response.json()["data"]["access_token"]
     snapshot_key = key("auth", "snapshot", str(user.id))
+    epoch_key = key("auth", "epoch", str(user.id))
+    await fake_redis.set(
+        epoch_key,
+        "7",
+        ex=auth_service.AUTH_EPOCH_TTL_SECONDS,
+    )
 
     response = await client.get(
         "/api/v1/auth/me",
@@ -490,10 +496,10 @@ async def test_auth_snapshot_cache_is_populated_and_invalidated(
         "token_version": user.token_version,
         "role_id": None,
         "department_id": None,
-        "epoch": "0",
+        "epoch": "7",
     }
     assert fake_redis.expirations[snapshot_key] == 600
-    assert key("auth", "epoch", str(user.id)) not in fake_redis.values
+    assert fake_redis.expirations[epoch_key] == auth_service.AUTH_EPOCH_TTL_SECONDS
 
     await auth_service.invalidate_auth_snapshot(fake_redis, user.id)
 
