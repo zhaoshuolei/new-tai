@@ -115,6 +115,14 @@ class FakeRedis:
                     exceeded = 1
             return exceeded
 
+        if "redis.call('EXISTS'" in script:
+            invalidation_key, snapshot_key = keys
+            if self.values.get(invalidation_key) is not None:
+                return 0
+            self.values[snapshot_key] = values[0]
+            self.expirations[snapshot_key] = int(values[1])
+            return 1
+
         if len(keys) != 1:
             raise NotImplementedError
         redis_key = keys[0]

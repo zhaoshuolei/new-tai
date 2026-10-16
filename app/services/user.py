@@ -122,22 +122,20 @@ async def _get_current_role(
     return await role_repository.get_by_id(session, user.role_id)
 
 
-async def _bump_user_token_version(
+async def _commit_user_security_change(
     session: AsyncSession,
     user_id: int,
     redis: Redis | None,
+    *,
+    increment_token_version: bool = True,
 ) -> None:
     async with redis_scope(redis) as resolved_redis:
-        await auth_service.bump_token_version_in_transaction(
+        await auth_service.commit_security_change(
             session,
             user_id,
             redis=resolved_redis,
+            increment_token_version=increment_token_version,
         )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
 
 
 async def list_users(
@@ -214,7 +212,7 @@ async def assign_user_role(
         return user
 
     user.role_id = payload.role_id
-    await _bump_user_token_version(session, user.id, redis)
+    await _commit_user_security_change(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -251,7 +249,7 @@ async def assign_user_department(
         return user
 
     user.department_id = payload.department_id
-    await _bump_user_token_version(session, user.id, redis)
+    await _commit_user_security_change(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -280,7 +278,7 @@ async def update_user_status(
         return user
 
     user.status = payload.status
-    await _bump_user_token_version(session, user.id, redis)
+    await _commit_user_security_change(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -325,17 +323,12 @@ async def delete_user(
     )
 
     await user_repository.delete(session, user)
-    async with redis_scope(redis) as resolved_redis:
-        await auth_service.invalidate_user_sessions_before_commit(
-            session,
-            user_id,
-            resolved_redis,
-        )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
+    await _commit_user_security_change(
+        session,
+        user_id,
+        redis,
+        increment_token_version=False,
+    )
 
 
 __all__: tuple[str, ...] = (

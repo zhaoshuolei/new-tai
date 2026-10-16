@@ -1,6 +1,7 @@
 """本地认证、令牌生命周期与请求认证快照。"""
 
 import json
+import logging
 import re
 import secrets
 from dataclasses import dataclass
@@ -27,9 +28,12 @@ from app.repositories import role as role_repository
 from app.repositories import user as user_repository
 
 AUTH_SNAPSHOT_TTL_SECONDS = 600
+SESSION_INVALIDATION_FENCE_TTL_SECONDS = AUTH_SNAPSHOT_TTL_SECONDS * 2
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
 LOGIN_RATE_LIMIT_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
+
+logger = logging.getLogger(__name__)
 
 _DUMMY_PASSWORD_HASH = (
     "$argon2id$v=19$m=65536,t=3,p=4$0sQwzdi5vx9ycTTSD1oUBA$"
@@ -63,6 +67,13 @@ if not current or current ~= ARGV[1] then
     return 0
 end
 return redis.call('DEL', KEYS[1])
+"""
+_WRITE_SNAPSHOT_IF_NOT_INVALIDATING_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 0
+end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+return 1
 """
 
 
@@ -132,6 +143,10 @@ def _snapshot_key(user_id: int) -> str:
     return key("auth", "snapshot", str(user_id))
 
 
+def _session_invalidation_key(user_id: int) -> str:
+    return key("auth", "invalidating", str(user_id))
+
+
 def _refresh_key(user_id: int, device_id: str) -> str:
     return key("auth", "refresh", str(user_id), device_id)
 
@@ -159,7 +174,15 @@ async def get_auth_snapshot(
 ) -> AuthSnapshot:
     """返回用户认证快照；缓存未命中时回源数据库并写回。"""
     snapshot_key = _snapshot_key(user_id)
-    cached = await redis.get(snapshot_key)
+    invalidation_key = _session_invalidation_key(user_id)
+    invalidating = await redis.get(invalidation_key) is not None
+    if invalidating:
+        # 变更事务尚未提交，禁止使用或回填旧快照。
+        await redis.delete(snapshot_key)
+        cached = None
+    else:
+        cached = await redis.get(snapshot_key)
+
     if isinstance(cached, str):
         snapshot = AuthSnapshot.from_cache(cached)
         if snapshot is not None:
@@ -180,16 +203,54 @@ async def get_auth_snapshot(
         role_id=user.role_id,
         department_id=user.department_id,
     )
-    await redis.set(
+    if invalidating:
+        return snapshot
+
+    written = await redis.eval(
+        _WRITE_SNAPSHOT_IF_NOT_INVALIDATING_SCRIPT,
+        2,
+        invalidation_key,
         snapshot_key,
         snapshot.to_cache(),
-        ex=AUTH_SNAPSHOT_TTL_SECONDS,
+        str(AUTH_SNAPSHOT_TTL_SECONDS),
     )
+    if written != 1:
+        return snapshot
     return snapshot
 
 
 async def invalidate_auth_snapshot(redis: Redis, user_id: int) -> None:
     await redis.delete(_snapshot_key(user_id))
+
+
+async def _start_user_session_invalidation(redis: Redis, user_id: int) -> None:
+    """在删除快照前立栅栏，阻止并发请求回填旧快照。"""
+    await redis.set(
+        _session_invalidation_key(user_id),
+        "1",
+        ex=SESSION_INVALIDATION_FENCE_TTL_SECONDS,
+    )
+
+
+async def _finish_user_session_invalidation(redis: Redis, user_id: int) -> None:
+    """提交后再删一次，清理提交窗口内由旧行回填的快照。"""
+    try:
+        await invalidate_user_sessions(redis, user_id)
+    except Exception:
+        # 保留栅栏；其 TTL 长于快照 TTL，旧快照不会在栅栏过期后重生。
+        logger.exception(
+            "Post-commit session invalidation failed",
+            extra={"user_id": user_id},
+        )
+        return
+    try:
+        await redis.delete(_session_invalidation_key(user_id))
+    except Exception:
+        # 栅栏残留只会让认证缓存暂时旁路，不会放行旧授权。
+        logger.exception(
+            "Session invalidation fence cleanup failed",
+            extra={"user_id": user_id},
+        )
 
 
 async def invalidate_refresh_tokens(redis: Redis, user_id: int) -> None:
@@ -206,30 +267,10 @@ async def invalidate_user_sessions(
     await invalidate_refresh_tokens(redis, user_id)
 
 
-async def invalidate_user_sessions_before_commit(
+async def _increment_token_version_in_transaction(
     session: AsyncSession,
     user_id: int,
-    redis: Redis,
 ) -> None:
-    """提交安全变更前清除会话；失败则回滚数据库并关闭授权。"""
-    try:
-        await invalidate_user_sessions(redis, user_id)
-    except Exception as error:
-        await session.rollback()
-        raise BusinessError(
-            ErrorCode.INTERNAL_ERROR,
-            "Session invalidation failed; database change rolled back",
-            http_status=503,
-        ) from error
-
-
-async def bump_token_version_in_transaction(
-    session: AsyncSession,
-    user_id: int,
-    *,
-    redis: Redis,
-) -> None:
-    """在当前事务内递增版本，并在提交前完成会话失效。"""
     statement = (
         update(User)
         .where(User.id == user_id)
@@ -243,7 +284,42 @@ async def bump_token_version_in_transaction(
             "User not found",
             http_status=404,
         )
-    await invalidate_user_sessions_before_commit(session, user_id, redis)
+
+
+async def commit_security_change(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    redis: Redis,
+    increment_token_version: bool = True,
+) -> None:
+    """提交安全变更并保证提交前后均完成会话失效。
+
+    顺序固定为：事务内改字段/版本、设置失效栅栏、第一次删除、提交、
+    第二次删除。第一次删除失败会回滚数据库；第二次删除失败保留栅栏，
+    并发请求不会写入旧快照，且栅栏 TTL 长于快照 TTL。
+    """
+    if increment_token_version:
+        await _increment_token_version_in_transaction(session, user_id)
+
+    try:
+        await _start_user_session_invalidation(redis, user_id)
+        await invalidate_user_sessions(redis, user_id)
+    except Exception as error:
+        await session.rollback()
+        raise BusinessError(
+            ErrorCode.INTERNAL_ERROR,
+            "Session invalidation failed; database change rolled back",
+            http_status=503,
+        ) from error
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    await _finish_user_session_invalidation(redis, user_id)
 
 
 async def bump_token_version(
@@ -252,17 +328,11 @@ async def bump_token_version(
     *,
     redis: Redis | None = None,
 ) -> None:
-    resolved_redis = redis or default_redis_client
-    await bump_token_version_in_transaction(
+    await commit_security_change(
         session,
         user_id,
-        redis=resolved_redis,
+        redis=redis or default_redis_client,
     )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
 
 
 async def authenticate_local_user(
@@ -540,14 +610,13 @@ __all__: tuple[str, ...] = (
     "authenticate_local_user",
     "build_auth_context",
     "bump_token_version",
-    "bump_token_version_in_transaction",
     "clear_login_account_failures",
+    "commit_security_change",
     "enforce_login_rate_limit",
     "get_auth_snapshot",
     "invalidate_auth_snapshot",
     "invalidate_refresh_tokens",
     "invalidate_user_sessions",
-    "invalidate_user_sessions_before_commit",
     "issue_token_pair",
     "login_local_user",
     "logout_refresh_token",

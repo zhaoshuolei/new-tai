@@ -46,6 +46,15 @@ ALL_USER_PERMISSIONS = frozenset(
 
 
 class FailingRedis:
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        ex: int | None = None,
+    ) -> bool:
+        return True
+
     async def delete(self, *names: str) -> int:
         raise RuntimeError("redis unavailable")
 
@@ -64,6 +73,112 @@ class InspectingFailingRedis(FailingRedis):
         ).one()
         self.observed = (row.role_id, row.token_version)
         return await super().delete(*names)
+
+
+class PostCommitDeleteFailingRedis:
+    def __init__(self, snapshot_key: str, stale_snapshot: str) -> None:
+        self.snapshot_key = snapshot_key
+        self.stale_snapshot = stale_snapshot
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+        self.snapshot_deletes = 0
+
+    async def get(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        ex: int | None = None,
+        nx: bool = False,
+        xx: bool = False,
+        get: bool = False,
+    ) -> str | bool | None:
+        existing = self.values.get(name)
+        if nx and existing is not None:
+            return None if get else False
+        if xx and existing is None:
+            return None if get else False
+        self.values[name] = value
+        if ex is not None:
+            self.expirations[name] = ex
+        return existing if get else True
+
+    async def delete(self, *names: str) -> int:
+        if self.snapshot_key in names:
+            self.snapshot_deletes += 1
+            if self.snapshot_deletes == 2:
+                self.values[self.snapshot_key] = self.stale_snapshot
+                raise RuntimeError("redis unavailable after commit")
+        deleted = 0
+        for name in names:
+            if name in self.values:
+                deleted += 1
+                del self.values[name]
+                self.expirations.pop(name, None)
+        if self.snapshot_key in names and self.snapshot_deletes == 1:
+            self.values[self.snapshot_key] = self.stale_snapshot
+            self.expirations[self.snapshot_key] = auth_service.AUTH_SNAPSHOT_TTL_SECONDS
+        return deleted
+
+    async def scan_iter(self, *, match: str) -> AsyncIterator[str]:
+        prefix = match.removesuffix("*")
+        for name in tuple(self.values):
+            if name.startswith(prefix):
+                yield name
+
+
+class RaceRepopulatingRedis:
+    def __init__(self, snapshot_key: str, stale_snapshot: str) -> None:
+        self.snapshot_key = snapshot_key
+        self.stale_snapshot = stale_snapshot
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+        self.repopulated = False
+
+    async def get(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        ex: int | None = None,
+        nx: bool = False,
+        xx: bool = False,
+        get: bool = False,
+    ) -> str | bool | None:
+        existing = self.values.get(name)
+        if nx and existing is not None:
+            return None if get else False
+        if xx and existing is None:
+            return None if get else False
+        self.values[name] = value
+        if ex is not None:
+            self.expirations[name] = ex
+        return existing if get else True
+
+    async def delete(self, *names: str) -> int:
+        deleted = 0
+        for name in names:
+            if name in self.values:
+                deleted += 1
+                del self.values[name]
+                self.expirations.pop(name, None)
+        if self.snapshot_key in names and not self.repopulated:
+            self.values[self.snapshot_key] = self.stale_snapshot
+            self.expirations[self.snapshot_key] = auth_service.AUTH_SNAPSHOT_TTL_SECONDS
+            self.repopulated = True
+        return deleted
+
+    async def scan_iter(self, *, match: str) -> AsyncIterator[str]:
+        prefix = match.removesuffix("*")
+        for name in tuple(self.values):
+            if name.startswith(prefix):
+                yield name
 
 
 class RecordingRedis:
@@ -838,6 +953,70 @@ async def test_non_super_admin_cannot_revoke_super_admin(
     assert error.value.http_status == 403
     await session.refresh(target)
     assert target.role_id == super_admin.id
+
+
+async def test_post_commit_reinvalidation_clears_snapshot_repopulated_during_commit(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session, role=role)
+    assigned_role = await add_role(session)
+    snapshot_key = key("auth", "snapshot", str(target.id))
+    stale_snapshot = auth_service.AuthSnapshot(
+        status=target.status,
+        token_version=target.token_version,
+        role_id=target.role_id,
+        department_id=target.department_id,
+    ).to_cache()
+    redis = RaceRepopulatingRedis(snapshot_key, stale_snapshot)
+
+    updated = await assign_user_role(
+        session,
+        target.id,
+        UserRoleUpdate(role_id=assigned_role.id),
+        context=context_for(caller, role),
+        redis=redis,
+    )
+
+    refresh_prefix = key("auth", "refresh", str(target.id), "")
+    assert redis.repopulated is True
+    assert updated.role_id == assigned_role.id
+    assert snapshot_key not in redis.values
+    assert not any(name.startswith(refresh_prefix) for name in redis.values)
+
+
+async def test_post_commit_delete_failure_leaves_fence_that_blocks_stale_snapshot(
+    session: AsyncSession,
+) -> None:
+    role = await add_role(session)
+    caller = await add_user(session, role=role)
+    target = await add_user(session, role=role)
+    assigned_role = await add_role(session)
+    snapshot_key = key("auth", "snapshot", str(target.id))
+    fence_key = key("auth", "invalidating", str(target.id))
+    stale_snapshot = auth_service.AuthSnapshot(
+        status=target.status,
+        token_version=target.token_version,
+        role_id=target.role_id,
+        department_id=target.department_id,
+    ).to_cache()
+    redis = PostCommitDeleteFailingRedis(snapshot_key, stale_snapshot)
+
+    updated = await assign_user_role(
+        session,
+        target.id,
+        UserRoleUpdate(role_id=assigned_role.id),
+        context=context_for(caller, role),
+        redis=redis,
+    )
+    snapshot = await auth_service.get_auth_snapshot(session, redis, target.id)
+
+    assert updated.role_id == assigned_role.id
+    assert fence_key in redis.values
+    assert snapshot_key not in redis.values
+    assert snapshot.role_id == assigned_role.id
+    assert snapshot.token_version == updated.token_version
 
 
 async def test_target_visibility_uses_dept_child_and_custom_semantics(
