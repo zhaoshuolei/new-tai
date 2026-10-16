@@ -51,17 +51,21 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             return response
         finally:
             try:
+                access_fields = {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": round(
+                        (perf_counter() - started_at) * 1000,
+                        3,
+                    ),
+                    "user_id": _request_user_id(request),
+                }
                 logger.info(
                     "HTTP request completed",
                     extra={
-                        "method": request.method,
-                        "path": request.url.path,
-                        "status_code": status_code,
-                        "duration_ms": round(
-                            (perf_counter() - started_at) * 1000,
-                            3,
-                        ),
-                        "user_id": _request_user_id(request),
+                        **access_fields,
+                        "extra_fields": access_fields,
                     },
                 )
             finally:

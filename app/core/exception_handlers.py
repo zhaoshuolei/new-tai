@@ -86,7 +86,11 @@ async def http_exception_handler(
         raise exc
 
     if exc.status_code >= 500:
-        logger.error("HTTP server exception", exc_info=exc)
+        logger.error(
+            "HTTP server exception",
+            exc_info=exc,
+            extra={"request_id": _request_id(request)},
+        )
         message = _INTERNAL_SERVER_ERROR_MESSAGE
     else:
         message = str(exc.detail)
@@ -118,7 +122,11 @@ async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:
-    logger.error("Unhandled request exception", exc_info=exc)
+    logger.error(
+        "Unhandled request exception",
+        exc_info=exc,
+        extra={"request_id": _request_id(request)},
+    )
     return _error_response(
         request,
         code=ErrorCode.INTERNAL_ERROR,

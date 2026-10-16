@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from app.core.config import settings
 from app.core.logging import (
     JsonFormatter,
+    LocalFormatter,
     current_request_id,
     mask_sensitive_text,
 )
@@ -84,18 +85,22 @@ def test_sensitive_fields_are_masked_in_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.clear()
+    original_formatter = caplog.handler.formatter
     caplog.handler.setFormatter(JsonFormatter())
     logger = logging.getLogger("tests.sensitive")
-    logger.info(
-        "credentials",
-        extra={
-            "extra_fields": {
-                "password": "secret-password",
-                "nested": {"access_token": "secret-token"},
-                "safe": "visible",
-            }
-        },
-    )
+    try:
+        logger.info(
+            "credentials",
+            extra={
+                "extra_fields": {
+                    "password": "secret-password",
+                    "nested": {"access_token": "secret-token"},
+                    "safe": "visible",
+                }
+            },
+        )
+    finally:
+        caplog.handler.setFormatter(original_formatter)
 
     payload = json.loads(caplog.text)
 
@@ -105,6 +110,61 @@ def test_sensitive_fields_are_masked_in_logs(
     assert "secret-password" not in caplog.text
     assert "secret-token" not in caplog.text
     assert mask_sensitive_text("password=secret with spaces") == "password=***"
+
+
+async def test_unhandled_exception_log_uses_response_request_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    test_app = create_app()
+
+    @test_app.get("/unhandled-request-id")
+    async def unhandled() -> None:
+        raise RuntimeError("sensitive internal detail")
+
+    with caplog.at_level(logging.ERROR, logger="app.core.exception_handlers"):
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/unhandled-request-id",
+                headers={"X-Request-Id": "logged-request-id"},
+            )
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "app.core.exception_handlers"
+    ]
+    assert len(records) == 1
+    assert records[0].request_id == response.headers["X-Request-Id"]
+    assert records[0].request_id == response.json()["request_id"]
+
+
+async def test_local_access_log_contains_required_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    test_app = create_app()
+    caplog.clear()
+    original_formatter = caplog.handler.formatter
+    caplog.handler.setFormatter(LocalFormatter())
+
+    try:
+        with caplog.at_level(logging.INFO, logger="app.request"):
+            async with AsyncClient(
+                transport=ASGITransport(app=test_app),
+                base_url="http://test",
+            ) as client:
+                await client.get("/health/live")
+        output = caplog.text
+    finally:
+        caplog.handler.setFormatter(original_formatter)
+
+    assert "method='GET'" in output
+    assert "path='/health/live'" in output
+    assert "status_code=200" in output
+    assert "duration_ms=" in output
+    assert "user_id=None" in output
 
 
 async def test_access_log_contains_request_context(
