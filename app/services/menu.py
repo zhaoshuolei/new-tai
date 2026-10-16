@@ -36,21 +36,23 @@ async def _collect_ancestor_ids(
 async def _lock_menu_candidates(
     session: AsyncSession,
     root_ids: set[int],
-    *,
-    include_children: bool = False,
 ) -> dict[int, Menu]:
-    # 所有菜单写操作先汇总目标、新旧父节点、祖先和直接子节点，再只调用一次
-    # lock_menu_nodes 按 id 升序加锁；统一顺序可避免父子 id 大小相反时交叉等待。
+    # 所有菜单写操作先汇总目标、新旧父节点和祖先，再由 lock_menu_nodes
+    # 单次按 id 升序 FOR UPDATE；统一顺序避免父子 id 大小相反时交叉等待。
     candidate_ids = set(root_ids)
     for root_id in root_ids:
         await _collect_ancestor_ids(session, root_id, candidate_ids)
 
-    if include_children:
-        for root_id in root_ids:
-            for child in await menu_repository.list_children(session, root_id):
-                candidate_ids.add(child.id)
-
     return await menu_repository.lock_menu_nodes(session, candidate_ids)
+
+
+async def _lock_children_for_validation(
+    session: AsyncSession,
+    menu_id: int,
+) -> list[Menu]:
+    # 目标行已锁定后才锁读直接子节点；并发跨层写即使触发死锁，也会回滚并
+    # 映射为可重试的 409，绝不牺牲菜单层级不变量。
+    return await menu_repository.list_children_for_update(session, menu_id)
 
 
 def _is_valid_parent_type(
@@ -78,15 +80,11 @@ def _validate_parent(
 
 
 def _validate_children(
-    menu_id: int,
+    children: list[Menu],
     menu_type: MenuType,
-    menus_by_id: dict[int, Menu],
 ) -> None:
-    for child in menus_by_id.values():
-        if child.parent_id == menu_id and not _is_valid_parent_type(
-            child.type,
-            menu_type,
-        ):
+    for child in children:
+        if not _is_valid_parent_type(child.type, menu_type):
             raise BusinessError(
                 ErrorCode.INVALID_MENU_HIERARCHY,
                 "Invalid menu hierarchy",
@@ -281,11 +279,7 @@ async def update_menu(
         requested_parent_id = changes.get("parent_id", None)
         if requested_parent_id is not None:
             root_ids.add(requested_parent_id)
-        locked = await _lock_menu_candidates(
-            session,
-            root_ids,
-            include_children=True,
-        )
+        locked = await _lock_menu_candidates(session, root_ids)
 
         menu = locked.get(menu_id)
         if menu is None:
@@ -304,9 +298,10 @@ async def update_menu(
                 "Menu not found",
                 http_status=404,
             )
+        children = await _lock_children_for_validation(session, menu.id)
         _validate_parent(new_type, parent)
         _ensure_parent_is_not_descendant(menu.id, new_parent_id, locked)
-        _validate_children(menu.id, new_type, locked)
+        _validate_children(children, new_type)
         await _ensure_permission_code_available(
             session,
             changes.get("permission_code", menu.permission_code),
@@ -323,11 +318,7 @@ async def update_menu(
 
 async def delete_menu(session: AsyncSession, menu_id: int) -> None:
     async with _map_menu_write_errors(session):
-        locked = await _lock_menu_candidates(
-            session,
-            {menu_id},
-            include_children=True,
-        )
+        locked = await _lock_menu_candidates(session, {menu_id})
         menu = locked.get(menu_id)
         if menu is None:
             raise BusinessError(
@@ -335,7 +326,8 @@ async def delete_menu(session: AsyncSession, menu_id: int) -> None:
                 "Menu not found",
                 http_status=404,
             )
-        if any(node.parent_id == menu_id for node in locked.values()):
+        children = await _lock_children_for_validation(session, menu.id)
+        if children:
             raise BusinessError(
                 ErrorCode.INVALID_MENU_HIERARCHY,
                 "Menu has children",

@@ -433,7 +433,11 @@ async def test_delete_foreign_key_violation_returns_4001(
     ) -> list[Menu]:
         return []
 
-    monkeypatch.setattr(menu_repository, "list_children", no_children)
+    monkeypatch.setattr(
+        menu_repository,
+        "list_children_for_update",
+        no_children,
+    )
 
     with pytest.raises(BusinessError) as error:
         await delete_menu(session, parent.id)

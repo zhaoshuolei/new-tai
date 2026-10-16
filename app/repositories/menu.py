@@ -65,6 +65,22 @@ async def list_children(session: AsyncSession, menu_id: int) -> list[Menu]:
     return list(result.all())
 
 
+async def list_children_for_update(
+    session: AsyncSession,
+    menu_id: int,
+) -> list[Menu]:
+    """按 id 升序锁定并读取直接子节点。"""
+    statement = (
+        select(Menu)
+        .where(Menu.parent_id == menu_id)
+        .order_by(Menu.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
 async def has_children(session: AsyncSession, menu_id: int) -> bool:
     statement = select(Menu.id).where(Menu.parent_id == menu_id).limit(1)
     return await session.scalar(statement) is not None
@@ -77,5 +93,6 @@ __all__: tuple[str, ...] = (
     "has_children",
     "list_all",
     "list_children",
+    "list_children_for_update",
     "lock_menu_nodes",
 )

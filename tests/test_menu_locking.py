@@ -69,7 +69,27 @@ async def test_lock_menu_nodes_uses_one_ascending_for_update_query() -> None:
     assert "FOR UPDATE" in compiled
 
 
-async def test_update_locks_all_candidates_through_one_helper(
+@pytest.mark.asyncio
+async def test_list_children_for_update_uses_ascending_locking_query() -> None:
+    recording = _RecordingSession()
+
+    await menu_repository.list_children_for_update(
+        cast(AsyncSession, recording),
+        10,
+    )
+
+    compiled = str(
+        recording.statement.compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "menu.parent_id = 10" in compiled
+    assert "ORDER BY menu.id" in compiled
+    assert "FOR UPDATE" in compiled
+
+
+async def test_update_locks_target_before_locking_children(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -77,7 +97,7 @@ async def test_update_locks_all_candidates_through_one_helper(
         session,
         MenuCreate(type=MenuType.DIR, name="根目录"),
     )
-    child = await create_menu(
+    await create_menu(
         session,
         MenuCreate(
             parent_id=root.id,
@@ -86,16 +106,29 @@ async def test_update_locks_all_candidates_through_one_helper(
         ),
     )
     original_lock = menu_repository.lock_menu_nodes
-    locked_batches: list[set[int]] = []
+    original_children_lock = menu_repository.list_children_for_update
+    lock_events: list[tuple[str, object]] = []
 
-    async def record_lock(
+    async def record_node_lock(
         lock_session: AsyncSession,
         menu_ids: set[int],
     ) -> dict[int, Any]:
-        locked_batches.append(set(menu_ids))
+        lock_events.append(("nodes", set(menu_ids)))
         return await original_lock(lock_session, menu_ids)
 
-    monkeypatch.setattr(menu_repository, "lock_menu_nodes", record_lock)
+    async def record_child_lock(
+        lock_session: AsyncSession,
+        menu_id: int,
+    ) -> list[Any]:
+        lock_events.append(("children", menu_id))
+        return await original_children_lock(lock_session, menu_id)
+
+    monkeypatch.setattr(menu_repository, "lock_menu_nodes", record_node_lock)
+    monkeypatch.setattr(
+        menu_repository,
+        "list_children_for_update",
+        record_child_lock,
+    )
 
     await update_menu(
         session,
@@ -103,7 +136,49 @@ async def test_update_locks_all_candidates_through_one_helper(
         MenuUpdate(name="平台管理"),
     )
 
-    assert locked_batches == [{root.id, child.id}]
+    assert lock_events == [
+        ("nodes", {root.id}),
+        ("children", root.id),
+    ]
+
+
+async def test_update_validates_post_lock_children(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = await create_menu(
+        session,
+        MenuCreate(type=MenuType.MENU, name="用户管理"),
+    )
+    await create_menu(
+        session,
+        MenuCreate(
+            parent_id=parent.id,
+            type=MenuType.BUTTON,
+            name="新增用户",
+        ),
+    )
+
+    async def empty_pre_lock_read(
+        _session: AsyncSession,
+        _menu_id: int,
+    ) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        menu_repository,
+        "list_children",
+        empty_pre_lock_read,
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await update_menu(
+            session,
+            parent.id,
+            MenuUpdate(type=MenuType.DIR),
+        )
+
+    assert error.value.code == ErrorCode.INVALID_MENU_HIERARCHY
 
 
 async def test_create_menu_maps_deadlock_to_conflict(
