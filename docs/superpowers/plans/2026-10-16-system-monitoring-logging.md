@@ -361,7 +361,7 @@ async def test_write_failure_does_not_propagate(...):
 **Interfaces:**
 - Produces:
   - `app/services/monitor.py`: `async def run_retention(session) -> dict[str, int]` — 对四表按 spec 第 8 节的时间列删除超过保留天数的行，返回各表删除数；对应保留天数配置为 `0` 时跳过该表。采样循环每约 1 小时调用一次（按 `sampled_at` 与 `time.monotonic()` 计数均可，实现者裁量，但必须可测：直接暴露 `run_retention`）。
-  - 菜单种子新增（`_MENU_SEEDS` 追加，父级 `system`）：`logs`（目录 `/system/logs`）、`logs-operations`（菜单 `/system/logs/operations`，`audit:read`）、`logs-logins`（菜单 `/system/logs/logins`，`login_log:read`）、`monitor`（菜单 `/system/monitor`，`monitor:read`）、`exceptions`（菜单 `/system/monitor/exceptions`，`exception:read`）、`exceptions-ack`（按钮，父级 `exceptions`，`exception:update`）。
+  - 菜单种子新增（`_MENU_SEEDS` 追加，父级 `system`）：`logs`（目录 `/system/logs`）、`logs-operations`（菜单 `/system/logs/operations`，`audit:read`）、`logs-logins`（菜单 `/system/logs/logins`，`login_log:read`）、`monitor`（菜单 `/system/monitor`，`monitor:read`）、`exceptions`（菜单 `/system/monitor/exceptions`，`exception:read`，**父级 `system`**——菜单服务的层级不变量只允许 `MENU` 下挂 `BUTTON`，故 `exceptions` 不能挂在同为 `MENU` 的 `monitor` 下）、`exceptions-ack`（按钮，父级 `exceptions`，`exception:update`）。
 - Consumes: Task 1 配置、Task 10 采样循环。
 
 - [ ] **Step 1: 写失败测试**
