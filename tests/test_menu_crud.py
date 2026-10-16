@@ -62,7 +62,7 @@ async def test_create_dir_then_menu_then_button(session: AsyncSession) -> None:
             name="用户管理",
             path="/system/users",
             component="system/users/index",
-            permission_code="system:user:list",
+            permission_code="system:read",
         ),
     )
     button = await create_menu(
@@ -71,7 +71,7 @@ async def test_create_dir_then_menu_then_button(session: AsyncSession) -> None:
             parent_id=menu.id,
             type=MenuType.BUTTON,
             name="新增用户",
-            permission_code="system:user:create",
+            permission_code="system:create",
         ),
     )
 
@@ -147,7 +147,7 @@ async def test_duplicate_permission_code_returns_4002(
         MenuCreate(
             type=MenuType.MENU,
             name="用户管理",
-            permission_code="system:user:list",
+            permission_code="system:read",
         ),
     )
 
@@ -157,8 +157,164 @@ async def test_duplicate_permission_code_returns_4002(
             MenuCreate(
                 type=MenuType.MENU,
                 name="角色管理",
-                permission_code="system:user:list",
+                permission_code="system:read",
             ),
+        )
+
+    assert error.value.code == ErrorCode.PERMISSION_CODE_EXISTS
+
+
+@pytest.mark.parametrize(
+    "permission_code",
+    [
+        "",
+        "system:user",
+        "system:user:read",
+        "System:read",
+        "system:list",
+        "system:",
+        ":read",
+    ],
+)
+async def test_create_menu_rejects_invalid_permission_code_with_422(
+    session: AsyncSession,
+    permission_code: str,
+) -> None:
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/menus",
+                json={
+                    "type": "MENU",
+                    "name": "用户管理",
+                    "permission_code": permission_code,
+                },
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.INVALID_PARAMETER
+
+
+async def test_update_menu_rejects_invalid_permission_code_with_422(
+    session: AsyncSession,
+) -> None:
+    menu = await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="用户管理",
+            permission_code="system:read",
+        ),
+    )
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.patch(
+                f"/api/v1/menus/{menu.id}",
+                json={"permission_code": "system:user:list"},
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.INVALID_PARAMETER
+
+
+async def test_permission_code_unique_constraint_on_create_returns_4002(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="用户管理",
+            permission_code="system:read",
+        ),
+    )
+
+    async def no_existing_code(
+        _session: AsyncSession,
+        _permission_code: str,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(
+        menu_repository,
+        "get_by_permission_code",
+        no_existing_code,
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await create_menu(
+            session,
+            MenuCreate(
+                type=MenuType.MENU,
+                name="角色管理",
+                permission_code="system:read",
+            ),
+        )
+
+    assert error.value.code == ErrorCode.PERMISSION_CODE_EXISTS
+
+
+async def test_permission_code_unique_constraint_on_update_returns_4002(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="用户管理",
+            permission_code="system:read",
+        ),
+    )
+    role_menu = await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="角色管理",
+            permission_code="system:update",
+        ),
+    )
+
+    async def no_existing_code(
+        _session: AsyncSession,
+        _permission_code: str,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(
+        menu_repository,
+        "get_by_permission_code",
+        no_existing_code,
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await update_menu(
+            session,
+            role_menu.id,
+            MenuUpdate(permission_code="system:read"),
         )
 
     assert error.value.code == ErrorCode.PERMISSION_CODE_EXISTS
@@ -202,7 +358,7 @@ async def test_list_enabled_permission_codes_excludes_disabled_and_nulls(
         MenuCreate(
             type=MenuType.MENU,
             name="用户管理",
-            permission_code="system:user:list",
+            permission_code="system:read",
         ),
     )
     disabled = await create_menu(
@@ -210,7 +366,7 @@ async def test_list_enabled_permission_codes_excludes_disabled_and_nulls(
         MenuCreate(
             type=MenuType.MENU,
             name="角色管理",
-            permission_code="system:role:list",
+            permission_code="system:update",
         ),
     )
     await create_menu(
@@ -228,7 +384,7 @@ async def test_list_enabled_permission_codes_excludes_disabled_and_nulls(
 
     codes = await list_enabled_permission_codes(session)
 
-    assert codes == frozenset({"system:user:list"})
+    assert codes == frozenset({"system:read"})
     assert active.permission_code in codes
 
 
@@ -247,6 +403,37 @@ async def test_delete_menu_with_children_returns_4001(
             name="用户管理",
         ),
     )
+
+    with pytest.raises(BusinessError) as error:
+        await delete_menu(session, parent.id)
+
+    assert error.value.code == ErrorCode.INVALID_MENU_HIERARCHY
+
+
+async def test_delete_foreign_key_violation_returns_4001(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = await create_menu(
+        session,
+        MenuCreate(type=MenuType.DIR, name="系统管理"),
+    )
+    await create_menu(
+        session,
+        MenuCreate(
+            parent_id=parent.id,
+            type=MenuType.MENU,
+            name="用户管理",
+        ),
+    )
+
+    async def no_children(
+        _session: AsyncSession,
+        _menu_id: int,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(menu_repository, "has_children", no_children)
 
     with pytest.raises(BusinessError) as error:
         await delete_menu(session, parent.id)
@@ -300,6 +487,74 @@ async def test_update_menu_changes_fields_and_validates_new_parent(
     assert updated.name == "用户与权限"
     assert updated.sort_order == 20
     assert updated.visible is False
+
+
+async def test_update_menu_with_incompatible_child_type_returns_4001(
+    session: AsyncSession,
+) -> None:
+    directory = await create_menu(
+        session,
+        MenuCreate(type=MenuType.DIR, name="系统管理"),
+    )
+    menu = await create_menu(
+        session,
+        MenuCreate(
+            parent_id=directory.id,
+            type=MenuType.MENU,
+            name="用户管理",
+        ),
+    )
+    await create_menu(
+        session,
+        MenuCreate(
+            parent_id=menu.id,
+            type=MenuType.BUTTON,
+            name="新增用户",
+        ),
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await update_menu(
+            session,
+            menu.id,
+            MenuUpdate(type=MenuType.DIR),
+        )
+
+    assert error.value.code == ErrorCode.INVALID_MENU_HIERARCHY
+
+
+async def test_update_menu_beneath_descendant_returns_4001(
+    session: AsyncSession,
+) -> None:
+    root = await create_menu(
+        session,
+        MenuCreate(type=MenuType.DIR, name="根目录"),
+    )
+    child = await create_menu(
+        session,
+        MenuCreate(
+            parent_id=root.id,
+            type=MenuType.DIR,
+            name="子目录",
+        ),
+    )
+    grandchild = await create_menu(
+        session,
+        MenuCreate(
+            parent_id=child.id,
+            type=MenuType.DIR,
+            name="孙目录",
+        ),
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await update_menu(
+            session,
+            root.id,
+            MenuUpdate(parent_id=grandchild.id),
+        )
+
+    assert error.value.code == ErrorCode.INVALID_MENU_HIERARCHY
 
 
 async def test_update_menu_to_non_menu_parent_returns_4001(

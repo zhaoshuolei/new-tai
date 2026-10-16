@@ -1,8 +1,30 @@
 """菜单请求与响应模型。"""
 
-from pydantic import BaseModel, ConfigDict, Field
+import re
+from typing import Annotated
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from app.models.menu import MenuStatus, MenuType
+
+PERMISSION_CODE_ACTIONS = frozenset({"create", "read", "update", "delete", "assign"})
+_PERMISSION_CODE_PATTERN = re.compile(r"^([a-z]+):([a-z]+)$")
+
+
+def _validate_permission_code(value: str) -> str:
+    match = _PERMISSION_CODE_PATTERN.fullmatch(value)
+    if match is None or match.group(2) not in PERMISSION_CODE_ACTIONS:
+        raise ValueError(
+            "permission_code must use resource:action with a supported action"
+        )
+    return value
+
+
+PermissionCode = Annotated[
+    str,
+    Field(max_length=100),
+    AfterValidator(_validate_permission_code),
+]
 
 
 class MenuCreate(BaseModel):
@@ -14,7 +36,7 @@ class MenuCreate(BaseModel):
     path: str | None = Field(default=None, max_length=255)
     component: str | None = Field(default=None, max_length=255)
     icon: str | None = Field(default=None, max_length=100)
-    permission_code: str | None = Field(default=None, max_length=100)
+    permission_code: PermissionCode | None = None
     sort_order: int = 0
     visible: bool = True
 
@@ -28,7 +50,7 @@ class MenuUpdate(BaseModel):
     path: str | None = Field(default=None, max_length=255)
     component: str | None = Field(default=None, max_length=255)
     icon: str | None = Field(default=None, max_length=100)
-    permission_code: str | None = Field(default=None, max_length=100)
+    permission_code: PermissionCode | None = None
     sort_order: int | None = None
     visible: bool | None = None
     status: MenuStatus | None = None
@@ -54,4 +76,10 @@ class MenuNode(BaseModel):
 MenuNode.model_rebuild()
 
 
-__all__: tuple[str, ...] = ("MenuCreate", "MenuNode", "MenuUpdate")
+__all__: tuple[str, ...] = (
+    "PERMISSION_CODE_ACTIONS",
+    "MenuCreate",
+    "MenuNode",
+    "MenuUpdate",
+    "PermissionCode",
+)
