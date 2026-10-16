@@ -1,4 +1,5 @@
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -69,6 +70,14 @@ class FakeRedis:
             if count > threshold:
                 exceeded = 1
         return exceeded
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_global_engine_after_test() -> AsyncIterator[None]:
+    import app.db.session as db_session
+
+    yield
+    await db_session.engine.dispose()
 
 
 @pytest_asyncio.fixture
