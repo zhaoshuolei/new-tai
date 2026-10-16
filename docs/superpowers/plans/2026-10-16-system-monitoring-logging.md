@@ -365,7 +365,7 @@ async def test_write_failure_does_not_propagate(...):
 - Consumes: Task 1 配置、Task 10 采样循环。
 
 - [ ] **Step 1: 写失败测试**
-  - `test_retention_deletes_only_expired`：各表插入 1 行 10 天前 + 1 行刚刚，`*_retention_days=30` 执行后只剩新行。
+  - `test_retention_deletes_only_expired`：各表插入 1 行 10 天前 + 1 行刚刚，把该表保留天数设为 **7 天**（10 > 7，故旧行应被删、新行保留）执行后只剩新行。（注：保留语义是"删除早于 N 天的行"，用例的保留天数必须小于插入行的年龄，否则旧行本就不该删。）
   - `test_retention_zero_disables_cleanup`：配置为 0 时旧行仍在、返回计数 0。
   - `test_seed_data.py`：`EXPECTED_PERMISSION_CODES` 增加 5 个新权限码；断言 `exceptions-ack` 按钮父级为 `exceptions`。
 - [ ] **Step 2: 跑测试确认失败** — Run: `uv run pytest tests/test_retention.py tests/test_seed_data.py -v`，Expected: FAIL
