@@ -6,9 +6,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
+from app.core.audit_meta import get_audit_route_meta
 from app.core.errors import BusinessError, ErrorCode
 from app.core.logging import current_request_id
 from app.core.middleware import SECURITY_HEADERS
+from app.core.request_context import current_request_meta
+from app.models.audit_log import AuditResult
+from app.services.audit import is_denial, record_audit_entry
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +67,68 @@ def _error_response(
     )
 
 
+def _error_reason(error: BusinessError) -> str:
+    try:
+        return ErrorCode(error.code).name
+    except ValueError:
+        return str(error.code)
+
+
+def _path_resource_id(request: Request) -> int | None:
+    path_params = request.path_params
+    candidate: object | None = None
+    for name, value in path_params.items():
+        if name == "resource_id" or name.endswith("_id"):
+            candidate = value
+            break
+    if candidate is None and len(path_params) == 1:
+        candidate = next(iter(path_params.values()))
+    if candidate is None:
+        return None
+
+    try:
+        return int(str(candidate))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _record_dependency_denial(
+    request: Request,
+    exc: BusinessError,
+) -> None:
+    """Record a pre-service denial unless the service hook already did."""
+    if not is_denial(exc) or getattr(exc, "audit_recorded", False):
+        return
+
+    # A 404 without a matched route has no scope["route"]; nothing to look up.
+    route_path = getattr(request.scope.get("route"), "path", None)
+    if not isinstance(route_path, str):
+        return
+
+    meta = get_audit_route_meta(request.method, route_path)
+    if meta is None:
+        return
+
+    await record_audit_entry(
+        action=meta.action,
+        resource_type=meta.resource_type,
+        resource_id=_path_resource_id(request),
+        result=AuditResult.DENIED,
+        reason=_error_reason(exc),
+        context=None,
+        request_meta=current_request_meta(),
+    )
+    setattr(exc, "audit_recorded", True)  # noqa: B010
+
+
 async def business_error_handler(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:
     if not isinstance(exc, BusinessError):
         raise exc
+
+    await _record_dependency_denial(request, exc)
 
     return _error_response(
         request,
