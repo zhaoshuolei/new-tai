@@ -420,6 +420,7 @@ async def test_me_menus_disabled_role_returns_empty(
         session,
         role.id,
         RoleUpdate(status=RoleStatus.DISABLED),
+        context=context_with_permissions("role:update", role_id=role.id),
         redis=fake_redis,
     )
     assert cache_key not in fake_redis.values

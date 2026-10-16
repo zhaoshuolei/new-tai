@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.core.permissions import (
     invalidate_role_permissions,
@@ -17,6 +18,7 @@ from app.core.redis import redis_scope
 from app.models.role import DataScope, Role, RoleStatus
 from app.repositories import role as role_repository
 from app.schemas.role import RoleCreate, RoleDataScopeUpdate, RoleUpdate
+from app.services import authorization as authorization_service
 from app.services import menu as menu_service
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset({"code", "name", "status"})
@@ -176,10 +178,12 @@ async def update_role(
     role_id: int,
     payload: RoleUpdate,
     *,
+    context: AuthContext,
     redis: Redis | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await get_role(session, role_id)
+        authorization_service.assert_can_manage_super_admin_role(context, role)
         changes = payload.model_dump(exclude_unset=True)
 
         for field_name in _NON_NULLABLE_UPDATE_FIELDS:
@@ -221,10 +225,12 @@ async def delete_role(
     session: AsyncSession,
     role_id: int,
     *,
+    context: AuthContext,
     redis: Redis | None = None,
 ) -> None:
     async with _map_role_write_errors(session):
         role = await get_role(session, role_id)
+        authorization_service.assert_can_manage_super_admin_role(context, role)
         if role.is_system:
             raise BusinessError(
                 ErrorCode.SYSTEM_ROLE_IMMUTABLE,

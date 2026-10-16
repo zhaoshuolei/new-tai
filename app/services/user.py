@@ -1,12 +1,15 @@
 """用户业务逻辑。"""
 
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
+from app.core.redis import redis_scope
 from app.core.security import hash_password
+from app.models.role import Role
 from app.models.user import User, UserStatus
 from app.repositories import department as department_repository
 from app.repositories import role as role_repository
@@ -19,6 +22,8 @@ from app.schemas.user import (
     UserStatusUpdate,
     UserUpdate,
 )
+from app.services import auth as auth_service
+from app.services import authorization as authorization_service
 from app.services.data_scope import apply_user_scope, build_user_scope_filter
 
 
@@ -114,6 +119,28 @@ async def _get_writable_user(
     )
 
 
+async def _get_current_role(
+    session: AsyncSession,
+    user: User,
+) -> Role | None:
+    if user.role_id is None:
+        return None
+    return await role_repository.get_by_id(session, user.role_id)
+
+
+async def _bump_user_token_version(
+    session: AsyncSession,
+    user_id: int,
+    redis: Redis | None,
+) -> None:
+    async with redis_scope(redis) as resolved_redis:
+        await auth_service.bump_token_version(
+            session,
+            user_id,
+            redis=resolved_redis,
+        )
+
+
 async def list_users(
     session: AsyncSession,
     *,
@@ -159,19 +186,47 @@ async def assign_user_role(
     payload: UserRoleUpdate,
     *,
     context: AuthContext,
+    redis: Redis | None = None,
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
+    authorization_service.assert_not_self(context, user)
+    current_role = await _get_current_role(session, user)
+
+    target_role: Role | None = None
     if payload.role_id is not None:
-        role = await role_repository.get_by_id(session, payload.role_id)
-        if role is None:
+        target_role = await role_repository.get_by_id(session, payload.role_id)
+        if target_role is None:
             raise BusinessError(
                 ErrorCode.ROLE_NOT_FOUND,
                 "Role not found",
                 http_status=404,
             )
+        authorization_service.assert_can_assign_role(context, target_role)
+
+    if (
+        current_role is not None
+        and authorization_service.is_system_super_admin(current_role)
+        and (target_role is None or target_role.id != current_role.id)
+    ):
+        if not context.is_super_admin:
+            raise BusinessError(
+                ErrorCode.CANNOT_GRANT_SUPER_ADMIN,
+                "Only a super administrator can revoke super administrator",
+                http_status=403,
+            )
+        await authorization_service.assert_can_reduce_super_admin(
+            session,
+            user,
+            current_role,
+            "demote",
+        )
+
+    if user.role_id == payload.role_id:
+        return user
 
     user.role_id = payload.role_id
     await session.commit()
+    await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -182,8 +237,11 @@ async def assign_user_department(
     payload: UserDepartmentUpdate,
     *,
     context: AuthContext,
+    redis: Redis | None = None,
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
+    authorization_service.assert_not_self(context, user)
+
     if payload.department_id is not None:
         department = await department_repository.get_by_id(
             session,
@@ -195,9 +253,18 @@ async def assign_user_department(
                 "Department not found",
                 http_status=404,
             )
+        await authorization_service.assert_can_assign_department(
+            session,
+            context,
+            department,
+        )
+
+    if user.department_id == payload.department_id:
+        return user
 
     user.department_id = payload.department_id
     await session.commit()
+    await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -208,10 +275,26 @@ async def update_user_status(
     payload: UserStatusUpdate,
     *,
     context: AuthContext,
+    redis: Redis | None = None,
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
+    authorization_service.assert_not_self(context, user)
+
+    if user.status == UserStatus.ACTIVE and payload.status == UserStatus.DISABLED:
+        current_role = await _get_current_role(session, user)
+        await authorization_service.assert_can_reduce_super_admin(
+            session,
+            user,
+            current_role,
+            "disable",
+        )
+
+    if user.status == payload.status:
+        return user
+
     user.status = payload.status
     await session.commit()
+    await _bump_user_token_version(session, user.id, redis)
     await session.refresh(user)
     return user
 
@@ -241,10 +324,23 @@ async def delete_user(
     user_id: int,
     *,
     context: AuthContext,
+    redis: Redis | None = None,
 ) -> None:
     user = await _get_writable_user(session, user_id, context)
+    authorization_service.assert_not_self(context, user)
+    current_role = await _get_current_role(session, user)
+    await authorization_service.assert_can_reduce_super_admin(
+        session,
+        user,
+        current_role,
+        "delete",
+    )
+
     await user_repository.delete(session, user)
     await session.commit()
+
+    async with redis_scope(redis) as resolved_redis:
+        await auth_service.invalidate_user_sessions(resolved_redis, user_id)
 
 
 __all__: tuple[str, ...] = (

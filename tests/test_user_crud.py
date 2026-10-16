@@ -312,7 +312,11 @@ async def test_delete_role_with_real_user_returns_3002(
     )
 
     with pytest.raises(BusinessError) as error:
-        await delete_role(session, role.id)
+        await delete_role(
+            session,
+            role.id,
+            context=ALL_SCOPE_CONTEXT,
+        )
 
     assert error.value.code == ErrorCode.ROLE_IN_USE
     assert await get_user(session, user.id, context=ALL_SCOPE_CONTEXT) is not None

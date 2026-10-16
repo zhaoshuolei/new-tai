@@ -58,6 +58,19 @@ ROLE_PERMISSION_CONTEXT = AuthContext(
     is_super_admin=False,
 )
 
+SUPER_ADMIN_CONTEXT = AuthContext(
+    user_id=1,
+    role_id=1,
+    department_id=None,
+    data_scope=DataScope.ALL,
+    custom_department_ids=frozenset(),
+    include_children=True,
+    permission_codes=frozenset(
+        {"role:create", "role:read", "role:update", "role:delete", "role:assign"}
+    ),
+    is_super_admin=True,
+)
+
 
 @pytest_asyncio.fixture
 async def session() -> AsyncIterator[AsyncSession]:
@@ -182,7 +195,12 @@ async def test_update_role_rejects_reserved_system_code(
     role = await create_role(session, RoleCreate(code="operator", name="运营"))
 
     with pytest.raises(BusinessError) as error:
-        await update_role(session, role.id, RoleUpdate(code=code))
+        await update_role(
+            session,
+            role.id,
+            RoleUpdate(code=code),
+            context=ROLE_PERMISSION_CONTEXT,
+        )
 
     assert error.value.code == ErrorCode.CONFLICT
     assert error.value.http_status == 409
@@ -199,7 +217,11 @@ async def test_system_role_cannot_be_deleted(session: AsyncSession) -> None:
     )
 
     with pytest.raises(BusinessError) as error:
-        await delete_role(session, role.id)
+        await delete_role(
+            session,
+            role.id,
+            context=SUPER_ADMIN_CONTEXT,
+        )
 
     assert error.value.code == ErrorCode.SYSTEM_ROLE_IMMUTABLE
     assert await role_repository.get_by_id(session, role.id) is not None
@@ -220,7 +242,11 @@ async def test_delete_role_in_use_returns_3002(
     monkeypatch.setattr(role_repository, "has_users", has_users)
 
     with pytest.raises(BusinessError) as error:
-        await delete_role(session, role.id)
+        await delete_role(
+            session,
+            role.id,
+            context=ROLE_PERMISSION_CONTEXT,
+        )
 
     assert error.value.code == ErrorCode.ROLE_IN_USE
     assert await role_repository.get_by_id(session, role.id) is not None
@@ -380,6 +406,7 @@ async def test_disabled_role_yields_empty_permission_codes(
         session,
         role.id,
         RoleUpdate(status=RoleStatus.DISABLED),
+        context=ROLE_PERMISSION_CONTEXT,
     )
 
     assert await list_role_permission_codes(session, role) == frozenset()

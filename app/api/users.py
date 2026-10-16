@@ -3,11 +3,13 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
+from app.core.redis import get_redis
 from app.core.response import MAX_PAGE_SIZE, Page, success
 from app.db.session import get_session
 from app.models.user import UserStatus
@@ -113,8 +115,14 @@ async def delete_user(
     user_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    await user_service.delete_user(session, user_id, context=context)
+    await user_service.delete_user(
+        session,
+        user_id,
+        context=context,
+        redis=redis,
+    )
     return success(message="deleted")
 
 
@@ -127,12 +135,14 @@ async def assign_user_role(
     payload: UserRoleUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     user = await user_service.assign_user_role(
         session,
         user_id,
         payload,
         context=context,
+        redis=redis,
     )
     return success(UserRead.model_validate(user))
 
@@ -146,12 +156,14 @@ async def assign_user_department(
     payload: UserDepartmentUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     user = await user_service.assign_user_department(
         session,
         user_id,
         payload,
         context=context,
+        redis=redis,
     )
     return success(UserRead.model_validate(user))
 
@@ -165,12 +177,14 @@ async def update_user_status(
     payload: UserStatusUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     user = await user_service.update_user_status(
         session,
         user_id,
         payload,
         context=context,
+        redis=redis,
     )
     return success(UserRead.model_validate(user))
 

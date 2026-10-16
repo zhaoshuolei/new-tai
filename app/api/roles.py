@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.permissions import require_permission
 from app.core.redis import get_redis
 from app.core.response import success
@@ -66,6 +68,7 @@ async def update_role(
     role_id: int,
     payload: RoleUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
     redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     role = await role_service.update_role(
@@ -73,6 +76,7 @@ async def update_role(
         session=session,
         role_id=role_id,
         payload=payload,
+        context=context,
     )
     return success(RoleRead.model_validate(role))
 
@@ -84,9 +88,15 @@ async def update_role(
 async def delete_role(
     role_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
     redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    await role_service.delete_role(session, role_id, redis=redis)
+    await role_service.delete_role(
+        session,
+        role_id,
+        context=context,
+        redis=redis,
+    )
     return success(message="deleted")
 
 
