@@ -1,0 +1,1 @@
+"""Tianxiadmin application package."""
