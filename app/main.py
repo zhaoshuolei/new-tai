@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.api.health import router as health_router
 from app.core.config import settings
+from app.core.exception_handlers import register_exception_handlers
 from app.core.redis import redis_client
 from app.db.session import engine
 
@@ -89,6 +90,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         openapi_tags=OPENAPI_TAGS,
     )
+    register_exception_handlers(application)
     application.include_router(health_router)
     return application
 
