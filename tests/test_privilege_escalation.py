@@ -660,7 +660,6 @@ def test_assignable_role_sets_respect_enabled_and_super_admin() -> None:
 
 async def test_non_super_admin_cannot_update_or_delete_super_admin_role(
     session: AsyncSession,
-    redis: RecordingRedis,
 ) -> None:
     role = await add_role(session)
     caller = await add_user(session, role=role)
@@ -677,7 +676,6 @@ async def test_non_super_admin_cannot_update_or_delete_super_admin_role(
             super_admin.id,
             RoleUpdate(description="attempted change"),
             context=context,
-            redis=redis,
         )
 
     assert update_error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
@@ -688,7 +686,6 @@ async def test_non_super_admin_cannot_update_or_delete_super_admin_role(
             session,
             super_admin.id,
             context=context,
-            redis=redis,
         )
 
     assert delete_error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN

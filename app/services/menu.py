@@ -4,16 +4,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import NoReturn
 
-from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
-from app.core.permissions import (
-    invalidate_role_permissions,
-    invalidate_super_admin_permissions,
-)
-from app.core.redis import redis_scope
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import RoleStatus
 from app.repositories import menu as menu_repository
@@ -237,21 +231,9 @@ def _build_menu_tree(menus: list[Menu]) -> list[MenuNode]:
     return roots
 
 
-async def _invalidate_permission_caches_after_menu_write(
-    session: AsyncSession,
-    redis: Redis | None,
-) -> None:
-    async with redis_scope(redis) as resolved_redis:
-        await invalidate_super_admin_permissions(resolved_redis)
-        for role in await role_repository.list_all(session):
-            await invalidate_role_permissions(resolved_redis, role.id)
-
-
 async def create_menu(
     session: AsyncSession,
     payload: MenuCreate,
-    *,
-    redis: Redis | None = None,
 ) -> Menu:
     async with _map_menu_write_errors(session):
         root_ids = {payload.parent_id} if payload.parent_id is not None else set()
@@ -283,7 +265,6 @@ async def create_menu(
         await menu_repository.add(session, menu)
         await session.commit()
         await session.refresh(menu)
-        await _invalidate_permission_caches_after_menu_write(session, redis)
         return menu
 
 
@@ -348,8 +329,6 @@ async def update_menu(
     session: AsyncSession,
     menu_id: int,
     payload: MenuUpdate,
-    *,
-    redis: Redis | None = None,
 ) -> Menu:
     async with _map_menu_write_errors(session):
         changes = payload.model_dump(exclude_unset=True)
@@ -399,15 +378,12 @@ async def update_menu(
 
         await session.commit()
         await session.refresh(menu)
-        await _invalidate_permission_caches_after_menu_write(session, redis)
         return menu
 
 
 async def delete_menu(
     session: AsyncSession,
     menu_id: int,
-    *,
-    redis: Redis | None = None,
 ) -> None:
     async with _map_menu_write_errors(session):
         locked = await _lock_menu_candidates(session, {menu_id})
@@ -427,7 +403,6 @@ async def delete_menu(
 
         await session.delete(menu)
         await session.commit()
-        await _invalidate_permission_caches_after_menu_write(session, redis)
 
 
 async def list_enabled_permission_codes(

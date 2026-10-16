@@ -3,13 +3,11 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, status
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
-from app.core.redis import get_redis
 from app.core.response import success
 from app.db.session import get_session
 from app.schemas.role import (
@@ -69,10 +67,8 @@ async def update_role(
     payload: RoleUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     role = await role_service.update_role(
-        redis=redis,
         session=session,
         role_id=role_id,
         payload=payload,
@@ -89,13 +85,11 @@ async def delete_role(
     role_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     await role_service.delete_role(
         session,
         role_id,
         context=context,
-        redis=redis,
     )
     return success(message="deleted")
 
@@ -108,13 +102,11 @@ async def assign_role_menus(
     role_id: int,
     payload: RoleMenuAssign,
     session: Annotated[AsyncSession, Depends(get_session)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     role = await role_service.assign_role_menus(
         session,
         role_id,
         payload.menu_ids,
-        redis=redis,
     )
     return success(RoleRead.model_validate(role))
 
@@ -127,13 +119,11 @@ async def set_role_data_scope(
     role_id: int,
     payload: RoleDataScopeUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
     role = await role_service.set_role_data_scope(
         session,
         role_id,
         payload,
-        redis=redis,
     )
     return success(RoleRead.model_validate(role))
 

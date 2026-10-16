@@ -3,13 +3,11 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, status
-from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
-from app.core.redis import get_redis
 from app.core.response import success
 from app.db.session import get_session
 from app.schemas.menu import MenuCreate, MenuNode, MenuUpdate
@@ -42,9 +40,8 @@ async def get_menu_tree(
 async def create_menu(
     payload: MenuCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    menu = await menu_service.create_menu(session, payload, redis=redis)
+    menu = await menu_service.create_menu(session, payload)
     return success(
         MenuNode.model_validate(menu),
         message="created",
@@ -59,9 +56,8 @@ async def update_menu(
     menu_id: int,
     payload: MenuUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    menu = await menu_service.update_menu(session, menu_id, payload, redis=redis)
+    menu = await menu_service.update_menu(session, menu_id, payload)
     return success(MenuNode.model_validate(menu))
 
 
@@ -72,9 +68,8 @@ async def update_menu(
 async def delete_menu(
     menu_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
-    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    await menu_service.delete_menu(session, menu_id, redis=redis)
+    await menu_service.delete_menu(session, menu_id)
     return success(message="deleted")
 
 
