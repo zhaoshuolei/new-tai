@@ -143,7 +143,7 @@ async def test_build_auth_context_carries_actor(session_with_user):
     - `DENIED_ERROR_CODES: frozenset[ErrorCode]` = `{CANNOT_MODIFY_SELF, CANNOT_GRANT_SUPER_ADMIN, LAST_SUPER_ADMIN, SYSTEM_ROLE_IMMUTABLE, INVALID_MENU_HIERARCHY, INVALID_DEPT_MOVE, SYSTEM_DEPT_IMMUTABLE}`
     - `def is_denial(error: BusinessError) -> bool` — `http_status == 403` 或 `error.code in DENIED_ERROR_CODES`
     - `async def record_audit_entry(*, action: str, resource_type: str, resource_id: int | None, result: AuditResult, reason: str | None, context: AuthContext | None, request_meta: RequestMeta | None) -> None` — 独立会话 + `run_best_effort` 的唯一写入口，供装饰器与异常处理器共用
-    - `def audited(*, action: str, resource_type: str, resource_id_param: str | None = None, resource_id_attr: str | None = None)` — 装饰器；成功记 `AuditResult.SUCCESS`；捕获 `BusinessError` 且 `is_denial` 时经 `record_audit_entry` 记 `DENIED`（`reason=ErrorCode(error.code).name`）并在异常实例上 `setattr(exc, "audit_recorded", True)` 后重抛；非拒绝异常不打标记直接重抛。操作人取 kwargs 里的 `context`（`AuthContext`），请求元信息取 `current_request_meta()`。
+    - `def audited(*, action: str, resource_type: str, resource_id_param: str | None = None, resource_id_attr: str | None = None)` — 装饰器；成功记 `AuditResult.SUCCESS`；捕获 `BusinessError` 且 `is_denial` 时经 `record_audit_entry` 记 `DENIED`（`reason=ErrorCode(error.code).name`）并在异常实例上 `setattr(exc, "audit_recorded", True)` 后重抛；非拒绝异常不打标记直接重抛。操作人取 kwargs 里的 `context`（`AuthContext`）——**kwargs 中无 `context` 或其值为 `None` 时，操作人快照字段（user_id/actor_username/actor_nickname）写 NULL，不报错**（Ruling GAP A）；请求元信息取 `current_request_meta()`。
 - Consumes: Task 1 模型、Task 2 AuthContext、Task 3 request meta。
 
 - [ ] **Step 1: 写失败测试**
@@ -162,11 +162,11 @@ async def test_denied_audit_survives_rollback(session, ...):
     async def op(session, *, context, user_id):
         session.add(User(username="ghost", ...))  # 制造待回滚变更
         raise BusinessError(ErrorCode.LAST_SUPER_ADMIN, "last", http_status=403)
-    with pytest.raises(BusinessError): await op(session, context=..., user_id=7)
+    with pytest.raises(BusinessError) as error_info: await op(session, context=..., user_id=7)
     await session.rollback()
     row = (await session.scalars(select(AuditLog))).one()
     assert row.result is AuditResult.DENIED and row.reason == "LAST_SUPER_ADMIN"
-    assert getattr(exc, "audit_recorded", False) is True  # exc 为捕获到的异常
+    assert getattr(error_info.value, "audit_recorded", False) is True  # 标记打在抛出的异常实例上
 
 async def test_not_denial_not_recorded(...):
     # BusinessError(USER_NOT_FOUND, 404) 不产生 audit 行，也不打标记
@@ -205,11 +205,12 @@ async def test_write_failure_does_not_propagate(...):
 ### Task 6: 用户模块接入审计
 
 **Files:**
-- Modify: `app/services/user.py`（`create_local_user` 增加 `context` 入参；全部写用例加 `@audited`）、`app/api/users.py`（create 传 context）
+- Modify: `app/services/user.py`（`create_local_user` 增加可选 `context` 入参；全部写用例加 `@audited`）、`app/api/users.py`（create 传 context）
 - Test: `tests/test_user_audit.py`
 
 **Interfaces:**
 - Produces: 各用例的 `action`/`resource_type`/id 来源对照——`create_local_user`: `user:create`/`user`/`resource_id_attr="id"`；`update_user`: `user:update`/`user_id`；`delete_user`: `user:delete`/`user_id`；`assign_user_role`: `user:assign`/`user_id`；`assign_user_department`: `user:assign`/`user_id`；`update_user_status`: `user:update`/`user_id`；`reset_user_password`: `user:update`/`user_id`。
+- **Ruling GAP A（必守）**：`create_local_user` 的新签名必须是 `async def create_local_user(session, payload, *, context: AuthContext | None = None) -> User`。既有 ~34 处测试直调不传 context，必须继续可运行（装饰器对缺失 context 写 NULL 操作人）。API 路由 `POST /users` 始终传 `context`。
 - Consumes: Task 4 装饰器、Task 5 注册表（`app/api/users.py` 底部为上述写路由调用 `register_audit_route`，path 用 FastAPI 模板如 `/users/{user_id}`）。
 
 - [ ] **Step 1: 写失败测试** — service 直调：成功创建产生 `user:create` success 行且 `resource_id` 为新 id；`assign_user_role` 自我修改抛 `CANNOT_MODIFY_SELF` 后恰 1 条 denied。API 级：无 `user:create` 权限调用 POST /users → 依赖层 403 恰 1 条 denied。
@@ -262,6 +263,7 @@ async def test_write_failure_does_not_propagate(...):
 - Test: `tests/test_exception_log.py`
 
 **Interfaces:**
+- **Ruling NOTE C（必守）**：`business_error_handler` 在 Task 5 已加入"拒绝审计钩子"。本任务只**新增** 5xx 异常记录分支，必须保留既有 `is_denial` + `audit_recorded` 去重逻辑——修改后 service 层 403 仍恰好 1 条 denied、依赖层 403 仍恰好 1 条 denied。改完须回跑 `tests/test_audit_denial_hooks.py` 确认未回归。
 - Produces:
   - `app/services/exception_log.py`: `def build_fingerprint(*, exception_type: str, message: str, traceback_text: str) -> str`（`sha256(type + 归一化消息(数字串替换为`N`) + 栈顶帧)前 64 位十六进制`）；`async def record_exception(*, exc, level, request_meta, user_id, status_code) -> None`（独立会话 + `run_best_effort`，message 经 `mask_sensitive_text` 且截断 1024）
   - `app/repositories/exception_log.py`: `add`、`list_exceptions(session, *, page, page_size, exception_type, level, acknowledged, start_time, end_time)`、`summary_by_fingerprint(session, *, start_time, end_time) -> list[Row]`（按 fingerprint 聚合：次数、最近时间、全部 acknowledged 与否）、`get_by_id`、`ack(session, row, *, user_id, at)`
@@ -280,7 +282,7 @@ async def test_write_failure_does_not_propagate(...):
 ### Task 10: 系统监控采集与接口
 
 **Files:**
-- Modify: `pyproject.toml`（新增 `psutil`）、`app/api/health.py`（探活抽出）、`app/main.py`（lifespan 启停采样任务）
+- Modify: `pyproject.toml`（新增 `psutil`）、`app/api/health.py`（探活抽出）、`app/main.py`（lifespan 启停采样任务）、`app/api/router.py`（**Ruling GAP B**：挂载 `monitor_router`，否则接口 404）
 - Create: `app/services/monitor.py`, `app/services/health.py`, `app/api/monitor.py`, `app/schemas/monitor.py`
 - Test: `tests/test_system_monitor.py`
 
@@ -321,7 +323,7 @@ async def test_write_failure_does_not_propagate(...):
   - `app/api/logs.py`:
     - `GET /logs/operations`（`audit:read`），筛选 `user_id`/`action`/`resource_type`/`resource_id`/`result`/`start_time`/`end_time`/`keyword`（keyword 匹配 actor_username/actor_nickname），按 `created_at` 倒序
     - `GET /logs/logins`（`login_log:read`），筛选 `user_id`/`username`/`login_type`/`result`/`ip`/`start_time`/`end_time`，倒序
-  - `app/api/router.py` 挂载 logs_router。
+  - `app/api/router.py` 挂载 logs_router（**保留 Task 10 已挂载的 monitor_router**）。
 - Consumes: Task 4/8 的 repository `list_*` 函数。
 
 - [ ] **Step 1: 写失败测试** — 预置若干行后：分页形状；`action`、`result`、时间范围各筛选 1 例；`keyword` 命中昵称；无权限 403；空结果返回 `items=[] total=0`。
