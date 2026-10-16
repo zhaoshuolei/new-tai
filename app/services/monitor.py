@@ -1,6 +1,7 @@
 """系统监控采样领域业务逻辑。"""
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TypedDict
 
@@ -15,6 +16,7 @@ from app.repositories import system_metric as system_metric_repository
 from app.services.health import check_database, check_redis
 
 _BYTES_PER_MB = 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class PsutilSnapshot(TypedDict):
@@ -96,13 +98,13 @@ async def sample_once(session: AsyncSession) -> SystemMetric:
 
 async def run_sampler(interval_seconds: int) -> None:
     """Sample forever until the owning lifespan task is cancelled."""
-    try:
-        while True:
+    while True:
+        try:
             async with session_factory() as session:
                 await sample_once(session)
-            await asyncio.sleep(interval_seconds)
-    except asyncio.CancelledError:
-        raise
+        except Exception:
+            logger.warning("System metric sampling failed", exc_info=True)
+        await asyncio.sleep(interval_seconds)
 
 
 async def list_history(

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -205,6 +206,51 @@ async def test_sampler_task_cancelled_on_shutdown(
 
     assert sample_started.is_set()
     assert calls == 1
+
+
+async def test_sampler_survives_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    second_sample_started = asyncio.Event()
+    calls = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    async def flaky_sample_once(session: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient sampling failure")
+        second_sample_started.set()
+
+    monkeypatch.setattr(
+        monitor_service,
+        "session_factory",
+        lambda: FakeSessionContext(),
+    )
+    monkeypatch.setattr(monitor_service, "sample_once", flaky_sample_once)
+
+    with caplog.at_level(logging.WARNING, logger=monitor_service.__name__):
+        sampler_task = asyncio.create_task(monitor_service.run_sampler(0))
+        try:
+            await asyncio.wait_for(second_sample_started.wait(), timeout=1)
+        finally:
+            sampler_task.cancel()
+            await asyncio.gather(sampler_task, return_exceptions=True)
+
+    assert calls == 2
+    assert "sampling" in caplog.text
+    assert any(
+        record.levelno == logging.WARNING
+        and record.name == monitor_service.__name__
+        for record in caplog.records
+    )
 
 
 async def test_current_snapshot_endpoint() -> None:
