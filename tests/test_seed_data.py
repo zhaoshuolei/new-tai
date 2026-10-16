@@ -158,9 +158,7 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
     }
     menus_by_id = {menu.id: menu for menu in menus}
     for menu in menus:
-        parent = (
-            menus_by_id.get(menu.parent_id) if menu.parent_id is not None else None
-        )
+        parent = menus_by_id.get(menu.parent_id) if menu.parent_id is not None else None
         assert _is_valid_parent_type(
             menu.type,
             parent.type if parent is not None else None,

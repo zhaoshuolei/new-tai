@@ -117,7 +117,7 @@ def _path_resource_id(request: Request) -> int | None:
 
     try:
         return int(str(candidate))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

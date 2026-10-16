@@ -27,9 +27,7 @@ async def record_login_log(
             result=result,
             reason=reason,
             ip=request_meta.ip if request_meta is not None else None,
-            user_agent=(
-                request_meta.user_agent if request_meta is not None else None
-            ),
+            user_agent=(request_meta.user_agent if request_meta is not None else None),
             device_id=device_id,
             request_id=request_meta.request_id if request_meta is not None else "",
         )

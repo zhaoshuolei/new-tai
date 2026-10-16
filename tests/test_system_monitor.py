@@ -301,8 +301,7 @@ async def test_sampler_survives_transient_failure(
     assert calls == 2
     assert "sampling" in caplog.text
     assert any(
-        record.levelno == logging.WARNING
-        and record.name == monitor_service.__name__
+        record.levelno == logging.WARNING and record.name == monitor_service.__name__
         for record in caplog.records
     )
 
