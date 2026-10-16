@@ -1,8 +1,10 @@
 """菜单树业务逻辑。"""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import NoReturn
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
@@ -13,36 +15,6 @@ from app.schemas.menu import MenuCreate, MenuNode, MenuUpdate
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
     {"type", "name", "sort_order", "visible", "status"}
 )
-
-
-async def _require_menu_for_update(
-    session: AsyncSession,
-    menu_id: int,
-) -> Menu:
-    menu = await menu_repository.get_by_id_for_update(session, menu_id)
-    if menu is None:
-        raise BusinessError(
-            ErrorCode.MENU_NOT_FOUND,
-            "Menu not found",
-            http_status=404,
-        )
-    return menu
-
-
-async def _require_parent_for_update(
-    session: AsyncSession,
-    parent_id: int | None,
-) -> Menu | None:
-    if parent_id is None:
-        return None
-    parent = await menu_repository.get_by_id_for_update(session, parent_id)
-    if parent is None:
-        raise BusinessError(
-            ErrorCode.MENU_NOT_FOUND,
-            "Menu not found",
-            http_status=404,
-        )
-    return parent
 
 
 async def _collect_ancestor_ids(
@@ -61,25 +33,24 @@ async def _collect_ancestor_ids(
         current_id = menu.parent_id
 
 
-async def _lock_menu_graph(
+async def _lock_menu_candidates(
     session: AsyncSession,
     root_ids: set[int],
+    *,
+    include_children: bool = False,
 ) -> dict[int, Menu]:
-    # 菜单写操作统一按 id 升序 FOR UPDATE，覆盖目标、新旧父节点和祖先链，
-    # 避免并发重挂形成环，并降低交叉加锁造成死锁的风险。
-    lock_ids = set(root_ids)
+    # 所有菜单写操作先汇总目标、新旧父节点、祖先和直接子节点，再只调用一次
+    # lock_menu_nodes 按 id 升序加锁；统一顺序可避免父子 id 大小相反时交叉等待。
+    candidate_ids = set(root_ids)
     for root_id in root_ids:
-        await _collect_ancestor_ids(session, root_id, lock_ids)
+        await _collect_ancestor_ids(session, root_id, candidate_ids)
 
-    while True:
-        locked = await menu_repository.lock_by_ids(session, lock_ids)
-        expanded_ids = set(lock_ids)
-        for menu in locked.values():
-            if menu.parent_id is not None:
-                expanded_ids.add(menu.parent_id)
-        if expanded_ids == lock_ids:
-            return locked
-        lock_ids = expanded_ids
+    if include_children:
+        for root_id in root_ids:
+            for child in await menu_repository.list_children(session, root_id):
+                candidate_ids.add(child.id)
+
+    return await menu_repository.lock_menu_nodes(session, candidate_ids)
 
 
 def _is_valid_parent_type(
@@ -106,18 +77,16 @@ def _validate_parent(
         )
 
 
-async def _validate_children(
-    session: AsyncSession,
-    menu: Menu,
+def _validate_children(
+    menu_id: int,
     menu_type: MenuType,
+    menus_by_id: dict[int, Menu],
 ) -> None:
-    children = await menu_repository.list_children(
-        session,
-        menu.id,
-        for_update=True,
-    )
-    for child in children:
-        if not _is_valid_parent_type(child.type, menu_type):
+    for child in menus_by_id.values():
+        if child.parent_id == menu_id and not _is_valid_parent_type(
+            child.type,
+            menu_type,
+        ):
             raise BusinessError(
                 ErrorCode.INVALID_MENU_HIERARCHY,
                 "Invalid menu hierarchy",
@@ -164,7 +133,7 @@ async def _ensure_permission_code_available(
         )
 
 
-def _mysql_error_number(error: IntegrityError) -> int | None:
+def _mysql_error_number(error: IntegrityError | OperationalError) -> int | None:
     args = getattr(error.orig, "args", ())
     if args and isinstance(args[0], int):
         return args[0]
@@ -193,6 +162,30 @@ def _raise_mapped_integrity_error(error: IntegrityError) -> NoReturn:
     raise error
 
 
+def _raise_mapped_operational_error(error: OperationalError) -> NoReturn:
+    if _mysql_error_number(error) in {1205, 1213}:
+        raise BusinessError(
+            ErrorCode.CONFLICT,
+            "菜单正在被并发修改，请稍后重试",
+            http_status=409,
+        )
+    raise error
+
+
+@asynccontextmanager
+async def _map_menu_write_errors(
+    session: AsyncSession,
+) -> AsyncIterator[None]:
+    try:
+        yield
+    except IntegrityError as error:
+        await session.rollback()
+        _raise_mapped_integrity_error(error)
+    except OperationalError as error:
+        await session.rollback()
+        _raise_mapped_operational_error(error)
+
+
 def _is_effectively_enabled(menu: Menu, menus_by_id: dict[int, Menu]) -> bool:
     current: Menu | None = menu
     visited: set[int] = set()
@@ -207,30 +200,37 @@ def _is_effectively_enabled(menu: Menu, menus_by_id: dict[int, Menu]) -> bool:
 
 
 async def create_menu(session: AsyncSession, payload: MenuCreate) -> Menu:
-    parent = await _require_parent_for_update(session, payload.parent_id)
-    _validate_parent(payload.type, parent)
-    await _ensure_permission_code_available(session, payload.permission_code)
+    async with _map_menu_write_errors(session):
+        root_ids = {payload.parent_id} if payload.parent_id is not None else set()
+        locked = await _lock_menu_candidates(session, root_ids)
+        parent = (
+            locked.get(payload.parent_id) if payload.parent_id is not None else None
+        )
+        if payload.parent_id is not None and parent is None:
+            raise BusinessError(
+                ErrorCode.MENU_NOT_FOUND,
+                "Menu not found",
+                http_status=404,
+            )
+        _validate_parent(payload.type, parent)
+        await _ensure_permission_code_available(session, payload.permission_code)
 
-    menu = Menu(
-        parent_id=payload.parent_id,
-        type=payload.type,
-        name=payload.name,
-        path=payload.path,
-        component=payload.component,
-        icon=payload.icon,
-        permission_code=payload.permission_code,
-        sort_order=payload.sort_order,
-        visible=payload.visible,
-        status=MenuStatus.ACTIVE,
-    )
-    try:
+        menu = Menu(
+            parent_id=payload.parent_id,
+            type=payload.type,
+            name=payload.name,
+            path=payload.path,
+            component=payload.component,
+            icon=payload.icon,
+            permission_code=payload.permission_code,
+            sort_order=payload.sort_order,
+            visible=payload.visible,
+            status=MenuStatus.ACTIVE,
+        )
         await menu_repository.add(session, menu)
         await session.commit()
-    except IntegrityError as error:
-        await session.rollback()
-        _raise_mapped_integrity_error(error)
-    await session.refresh(menu)
-    return menu
+        await session.refresh(menu)
+        return menu
 
 
 async def get_menu_tree(
@@ -267,74 +267,82 @@ async def update_menu(
     menu_id: int,
     payload: MenuUpdate,
 ) -> Menu:
-    changes = payload.model_dump(exclude_unset=True)
+    async with _map_menu_write_errors(session):
+        changes = payload.model_dump(exclude_unset=True)
 
-    for field_name in _NON_NULLABLE_UPDATE_FIELDS:
-        if field_name in changes and changes[field_name] is None:
+        for field_name in _NON_NULLABLE_UPDATE_FIELDS:
+            if field_name in changes and changes[field_name] is None:
+                raise BusinessError(
+                    ErrorCode.INVALID_PARAMETER,
+                    f"{field_name} cannot be null",
+                )
+
+        root_ids = {menu_id}
+        requested_parent_id = changes.get("parent_id", None)
+        if requested_parent_id is not None:
+            root_ids.add(requested_parent_id)
+        locked = await _lock_menu_candidates(
+            session,
+            root_ids,
+            include_children=True,
+        )
+
+        menu = locked.get(menu_id)
+        if menu is None:
             raise BusinessError(
-                ErrorCode.INVALID_PARAMETER,
-                f"{field_name} cannot be null",
+                ErrorCode.MENU_NOT_FOUND,
+                "Menu not found",
+                http_status=404,
             )
 
-    root_ids = {menu_id}
-    requested_parent_id = changes.get("parent_id", None)
-    if requested_parent_id is not None:
-        root_ids.add(requested_parent_id)
-    locked = await _lock_menu_graph(session, root_ids)
-
-    menu = locked.get(menu_id)
-    if menu is None:
-        raise BusinessError(
-            ErrorCode.MENU_NOT_FOUND,
-            "Menu not found",
-            http_status=404,
+        new_type = changes.get("type", menu.type)
+        new_parent_id = changes.get("parent_id", menu.parent_id)
+        parent = locked.get(new_parent_id) if new_parent_id is not None else None
+        if new_parent_id is not None and parent is None:
+            raise BusinessError(
+                ErrorCode.MENU_NOT_FOUND,
+                "Menu not found",
+                http_status=404,
+            )
+        _validate_parent(new_type, parent)
+        _ensure_parent_is_not_descendant(menu.id, new_parent_id, locked)
+        _validate_children(menu.id, new_type, locked)
+        await _ensure_permission_code_available(
+            session,
+            changes.get("permission_code", menu.permission_code),
+            exclude_id=menu.id,
         )
 
-    new_type = changes.get("type", menu.type)
-    new_parent_id = changes.get("parent_id", menu.parent_id)
-    parent = locked.get(new_parent_id) if new_parent_id is not None else None
-    if new_parent_id is not None and parent is None:
-        raise BusinessError(
-            ErrorCode.MENU_NOT_FOUND,
-            "Menu not found",
-            http_status=404,
-        )
-    _validate_parent(new_type, parent)
-    _ensure_parent_is_not_descendant(menu.id, new_parent_id, locked)
-    await _validate_children(session, menu, new_type)
-    await _ensure_permission_code_available(
-        session,
-        changes.get("permission_code", menu.permission_code),
-        exclude_id=menu.id,
-    )
+        for field_name, value in changes.items():
+            setattr(menu, field_name, value)
 
-    for field_name, value in changes.items():
-        setattr(menu, field_name, value)
-
-    try:
         await session.commit()
-    except IntegrityError as error:
-        await session.rollback()
-        _raise_mapped_integrity_error(error)
-    await session.refresh(menu)
-    return menu
+        await session.refresh(menu)
+        return menu
 
 
 async def delete_menu(session: AsyncSession, menu_id: int) -> None:
-    # 先锁定目标行，再检查子节点；并发创建子节点会先等待父节点锁释放。
-    menu = await _require_menu_for_update(session, menu_id)
-    if await menu_repository.has_children(session, menu_id):
-        raise BusinessError(
-            ErrorCode.INVALID_MENU_HIERARCHY,
-            "Menu has children",
+    async with _map_menu_write_errors(session):
+        locked = await _lock_menu_candidates(
+            session,
+            {menu_id},
+            include_children=True,
         )
+        menu = locked.get(menu_id)
+        if menu is None:
+            raise BusinessError(
+                ErrorCode.MENU_NOT_FOUND,
+                "Menu not found",
+                http_status=404,
+            )
+        if any(node.parent_id == menu_id for node in locked.values()):
+            raise BusinessError(
+                ErrorCode.INVALID_MENU_HIERARCHY,
+                "Menu has children",
+            )
 
-    try:
         await session.delete(menu)
         await session.commit()
-    except IntegrityError as error:
-        await session.rollback()
-        _raise_mapped_integrity_error(error)
 
 
 async def list_enabled_permission_codes(

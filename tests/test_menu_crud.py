@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.core.errors import BusinessError, ErrorCode
 from app.db.session import get_session
 from app.main import create_app
-from app.models.menu import MenuStatus, MenuType
+from app.models.menu import Menu, MenuStatus, MenuType
 from app.repositories import menu as menu_repository
 from app.schemas.menu import MenuCreate, MenuUpdate
 from app.services.menu import (
@@ -430,10 +430,10 @@ async def test_delete_foreign_key_violation_returns_4001(
     async def no_children(
         _session: AsyncSession,
         _menu_id: int,
-    ) -> bool:
-        return False
+    ) -> list[Menu]:
+        return []
 
-    monkeypatch.setattr(menu_repository, "has_children", no_children)
+    monkeypatch.setattr(menu_repository, "list_children", no_children)
 
     with pytest.raises(BusinessError) as error:
         await delete_menu(session, parent.id)
