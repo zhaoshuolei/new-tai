@@ -13,6 +13,7 @@ from app.core.auth_context import AuthContext
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.errors import BusinessError, ErrorCode
 from app.repositories.integration_config import get_by_provider, upsert
+from app.services.audit import audited
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ async def get_tianyancha_status(session: AsyncSession) -> dict[str, object]:
     }
 
 
+@audited(
+    action="integration:update",
+    resource_type="integration",
+)
 async def save_tianyancha_token(
     session: AsyncSession,
     api_key: str,

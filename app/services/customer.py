@@ -18,6 +18,7 @@ from app.models.user import User, UserStatus
 from app.repositories import customer as customer_repository
 from app.repositories.customer import get_by_credit_code
 from app.schemas.customer import CustomerCreate, CustomerUpdate
+from app.services.audit import audited
 from app.services.customer_scope_text import resolve_full_business_scope
 from app.services.data_scope import (
     apply_customer_scope,
@@ -230,6 +231,11 @@ async def search_candidates(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@audited(
+    action="customer:create",
+    resource_type="customer",
+    resource_id_attr="id",
+)
 async def import_from_tianyancha(
     session: AsyncSession,
     credit_code: str,
@@ -285,6 +291,11 @@ async def import_from_tianyancha(
     return customer
 
 
+@audited(
+    action="customer:create",
+    resource_type="customer",
+    resource_id_attr="id",
+)
 async def create_customer(
     session: AsyncSession,
     payload: CustomerCreate,
@@ -336,6 +347,11 @@ async def get_customer(
     return await _require_scoped_customer(session, customer_id, context)
 
 
+@audited(
+    action="customer:update",
+    resource_type="customer",
+    resource_id_param="customer_id",
+)
 async def update_customer(
     session: AsyncSession,
     customer_id: int,
@@ -392,6 +408,11 @@ async def update_customer(
     return customer
 
 
+@audited(
+    action="customer:delete",
+    resource_type="customer",
+    resource_id_param="customer_id",
+)
 async def delete_customer(
     session: AsyncSession,
     customer_id: int,
@@ -403,6 +424,11 @@ async def delete_customer(
     await session.flush()
 
 
+@audited(
+    action="customer:transfer",
+    resource_type="customer",
+    resource_id_param="customer_id",
+)
 async def transfer_owner(
     session: AsyncSession,
     customer_id: int,
