@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
@@ -42,8 +43,9 @@ async def get_menu_tree(
 async def create_menu(
     payload: MenuCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    menu = await menu_service.create_menu(session, payload)
+    menu = await menu_service.create_menu(session, payload, context=context)
     return success(
         MenuNode.model_validate(menu),
         message="created",
@@ -59,8 +61,14 @@ async def update_menu(
     menu_id: int,
     payload: MenuUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    menu = await menu_service.update_menu(session, menu_id, payload)
+    menu = await menu_service.update_menu(
+        session,
+        menu_id,
+        payload,
+        context=context,
+    )
     return success(MenuNode.model_validate(menu))
 
 
@@ -72,8 +80,9 @@ async def update_menu(
 async def delete_menu(
     menu_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    await menu_service.delete_menu(session, menu_id)
+    await menu_service.delete_menu(session, menu_id, context=context)
     return success(message="deleted")
 
 
@@ -101,6 +110,26 @@ async def get_my_menus(
         is_super_admin=context.is_super_admin,
     )
     return success(tree)
+
+
+register_audit_route(
+    "POST",
+    "/menus",
+    action="menu:create",
+    resource_type="menu",
+)
+register_audit_route(
+    "PATCH",
+    "/menus/{menu_id}",
+    action="menu:update",
+    resource_type="menu",
+)
+register_audit_route(
+    "DELETE",
+    "/menus/{menu_id}",
+    action="menu:delete",
+    resource_type="menu",
+)
 
 
 __all__: tuple[str, ...] = (

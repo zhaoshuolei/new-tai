@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
@@ -43,8 +44,9 @@ async def list_roles(
 async def create_role(
     payload: RoleCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    role = await role_service.create_role(session, payload)
+    role = await role_service.create_role(session, payload, context=context)
     return success(RoleRead.model_validate(role), message="created")
 
 
@@ -108,11 +110,13 @@ async def assign_role_menus(
     role_id: int,
     payload: RoleMenuAssign,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     role = await role_service.assign_role_menus(
         session,
         role_id,
         payload.menu_ids,
+        context=context,
     )
     return success(RoleRead.model_validate(role))
 
@@ -126,13 +130,47 @@ async def set_role_data_scope(
     role_id: int,
     payload: RoleDataScopeUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     role = await role_service.set_role_data_scope(
         session,
         role_id,
         payload,
+        context=context,
     )
     return success(RoleRead.model_validate(role))
+
+
+register_audit_route(
+    "POST",
+    "/roles",
+    action="role:create",
+    resource_type="role",
+)
+register_audit_route(
+    "PATCH",
+    "/roles/{role_id}",
+    action="role:update",
+    resource_type="role",
+)
+register_audit_route(
+    "DELETE",
+    "/roles/{role_id}",
+    action="role:delete",
+    resource_type="role",
+)
+register_audit_route(
+    "PUT",
+    "/roles/{role_id}/menus",
+    action="role:assign",
+    resource_type="role",
+)
+register_audit_route(
+    "PUT",
+    "/roles/{role_id}/data-scope",
+    action="role:assign",
+    resource_type="role",
+)
 
 
 __all__: tuple[str, ...] = (

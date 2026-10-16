@@ -5,6 +5,9 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_meta import register_audit_route
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.permissions import require_permission
 from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
@@ -44,8 +47,13 @@ async def get_department_tree(
 async def create_department(
     payload: DepartmentCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    department = await department_service.create_department(session, payload)
+    department = await department_service.create_department(
+        session,
+        payload,
+        context=context,
+    )
     return success(
         DepartmentNode.model_validate(department),
         message="created",
@@ -61,11 +69,13 @@ async def update_department(
     department_id: int,
     payload: DepartmentUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     department = await department_service.update_department(
         session,
         department_id,
         payload,
+        context=context,
     )
     return success(DepartmentNode.model_validate(department))
 
@@ -79,11 +89,13 @@ async def move_department(
     department_id: int,
     payload: DepartmentMove,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     department = await department_service.move_department(
         session,
         department_id,
         payload.new_parent_id,
+        context=context,
     )
     return success(DepartmentNode.model_validate(department))
 
@@ -96,9 +108,40 @@ async def move_department(
 async def delete_department(
     department_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    await department_service.delete_department(session, department_id)
+    await department_service.delete_department(
+        session,
+        department_id,
+        context=context,
+    )
     return success(message="deleted")
+
+
+register_audit_route(
+    "POST",
+    "/departments",
+    action="dept:create",
+    resource_type="department",
+)
+register_audit_route(
+    "PATCH",
+    "/departments/{department_id}",
+    action="dept:update",
+    resource_type="department",
+)
+register_audit_route(
+    "PATCH",
+    "/departments/{department_id}/move",
+    action="dept:move",
+    resource_type="department",
+)
+register_audit_route(
+    "DELETE",
+    "/departments/{department_id}",
+    action="dept:delete",
+    resource_type="department",
+)
 
 
 __all__: tuple[str, ...] = (

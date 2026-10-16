@@ -3,15 +3,21 @@
 from fastapi import APIRouter
 
 from app.api.departments import router as departments_router
+from app.api.logs import router as logs_router
 from app.api.menus import me_router
 from app.api.menus import router as menus_router
+from app.api.monitor import exceptions_router as exceptions_monitor_router
+from app.api.monitor import router as monitor_router
 from app.api.roles import router as roles_router
 from app.api.users import router as users_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(departments_router)
+api_v1_router.include_router(exceptions_monitor_router)
+api_v1_router.include_router(logs_router)
 api_v1_router.include_router(menus_router)
 api_v1_router.include_router(me_router)
+api_v1_router.include_router(monitor_router)
 api_v1_router.include_router(roles_router)
 api_v1_router.include_router(users_router)
 

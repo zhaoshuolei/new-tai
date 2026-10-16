@@ -9,7 +9,11 @@ from app.core.audit_meta import ActorSnapshot
 from app.core.auth_context import AuthContext
 from app.core.best_effort import run_best_effort
 from app.core.errors import BusinessError, ErrorCode
-from app.core.request_context import RequestMeta, current_request_meta
+from app.core.request_context import (
+    RequestMeta,
+    bounded_request_id,
+    current_request_meta,
+)
 from app.db.session import session_factory
 from app.models.audit_log import AuditLog, AuditResult
 from app.repositories import audit_log as audit_log_repository
@@ -71,7 +75,9 @@ async def record_audit_entry(
             method=request_meta.method if request_meta is not None else None,
             path=request_meta.path if request_meta is not None else None,
             ip=request_meta.ip if request_meta is not None else None,
-            request_id=request_meta.request_id if request_meta is not None else "",
+            request_id=bounded_request_id(
+                request_meta.request_id if request_meta is not None else ""
+            ),
         )
         async with session_factory() as session:
             await audit_log_repository.add(session, row)

@@ -1,5 +1,4 @@
 import logging
-from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -10,9 +9,16 @@ from app.core.audit_meta import get_audit_route_meta
 from app.core.errors import BusinessError, ErrorCode
 from app.core.logging import current_request_id
 from app.core.middleware import SECURITY_HEADERS
-from app.core.request_context import current_request_meta
+from app.core.request_context import (
+    USER_AGENT_MAX_LENGTH,
+    RequestMeta,
+    current_request_meta,
+    normalize_request_id,
+)
 from app.models.audit_log import AuditResult
+from app.models.exception_log import ExceptionLevel
 from app.services.audit import is_denial, record_audit_entry
+from app.services.exception_log import record_exception
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +44,30 @@ def _request_id(request: Request) -> str:
     if context_request_id:
         return context_request_id
 
-    header_request_id = request.headers.get("X-Request-Id")
-    if header_request_id:
-        return header_request_id
+    return normalize_request_id(request.headers.get("X-Request-Id"))
 
-    return str(uuid4())
+
+def _request_user_id(request: Request) -> int | None:
+    user_id = getattr(request.state, "user_id", None)
+    return user_id if isinstance(user_id, int) else None
+
+
+def _exception_request_meta(request: Request) -> RequestMeta:
+    """Return the request context, rebuilding it when outer middleware reset it."""
+    meta = current_request_meta()
+    if meta is not None:
+        return meta
+
+    user_agent = request.headers.get("user-agent")
+    return RequestMeta(
+        request_id=_request_id(request),
+        method=request.method,
+        path=request.url.path,
+        ip=request.client.host if request.client is not None else None,
+        user_agent=(
+            user_agent[:USER_AGENT_MAX_LENGTH] if user_agent is not None else None
+        ),
+    )
 
 
 def _error_response(
@@ -96,7 +121,7 @@ def _path_resource_id(request: Request) -> int | None:
 
     try:
         return int(str(candidate))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -139,6 +164,15 @@ async def business_error_handler(
 
     await _record_dependency_denial(request, exc)
 
+    if exc.http_status >= 500:
+        await record_exception(
+            exc=exc,
+            level=ExceptionLevel.ERROR,
+            request_meta=_exception_request_meta(request),
+            user_id=_request_user_id(request),
+            status_code=exc.http_status,
+        )
+
     return _error_response(
         request,
         code=exc.code,
@@ -160,6 +194,13 @@ async def http_exception_handler(
             "HTTP server exception",
             exc_info=exc,
             extra={"request_id": _request_id(request)},
+        )
+        await record_exception(
+            exc=exc,
+            level=ExceptionLevel.ERROR,
+            request_meta=_exception_request_meta(request),
+            user_id=_request_user_id(request),
+            status_code=exc.status_code,
         )
         message = _INTERNAL_SERVER_ERROR_MESSAGE
     else:
@@ -196,6 +237,13 @@ async def unhandled_exception_handler(
         "Unhandled request exception",
         exc_info=exc,
         extra={"request_id": _request_id(request)},
+    )
+    await record_exception(
+        exc=exc,
+        level=ExceptionLevel.ERROR,
+        request_meta=_exception_request_meta(request),
+        user_id=_request_user_id(request),
+        status_code=500,
     )
     return _error_response(
         request,

@@ -1,4 +1,5 @@
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -43,3 +44,20 @@ def test_malformed_config_encryption_key_refuses_startup(
     with pytest.raises(RuntimeError) as exc_info:
         _validate_critical_settings()
     assert str(exc_info.value) == "Invalid config_encryption_key"
+
+
+def test_monitor_sample_interval_default_is_60(test_settings: Settings) -> None:
+    assert test_settings.monitor_sample_interval_seconds == 60
+
+
+@pytest.mark.parametrize("interval", [0, -1, -60])
+def test_monitor_sample_interval_must_be_positive(interval: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="mysql+asyncmy://u:p@localhost:3306/db",
+            redis_url="redis://localhost:6379/15",
+            jwt_secret="secret",
+            config_encryption_key=Fernet.generate_key().decode(),
+            monitor_sample_interval_seconds=interval,
+            _env_file=None,
+        )

@@ -14,6 +14,7 @@ from app.repositories import role as role_repository
 from app.schemas.role import RoleCreate, RoleDataScopeUpdate, RoleUpdate
 from app.services import authorization as authorization_service
 from app.services import menu as menu_service
+from app.services.audit import audited
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset({"code", "name", "status"})
 _SUPER_ADMIN_IMMUTABLE_UPDATE_FIELDS = frozenset({"code", "name", "status"})
@@ -130,7 +131,13 @@ async def _ensure_role_code_available(
         )
 
 
-async def create_role(session: AsyncSession, payload: RoleCreate) -> Role:
+@audited(action="role:create", resource_type="role", resource_id_attr="id")
+async def create_role(
+    session: AsyncSession,
+    payload: RoleCreate,
+    *,
+    context: AuthContext | None = None,
+) -> Role:
     async with _map_role_write_errors(session):
         _ensure_role_code_is_not_reserved(
             payload.code,
@@ -157,6 +164,7 @@ async def list_roles(session: AsyncSession) -> list[Role]:
     return await role_repository.list_all(session)
 
 
+@audited(action="role:update", resource_type="role", resource_id_param="role_id")
 async def update_role(
     session: AsyncSession,
     role_id: int,
@@ -203,6 +211,7 @@ async def update_role(
         return role
 
 
+@audited(action="role:delete", resource_type="role", resource_id_param="role_id")
 async def delete_role(
     session: AsyncSession,
     role_id: int,
@@ -227,10 +236,13 @@ async def delete_role(
         await session.commit()
 
 
+@audited(action="role:assign", resource_type="role", resource_id_param="role_id")
 async def assign_role_menus(
     session: AsyncSession,
     role_id: int,
     menu_ids: list[int],
+    *,
+    context: AuthContext | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await _get_role_for_update(session, role_id)
@@ -259,10 +271,13 @@ async def assign_role_menus(
         return role
 
 
+@audited(action="role:assign", resource_type="role", resource_id_param="role_id")
 async def set_role_data_scope(
     session: AsyncSession,
     role_id: int,
     payload: RoleDataScopeUpdate,
+    *,
+    context: AuthContext | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await _get_role_for_update(session, role_id)

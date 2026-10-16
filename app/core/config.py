@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,7 +23,7 @@ class Settings(BaseSettings):
     initial_superadmin_username: str = "superadmin"
     initial_superadmin_password: str = ""
     monitor_enabled: bool = True
-    monitor_sample_interval_seconds: int = 60
+    monitor_sample_interval_seconds: int = Field(default=60, ge=1)
     monitor_metric_retention_days: int = 30
     exception_log_retention_days: int = 90
     login_log_retention_days: int = 180

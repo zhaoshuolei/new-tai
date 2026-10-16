@@ -7,12 +7,14 @@ from typing import NoReturn
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import RoleStatus
 from app.repositories import menu as menu_repository
 from app.repositories import role as role_repository
 from app.schemas.menu import MenuCreate, MenuNode, MenuUpdate
+from app.services.audit import audited
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
     {"type", "name", "sort_order", "visible", "status"}
@@ -231,9 +233,12 @@ def _build_menu_tree(menus: list[Menu]) -> list[MenuNode]:
     return roots
 
 
+@audited(action="menu:create", resource_type="menu", resource_id_attr="id")
 async def create_menu(
     session: AsyncSession,
     payload: MenuCreate,
+    *,
+    context: AuthContext | None = None,
 ) -> Menu:
     async with _map_menu_write_errors(session):
         root_ids = {payload.parent_id} if payload.parent_id is not None else set()
@@ -325,10 +330,13 @@ async def get_visible_menu_tree(
     return _build_menu_tree(visible_menus)
 
 
+@audited(action="menu:update", resource_type="menu", resource_id_param="menu_id")
 async def update_menu(
     session: AsyncSession,
     menu_id: int,
     payload: MenuUpdate,
+    *,
+    context: AuthContext | None = None,
 ) -> Menu:
     async with _map_menu_write_errors(session):
         changes = payload.model_dump(exclude_unset=True)
@@ -381,9 +389,12 @@ async def update_menu(
         return menu
 
 
+@audited(action="menu:delete", resource_type="menu", resource_id_param="menu_id")
 async def delete_menu(
     session: AsyncSession,
     menu_id: int,
+    *,
+    context: AuthContext | None = None,
 ) -> None:
     async with _map_menu_write_errors(session):
         locked = await _lock_menu_candidates(session, {menu_id})
