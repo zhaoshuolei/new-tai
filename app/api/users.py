@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
+from app.core.permissions import require_permission
 from app.core.response import MAX_PAGE_SIZE, Page, success
 from app.db.session import get_session
 from app.models.user import UserStatus
@@ -24,29 +25,9 @@ from app.services import user as user_service
 router = APIRouter(prefix="/users", tags=["用户"])
 
 
-async def require_user_read() -> None:
-    """Task 15 接入用户读取权限前的占位依赖。"""
-
-
-async def require_user_create() -> None:
-    """Task 15 接入用户创建权限前的占位依赖。"""
-
-
-async def require_user_update() -> None:
-    """Task 15 接入用户更新权限前的占位依赖。"""
-
-
-async def require_user_assign() -> None:
-    """Task 15 接入用户授权权限前的占位依赖。"""
-
-
-async def require_user_delete() -> None:
-    """Task 15 接入用户删除权限前的占位依赖。"""
-
-
 @router.get(
     "",
-    dependencies=[Depends(require_user_read)],
+    dependencies=[Depends(require_permission("user:read"))],
 )
 async def list_users(
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -81,7 +62,7 @@ async def list_users(
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_user_create)],
+    dependencies=[Depends(require_permission("user:create"))],
 )
 async def create_user(
     payload: UserCreate,
@@ -94,7 +75,7 @@ async def create_user(
 
 @router.get(
     "/{user_id}",
-    dependencies=[Depends(require_user_read)],
+    dependencies=[Depends(require_permission("user:read"))],
 )
 async def get_user(
     user_id: int,
@@ -107,7 +88,7 @@ async def get_user(
 
 @router.patch(
     "/{user_id}",
-    dependencies=[Depends(require_user_update)],
+    dependencies=[Depends(require_permission("user:update"))],
 )
 async def update_user(
     user_id: int,
@@ -126,7 +107,7 @@ async def update_user(
 
 @router.delete(
     "/{user_id}",
-    dependencies=[Depends(require_user_delete)],
+    dependencies=[Depends(require_permission("user:delete"))],
 )
 async def delete_user(
     user_id: int,
@@ -139,7 +120,7 @@ async def delete_user(
 
 @router.patch(
     "/{user_id}/role",
-    dependencies=[Depends(require_user_assign)],
+    dependencies=[Depends(require_permission("user:assign"))],
 )
 async def assign_user_role(
     user_id: int,
@@ -158,7 +139,7 @@ async def assign_user_role(
 
 @router.patch(
     "/{user_id}/department",
-    dependencies=[Depends(require_user_assign)],
+    dependencies=[Depends(require_permission("user:assign"))],
 )
 async def assign_user_department(
     user_id: int,
@@ -177,7 +158,7 @@ async def assign_user_department(
 
 @router.patch(
     "/{user_id}/status",
-    dependencies=[Depends(require_user_update)],
+    dependencies=[Depends(require_permission("user:update"))],
 )
 async def update_user_status(
     user_id: int,
@@ -196,7 +177,7 @@ async def update_user_status(
 
 @router.post(
     "/{user_id}/password/reset",
-    dependencies=[Depends(require_user_update)],
+    dependencies=[Depends(require_permission("user:update"))],
 )
 async def reset_user_password(
     user_id: int,

@@ -10,7 +10,10 @@ from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
+from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
 from app.models.department import Department, DepartmentStatus
@@ -40,6 +43,19 @@ from app.services.role import (
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
+
+ROLE_PERMISSION_CONTEXT = AuthContext(
+    user_id=1,
+    role_id=1,
+    department_id=None,
+    data_scope=DataScope.ALL,
+    custom_department_ids=frozenset(),
+    include_children=True,
+    permission_codes=frozenset(
+        {"role:create", "role:read", "role:update", "role:delete", "role:assign"}
+    ),
+    is_super_admin=False,
 )
 
 
@@ -641,13 +657,21 @@ async def test_non_custom_scope_clears_custom_departments(
     assert result.all() == []
 
 
-async def test_role_api_crud_and_assignments(session: AsyncSession) -> None:
+async def test_role_api_crud_and_assignments(
+    session: AsyncSession,
+    fake_redis: Any,
+) -> None:
     application = create_app()
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return ROLE_PERMISSION_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    application.dependency_overrides[get_redis] = lambda: fake_redis
     menu = await create_menu(
         session,
         MenuCreate(

@@ -3,8 +3,11 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import require_permission
+from app.core.redis import get_redis
 from app.core.response import success
 from app.db.session import get_session
 from app.schemas.role import (
@@ -19,29 +22,9 @@ from app.services import role as role_service
 router = APIRouter(prefix="/roles", tags=["角色"])
 
 
-async def require_role_read() -> None:
-    """Task 15 接入角色读取权限前的占位依赖。"""
-
-
-async def require_role_create() -> None:
-    """Task 15 接入角色创建权限前的占位依赖。"""
-
-
-async def require_role_update() -> None:
-    """Task 15 接入角色更新权限前的占位依赖。"""
-
-
-async def require_role_delete() -> None:
-    """Task 15 接入角色删除权限前的占位依赖。"""
-
-
-async def require_role_assign() -> None:
-    """Task 15 接入角色授权权限前的占位依赖。"""
-
-
 @router.get(
     "",
-    dependencies=[Depends(require_role_read)],
+    dependencies=[Depends(require_permission("role:read"))],
 )
 async def list_roles(
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -53,7 +36,7 @@ async def list_roles(
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role_create)],
+    dependencies=[Depends(require_permission("role:create"))],
 )
 async def create_role(
     payload: RoleCreate,
@@ -65,7 +48,7 @@ async def create_role(
 
 @router.get(
     "/{role_id}",
-    dependencies=[Depends(require_role_read)],
+    dependencies=[Depends(require_permission("role:read"))],
 )
 async def get_role(
     role_id: int,
@@ -77,52 +60,71 @@ async def get_role(
 
 @router.patch(
     "/{role_id}",
-    dependencies=[Depends(require_role_update)],
+    dependencies=[Depends(require_permission("role:update"))],
 )
 async def update_role(
     role_id: int,
     payload: RoleUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    role = await role_service.update_role(session, role_id, payload)
+    role = await role_service.update_role(
+        redis=redis,
+        session=session,
+        role_id=role_id,
+        payload=payload,
+    )
     return success(RoleRead.model_validate(role))
 
 
 @router.delete(
     "/{role_id}",
-    dependencies=[Depends(require_role_delete)],
+    dependencies=[Depends(require_permission("role:delete"))],
 )
 async def delete_role(
     role_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    await role_service.delete_role(session, role_id)
+    await role_service.delete_role(session, role_id, redis=redis)
     return success(message="deleted")
 
 
 @router.put(
     "/{role_id}/menus",
-    dependencies=[Depends(require_role_assign)],
+    dependencies=[Depends(require_permission("role:assign"))],
 )
 async def assign_role_menus(
     role_id: int,
     payload: RoleMenuAssign,
     session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    role = await role_service.assign_role_menus(session, role_id, payload.menu_ids)
+    role = await role_service.assign_role_menus(
+        session,
+        role_id,
+        payload.menu_ids,
+        redis=redis,
+    )
     return success(RoleRead.model_validate(role))
 
 
 @router.put(
     "/{role_id}/data-scope",
-    dependencies=[Depends(require_role_assign)],
+    dependencies=[Depends(require_permission("role:assign"))],
 )
 async def set_role_data_scope(
     role_id: int,
     payload: RoleDataScopeUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> dict[str, Any]:
-    role = await role_service.set_role_data_scope(session, role_id, payload)
+    role = await role_service.set_role_data_scope(
+        session,
+        role_id,
+        payload,
+        redis=redis,
+    )
     return success(RoleRead.model_validate(role))
 
 

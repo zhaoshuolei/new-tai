@@ -4,10 +4,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import NoReturn
 
+from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
+from app.core.permissions import (
+    invalidate_role_permissions,
+    invalidate_super_admin_permissions,
+)
+from app.core.redis import redis_scope
 from app.models.role import DataScope, Role, RoleStatus
 from app.repositories import role as role_repository
 from app.schemas.role import RoleCreate, RoleDataScopeUpdate, RoleUpdate
@@ -86,6 +92,16 @@ async def get_role(session: AsyncSession, role_id: int) -> Role:
     return role
 
 
+async def _invalidate_role_permission_cache(
+    redis: Redis | None,
+    role: Role,
+) -> None:
+    async with redis_scope(redis) as resolved_redis:
+        await invalidate_role_permissions(resolved_redis, role.id)
+        if role.code == "super_admin" and role.is_system:
+            await invalidate_super_admin_permissions(resolved_redis)
+
+
 async def _get_role_for_update(session: AsyncSession, role_id: int) -> Role:
     # 同一角色的整集合覆盖先按主键 FOR UPDATE 串行化；菜单/部门校验和
     # DELETE+INSERT 必须在同一事务内完成，避免并发 PUT 交叉替换。
@@ -159,6 +175,8 @@ async def update_role(
     session: AsyncSession,
     role_id: int,
     payload: RoleUpdate,
+    *,
+    redis: Redis | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await get_role(session, role_id)
@@ -195,10 +213,16 @@ async def update_role(
 
         await session.commit()
         await session.refresh(role)
+        await _invalidate_role_permission_cache(redis, role)
         return role
 
 
-async def delete_role(session: AsyncSession, role_id: int) -> None:
+async def delete_role(
+    session: AsyncSession,
+    role_id: int,
+    *,
+    redis: Redis | None = None,
+) -> None:
     async with _map_role_write_errors(session):
         role = await get_role(session, role_id)
         if role.is_system:
@@ -214,12 +238,15 @@ async def delete_role(session: AsyncSession, role_id: int) -> None:
 
         await session.delete(role)
         await session.commit()
+        await _invalidate_role_permission_cache(redis, role)
 
 
 async def assign_role_menus(
     session: AsyncSession,
     role_id: int,
     menu_ids: list[int],
+    *,
+    redis: Redis | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await _get_role_for_update(session, role_id)
@@ -228,6 +255,7 @@ async def assign_role_menus(
         if role.code == "super_admin" and role.is_system:
             await role_repository.replace_role_menus(session, role.id, set())
             await session.commit()
+            await _invalidate_role_permission_cache(redis, role)
             return role
 
         menus = await role_repository.list_menus_by_ids(session, unique_menu_ids)
@@ -245,6 +273,7 @@ async def assign_role_menus(
         )
         await session.commit()
         await session.refresh(role)
+        await _invalidate_role_permission_cache(redis, role)
         return role
 
 
@@ -252,6 +281,8 @@ async def set_role_data_scope(
     session: AsyncSession,
     role_id: int,
     payload: RoleDataScopeUpdate,
+    *,
+    redis: Redis | None = None,
 ) -> Role:
     async with _map_role_write_errors(session):
         role = await _get_role_for_update(session, role_id)
@@ -271,6 +302,7 @@ async def set_role_data_scope(
             )
             await session.commit()
             await session.refresh(role)
+            await _invalidate_role_permission_cache(redis, role)
             return role
 
         unique_department_ids = set(payload.department_ids)
@@ -303,6 +335,7 @@ async def set_role_data_scope(
         )
         await session.commit()
         await session.refresh(role)
+        await _invalidate_role_permission_cache(redis, role)
         return role
 
 

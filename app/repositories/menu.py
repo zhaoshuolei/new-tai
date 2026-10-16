@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.menu import Menu, MenuStatus
+from app.models.role import RoleMenu
 
 
 async def get_by_id(session: AsyncSession, menu_id: int) -> Menu | None:
@@ -65,6 +66,15 @@ async def list_children(session: AsyncSession, menu_id: int) -> list[Menu]:
     return list(result.all())
 
 
+async def list_assigned_menu_ids(
+    session: AsyncSession,
+    role_id: int,
+) -> frozenset[int]:
+    statement = select(RoleMenu.c.menu_id).where(RoleMenu.c.role_id == role_id)
+    result = await session.scalars(statement)
+    return frozenset(result.all())
+
+
 async def list_children_for_update(
     session: AsyncSession,
     menu_id: int,
@@ -92,6 +102,7 @@ __all__: tuple[str, ...] = (
     "get_by_permission_code",
     "has_children",
     "list_all",
+    "list_assigned_menu_ids",
     "list_children",
     "list_children_for_update",
     "lock_menu_nodes",

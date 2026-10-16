@@ -51,6 +51,9 @@ class ScopeData:
         include_children: bool = True,
         role_id: int | None = 7001,
         is_super_admin: bool = False,
+        permission_codes: frozenset[str] = frozenset(
+            {"user:create", "user:read", "user:update", "user:delete", "user:assign"}
+        ),
     ) -> AuthContext:
         return AuthContext(
             user_id=self.users[label].id,
@@ -59,7 +62,7 @@ class ScopeData:
             data_scope=data_scope,
             custom_department_ids=custom_department_ids,
             include_children=include_children,
-            permission_codes=frozenset(),
+            permission_codes=permission_codes,
             is_super_admin=is_super_admin,
         )
 

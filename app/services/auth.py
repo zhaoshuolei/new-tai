@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
+from app.core.permissions import get_role_permission_codes
 from app.core.redis import key
 from app.core.redis import redis_client as default_redis_client
 from app.core.security import create_access_token, verify_password
@@ -24,7 +25,6 @@ from app.models.role import DataScope, RoleDepartment, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
-from app.services import role as role_service
 
 AUTH_SNAPSHOT_TTL_SECONDS = 600
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
@@ -448,6 +448,8 @@ async def build_auth_context(
     session: AsyncSession,
     user_id: int,
     snapshot: AuthSnapshot,
+    *,
+    redis: Redis | None = None,
 ) -> AuthContext:
     role = None
     if snapshot.role_id is not None:
@@ -481,7 +483,11 @@ async def build_auth_context(
         data_scope=role.data_scope,
         custom_department_ids=custom_department_ids,
         include_children=role.data_scope_include_children,
-        permission_codes=await role_service.list_role_permission_codes(session, role),
+        permission_codes=await get_role_permission_codes(
+            session,
+            redis or default_redis_client,
+            role,
+        ),
         is_super_admin=role.code == "super_admin" and role.is_system,
     )
 

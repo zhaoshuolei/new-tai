@@ -48,7 +48,9 @@ ALL_SCOPE_CONTEXT = AuthContext(
     data_scope=DataScope.ALL,
     custom_department_ids=frozenset(),
     include_children=True,
-    permission_codes=frozenset(),
+    permission_codes=frozenset(
+        {"user:create", "user:read", "user:update", "user:delete", "user:assign"}
+    ),
     is_super_admin=False,
 )
 

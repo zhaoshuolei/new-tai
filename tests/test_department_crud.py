@@ -6,10 +6,13 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.db.session import get_session
 from app.main import create_app
 from app.models.department import Department, DepartmentStatus
+from app.models.role import DataScope
 from app.repositories import department as department_repository
 from app.schemas.department import DepartmentCreate, DepartmentUpdate
 from app.services.department import (
@@ -23,6 +26,19 @@ from app.services.department import (
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
+
+DEPT_PERMISSION_CONTEXT = AuthContext(
+    user_id=1,
+    role_id=1,
+    department_id=None,
+    data_scope=DataScope.ALL,
+    custom_department_ids=frozenset(),
+    include_children=True,
+    permission_codes=frozenset(
+        {"dept:create", "dept:read", "dept:update", "dept:delete"}
+    ),
+    is_super_admin=False,
 )
 
 
@@ -275,7 +291,11 @@ async def test_department_endpoints_return_success_envelope(
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return DEPT_PERMISSION_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),

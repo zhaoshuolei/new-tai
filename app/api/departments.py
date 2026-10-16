@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import require_permission
 from app.core.response import success
 from app.db.session import get_session
 from app.schemas.department import (
@@ -18,25 +19,9 @@ from app.services import department as department_service
 router = APIRouter(prefix="/departments", tags=["部门"])
 
 
-async def require_dept_read() -> None:
-    """Task 15 接入部门读取权限前的占位依赖。"""
-
-
-async def require_dept_create() -> None:
-    """Task 15 接入部门创建权限前的占位依赖。"""
-
-
-async def require_dept_update() -> None:
-    """Task 15 接入部门更新权限前的占位依赖。"""
-
-
-async def require_dept_delete() -> None:
-    """Task 15 接入部门删除权限前的占位依赖。"""
-
-
 @router.get(
     "/tree",
-    dependencies=[Depends(require_dept_read)],
+    dependencies=[Depends(require_permission("dept:read"))],
 )
 async def get_department_tree(
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -52,7 +37,7 @@ async def get_department_tree(
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_dept_create)],
+    dependencies=[Depends(require_permission("dept:create"))],
 )
 async def create_department(
     payload: DepartmentCreate,
@@ -67,7 +52,7 @@ async def create_department(
 
 @router.patch(
     "/{department_id}",
-    dependencies=[Depends(require_dept_update)],
+    dependencies=[Depends(require_permission("dept:update"))],
 )
 async def update_department(
     department_id: int,
@@ -84,7 +69,7 @@ async def update_department(
 
 @router.patch(
     "/{department_id}/move",
-    dependencies=[Depends(require_dept_update)],
+    dependencies=[Depends(require_permission("dept:update"))],
 )
 async def move_department(
     department_id: int,
@@ -101,7 +86,7 @@ async def move_department(
 
 @router.delete(
     "/{department_id}",
-    dependencies=[Depends(require_dept_delete)],
+    dependencies=[Depends(require_permission("dept:delete"))],
 )
 async def delete_department(
     department_id: int,

@@ -1,15 +1,20 @@
 import os
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
+from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
 from app.models.menu import Menu, MenuStatus, MenuType
+from app.models.role import DataScope
 from app.repositories import menu as menu_repository
 from app.schemas.menu import MenuCreate, MenuUpdate
 from app.services.menu import (
@@ -23,6 +28,19 @@ from app.services.menu import (
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+)
+
+MENU_PERMISSION_CONTEXT = AuthContext(
+    user_id=1,
+    role_id=1,
+    department_id=None,
+    data_scope=DataScope.ALL,
+    custom_department_ids=frozenset(),
+    include_children=True,
+    permission_codes=frozenset(
+        {"menu:create", "menu:read", "menu:update", "menu:delete"}
+    ),
+    is_super_admin=False,
 )
 
 
@@ -178,6 +196,7 @@ async def test_duplicate_permission_code_returns_4002(
 )
 async def test_create_menu_rejects_invalid_permission_code_with_422(
     session: AsyncSession,
+    fake_redis: Any,
     permission_code: str,
 ) -> None:
     application = create_app()
@@ -185,7 +204,12 @@ async def test_create_menu_rejects_invalid_permission_code_with_422(
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return MENU_PERMISSION_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    application.dependency_overrides[get_redis] = lambda: fake_redis
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),
@@ -208,6 +232,7 @@ async def test_create_menu_rejects_invalid_permission_code_with_422(
 
 async def test_update_menu_rejects_invalid_permission_code_with_422(
     session: AsyncSession,
+    fake_redis: Any,
 ) -> None:
     menu = await create_menu(
         session,
@@ -222,7 +247,12 @@ async def test_update_menu_rejects_invalid_permission_code_with_422(
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return MENU_PERMISSION_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    application.dependency_overrides[get_redis] = lambda: fake_redis
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),
@@ -597,13 +627,19 @@ async def test_update_menu_to_non_menu_parent_returns_4001(
 
 async def test_menu_endpoints_return_success_envelope(
     session: AsyncSession,
+    fake_redis: Any,
 ) -> None:
     application = create_app()
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return MENU_PERMISSION_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    application.dependency_overrides[get_redis] = lambda: fake_redis
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),

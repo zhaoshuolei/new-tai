@@ -54,7 +54,7 @@ async def get_current_context(
             http_status=401,
         )
 
-    return await build_auth_context(session, user_id, snapshot)
+    return await build_auth_context(session, user_id, snapshot, redis=redis)
 
 
 __all__: tuple[str, ...] = ("get_current_context",)

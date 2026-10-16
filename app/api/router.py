@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.departments import router as departments_router
+from app.api.menus import me_router
 from app.api.menus import router as menus_router
 from app.api.roles import router as roles_router
 from app.api.users import router as users_router
@@ -10,6 +11,7 @@ from app.api.users import router as users_router
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(departments_router)
 api_v1_router.include_router(menus_router)
+api_v1_router.include_router(me_router)
 api_v1_router.include_router(roles_router)
 api_v1_router.include_router(users_router)
 

@@ -4,12 +4,20 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import NoReturn
 
+from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
+from app.core.permissions import (
+    invalidate_role_permissions,
+    invalidate_super_admin_permissions,
+)
+from app.core.redis import redis_scope
 from app.models.menu import Menu, MenuStatus, MenuType
+from app.models.role import RoleStatus
 from app.repositories import menu as menu_repository
+from app.repositories import role as role_repository
 from app.schemas.menu import MenuCreate, MenuNode, MenuUpdate
 
 _NON_NULLABLE_UPDATE_FIELDS = frozenset(
@@ -197,7 +205,54 @@ def _is_effectively_enabled(menu: Menu, menus_by_id: dict[int, Menu]) -> bool:
     return False
 
 
-async def create_menu(session: AsyncSession, payload: MenuCreate) -> Menu:
+def _is_effectively_visible(menu: Menu, menus_by_id: dict[int, Menu]) -> bool:
+    current: Menu | None = menu
+    visited: set[int] = set()
+    while current is not None:
+        if current.id in visited or not current.visible:
+            return False
+        visited.add(current.id)
+        if current.parent_id is None:
+            return True
+        current = menus_by_id.get(current.parent_id)
+    return False
+
+
+def _build_menu_tree(menus: list[Menu]) -> list[MenuNode]:
+    nodes = {menu.id: MenuNode.model_validate(menu) for menu in menus}
+    roots: list[MenuNode] = []
+
+    for menu in menus:
+        node = nodes[menu.id]
+        if menu.parent_id is None:
+            roots.append(node)
+            continue
+
+        parent_node = nodes.get(menu.parent_id)
+        if parent_node is None:
+            roots.append(node)
+        else:
+            parent_node.children.append(node)
+
+    return roots
+
+
+async def _invalidate_permission_caches_after_menu_write(
+    session: AsyncSession,
+    redis: Redis | None,
+) -> None:
+    async with redis_scope(redis) as resolved_redis:
+        await invalidate_super_admin_permissions(resolved_redis)
+        for role in await role_repository.list_all(session):
+            await invalidate_role_permissions(resolved_redis, role.id)
+
+
+async def create_menu(
+    session: AsyncSession,
+    payload: MenuCreate,
+    *,
+    redis: Redis | None = None,
+) -> Menu:
     async with _map_menu_write_errors(session):
         root_ids = {payload.parent_id} if payload.parent_id is not None else set()
         locked = await _lock_menu_candidates(session, root_ids)
@@ -228,6 +283,7 @@ async def create_menu(session: AsyncSession, payload: MenuCreate) -> Menu:
         await menu_repository.add(session, menu)
         await session.commit()
         await session.refresh(menu)
+        await _invalidate_permission_caches_after_menu_write(session, redis)
         return menu
 
 
@@ -242,28 +298,58 @@ async def get_menu_tree(
         for menu in all_menus
         if include_disabled or _is_effectively_enabled(menu, menus_by_id)
     ]
-    nodes = {menu.id: MenuNode.model_validate(menu) for menu in visible_menus}
-    roots: list[MenuNode] = []
+    return _build_menu_tree(visible_menus)
 
-    for menu in visible_menus:
-        node = nodes[menu.id]
-        if menu.parent_id is None:
-            roots.append(node)
-            continue
 
-        parent_node = nodes.get(menu.parent_id)
-        if parent_node is None:
-            roots.append(node)
-        else:
-            parent_node.children.append(node)
+async def get_visible_menu_tree(
+    session: AsyncSession,
+    *,
+    role_id: int | None,
+    is_super_admin: bool,
+) -> list[MenuNode]:
+    """返回当前用户可见的非按钮菜单树。"""
+    all_menus = await menu_repository.list_all(session, include_disabled=True)
+    menus_by_id = {menu.id: menu for menu in all_menus}
+    visible_ids: set[int] = set()
 
-    return roots
+    if is_super_admin:
+        visible_ids = {
+            menu.id
+            for menu in all_menus
+            if menu.type != MenuType.BUTTON
+            and _is_effectively_enabled(menu, menus_by_id)
+            and _is_effectively_visible(menu, menus_by_id)
+        }
+    elif role_id is not None:
+        role = await role_repository.get_by_id(session, role_id)
+        if role is None or role.status != RoleStatus.ACTIVE:
+            return []
+
+        assigned_ids = await menu_repository.list_assigned_menu_ids(session, role_id)
+        for assigned_id in assigned_ids:
+            menu = menus_by_id.get(assigned_id)
+            if menu is None or not _is_effectively_enabled(menu, menus_by_id):
+                continue
+            if not _is_effectively_visible(menu, menus_by_id):
+                continue
+
+            current: Menu | None = menu
+            while current is not None:
+                if current.type != MenuType.BUTTON:
+                    visible_ids.add(current.id)
+                parent_id = current.parent_id
+                current = menus_by_id.get(parent_id) if parent_id is not None else None
+
+    visible_menus = [menu for menu in all_menus if menu.id in visible_ids]
+    return _build_menu_tree(visible_menus)
 
 
 async def update_menu(
     session: AsyncSession,
     menu_id: int,
     payload: MenuUpdate,
+    *,
+    redis: Redis | None = None,
 ) -> Menu:
     async with _map_menu_write_errors(session):
         changes = payload.model_dump(exclude_unset=True)
@@ -313,10 +399,16 @@ async def update_menu(
 
         await session.commit()
         await session.refresh(menu)
+        await _invalidate_permission_caches_after_menu_write(session, redis)
         return menu
 
 
-async def delete_menu(session: AsyncSession, menu_id: int) -> None:
+async def delete_menu(
+    session: AsyncSession,
+    menu_id: int,
+    *,
+    redis: Redis | None = None,
+) -> None:
     async with _map_menu_write_errors(session):
         locked = await _lock_menu_candidates(session, {menu_id})
         menu = locked.get(menu_id)
@@ -335,6 +427,7 @@ async def delete_menu(session: AsyncSession, menu_id: int) -> None:
 
         await session.delete(menu)
         await session.commit()
+        await _invalidate_permission_caches_after_menu_write(session, redis)
 
 
 async def list_enabled_permission_codes(
@@ -354,6 +447,7 @@ __all__: tuple[str, ...] = (
     "create_menu",
     "delete_menu",
     "get_menu_tree",
+    "get_visible_menu_tree",
     "list_enabled_permission_codes",
     "update_menu",
 )
