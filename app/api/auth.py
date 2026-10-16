@@ -11,7 +11,7 @@ from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis
-from app.core.response import success
+from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.repositories import user as user_repository
 from app.schemas.auth import (
@@ -29,7 +29,7 @@ from app.services import auth as auth_service
 router = APIRouter(prefix="/api/v1/auth", tags=["认证"])
 
 
-@router.post("/login")
+@router.post("/login", response_model=SuccessEnvelope[LoginRead])
 async def login(
     payload: LoginRequest,
     request: Request,
@@ -54,9 +54,13 @@ async def login(
     return success(response)
 
 
-@router.post("/feishu/login")
+@router.post(
+    "/feishu/login",
+    response_model=SuccessEnvelope[LoginRead],
+)
 async def feishu_login(
     payload: FeishuLoginRequest,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     redis: Annotated[Redis, Depends(get_redis)],
     feishu_client: Annotated[FeishuClient, Depends(get_feishu_client)],
@@ -65,6 +69,7 @@ async def feishu_login(
         session,
         redis,
         payload.code,
+        client_ip=(request.client.host if request.client is not None else "unknown"),
         client=feishu_client,
     )
     response = LoginRead(
@@ -77,7 +82,7 @@ async def feishu_login(
     return success(response)
 
 
-@router.post("/refresh")
+@router.post("/refresh", response_model=SuccessEnvelope[TokenRead])
 async def refresh(
     payload: RefreshRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -98,7 +103,7 @@ async def refresh(
     )
 
 
-@router.post("/logout")
+@router.post("/logout", response_model=SuccessEnvelope[None])
 async def logout(
     payload: LogoutRequest,
     redis: Annotated[Redis, Depends(get_redis)],
@@ -107,7 +112,7 @@ async def logout(
     return success(message="logged out")
 
 
-@router.post("/logout-all")
+@router.post("/logout-all", response_model=SuccessEnvelope[None])
 async def logout_all(
     context: Annotated[AuthContext, Depends(get_current_context)],
     redis: Annotated[Redis, Depends(get_redis)],
@@ -116,7 +121,7 @@ async def logout_all(
     return success(message="logged out from all devices")
 
 
-@router.get("/me")
+@router.get("/me", response_model=SuccessEnvelope[CurrentUserRead])
 async def get_me(
     context: Annotated[AuthContext, Depends(get_current_context)],
     session: Annotated[AsyncSession, Depends(get_session)],

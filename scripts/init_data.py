@@ -7,6 +7,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.password_policy import validate_password_policy
 from app.core.security import hash_password
 from app.db.session import session_factory
 from app.models.department import Department, DepartmentStatus
@@ -14,6 +15,7 @@ from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
 from app.models.user import User, UserStatus
 from app.schemas.menu import MenuCreate
+from app.services.auth import normalize_username
 
 _PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 _SUPER_ADMIN_ROLE_CODE = "super_admin"
@@ -354,13 +356,16 @@ async def _get_or_create_superadmin(
     pending_department: Department,
     super_admin_role: Role,
 ) -> User:
-    user = await session.scalar(select(User).where(User.username == username))
+    normalized_username = normalize_username(username)
+    user = await session.scalar(
+        select(User).where(User.username == normalized_username)
+    )
     if user is not None:
         return user
 
     user = User(
         feishu_open_id=None,
-        username=username,
+        username=normalized_username,
         password_hash=hash_password(password),
         nickname="应急超级管理员",
         email=None,
@@ -383,10 +388,10 @@ async def init_data(
     superadmin_password: str,
 ) -> None:
     """创建运行所需的基础数据；已有系统数据不会被重复创建。"""
-    if not superadmin_password:
-        raise ValueError(
-            "initial superadmin password is required; set INITIAL_SUPERADMIN_PASSWORD"
-        )
+    try:
+        validate_password_policy(superadmin_password)
+    except ValueError as error:
+        raise ValueError(f"Invalid initial superadmin password: {error}") from error
 
     pending_department = await _get_or_create_pending_department(session)
     super_admin_role = await _get_or_create_role(

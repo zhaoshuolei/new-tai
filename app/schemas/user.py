@@ -1,8 +1,8 @@
 """用户请求与响应模型。"""
 
-from datetime import datetime
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from app.models.user import UserStatus
 
@@ -63,6 +63,13 @@ class UserRead(BaseModel):
     status: UserStatus
     token_version: int
     last_login_at: datetime | None
+
+    @field_serializer("last_login_at", when_used="json")
+    def serialize_last_login_at(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+        return utc_value.astimezone(UTC).isoformat()
 
 
 __all__: tuple[str, ...] = (

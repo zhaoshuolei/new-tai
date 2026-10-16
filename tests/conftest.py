@@ -1,4 +1,5 @@
 import os
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -46,6 +47,25 @@ class FakeRedis:
                 del self.values[name]
                 self.expirations.pop(name, None)
         return deleted
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        if "redis.call('INCR'" not in script:
+            raise NotImplementedError
+
+        keys = args[:numkeys]
+        values = args[numkeys:]
+        ttl = int(values[0])
+        threshold = int(values[1])
+        exceeded = 0
+        for redis_key in keys:
+            name = str(redis_key)
+            count = int(self.values.get(name, "0")) + 1
+            self.values[name] = str(count)
+            if count == 1:
+                self.expirations[name] = ttl
+            if count > threshold:
+                exceeded = 1
+        return exceeded
 
 
 @pytest_asyncio.fixture

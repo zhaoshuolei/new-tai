@@ -12,6 +12,7 @@ from app.models.department import Department, DepartmentStatus
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
 from app.models.user import User, UserStatus
+from app.services import auth as auth_service
 from scripts.init_data import init_data
 
 TEST_DATABASE_URL = os.environ.get(
@@ -70,7 +71,7 @@ async def test_init_creates_pending_department_as_system_root(
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
 
     department = await session.scalar(
@@ -92,7 +93,7 @@ async def test_init_creates_super_admin_and_default_roles(
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
 
     super_admin = await session.scalar(select(Role).where(Role.code == "super_admin"))
@@ -119,7 +120,7 @@ async def test_default_role_is_scoped_to_self(session: AsyncSession) -> None:
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
 
     default = await session.scalar(select(Role).where(Role.code == "default"))
@@ -142,7 +143,7 @@ async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
 
     menus = list((await session.scalars(select(Menu))).all())
@@ -216,7 +217,7 @@ async def test_init_creates_local_emergency_superadmin(
     await init_data(
         session,
         superadmin_username="emergency-admin",
-        superadmin_password="secret-password",
+        superadmin_password="secret-password1",
     )
 
     user = await session.scalar(select(User).where(User.username == "emergency-admin"))
@@ -226,8 +227,8 @@ async def test_init_creates_local_emergency_superadmin(
     assert super_admin is not None
     assert user.feishu_open_id is None
     assert user.password_hash is not None
-    assert user.password_hash != "secret-password"
-    assert verify_password("secret-password", user.password_hash)
+    assert user.password_hash != "secret-password1"
+    assert verify_password("secret-password1", user.password_hash)
     assert user.role_id == super_admin.id
     assert user.status == UserStatus.ACTIVE
 
@@ -238,7 +239,7 @@ async def test_init_is_idempotent_when_run_twice(
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
     department = await session.scalar(
         select(Department).where(Department.name == "待分配")
@@ -252,7 +253,7 @@ async def test_init_is_idempotent_when_run_twice(
     await init_data(
         session,
         superadmin_username="superadmin",
-        superadmin_password="test-password",
+        superadmin_password="test-password1",
     )
 
     assert await _count(session, Department) == 1
@@ -298,3 +299,51 @@ async def test_init_requires_superadmin_password_from_env(
         await _count(session, User),
     )
     assert counts_after == counts_before
+
+
+async def test_init_rejects_superadmin_password_below_policy(
+    session: AsyncSession,
+) -> None:
+    counts_before = (
+        await _count(session, Department),
+        await _count(session, Role),
+        await _count(session, Menu),
+        await _count(session, User),
+    )
+
+    with pytest.raises(ValueError, match="8"):
+        await init_data(
+            session,
+            superadmin_username="superadmin",
+            superadmin_password="abc1234",
+        )
+
+    counts_after = (
+        await _count(session, Department),
+        await _count(session, Role),
+        await _count(session, Menu),
+        await _count(session, User),
+    )
+    assert counts_after == counts_before
+
+
+async def test_init_normalizes_superadmin_username(
+    session: AsyncSession,
+) -> None:
+    password = "abc12345"
+    await init_data(
+        session,
+        superadmin_username="  EmergencyAdmin  ",
+        superadmin_password=password,
+    )
+
+    user = await session.scalar(select(User))
+    authenticated = await auth_service.authenticate_local_user(
+        session,
+        "EMERGENCYADMIN",
+        password,
+    )
+
+    assert user is not None
+    assert user.username == "emergencyadmin"
+    assert authenticated.id == user.id

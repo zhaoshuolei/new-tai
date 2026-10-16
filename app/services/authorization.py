@@ -185,6 +185,27 @@ async def assert_super_admin_remains(
         )
 
 
+async def assert_can_change_super_admin_status(
+    session: AsyncSession,
+    ctx: AuthContext,
+    target_user: User,
+    current_role: Role | None,
+    target_status: UserStatus,
+) -> None:
+    """超管状态只能由超管变更，并在停用时保留系统可用超管。"""
+    if not is_system_super_admin(current_role):
+        return
+    if not ctx.is_super_admin:
+        raise _cannot_grant_super_admin()
+    if target_user.status == UserStatus.ACTIVE and target_status == UserStatus.DISABLED:
+        await assert_can_reduce_super_admin(
+            session,
+            target_user,
+            current_role,
+            "disable",
+        )
+
+
 async def assert_can_reduce_super_admin(
     session: AsyncSession,
     target_user: User,
@@ -237,6 +258,7 @@ def assert_can_manage_super_admin_role(
 __all__: tuple[str, ...] = (
     "assert_can_assign_department",
     "assert_can_assign_role",
+    "assert_can_change_super_admin_status",
     "assert_can_manage_super_admin_role",
     "assert_can_reduce_super_admin",
     "assert_can_reset_password",

@@ -91,7 +91,8 @@ def _refresh_key_pattern(user_id: int) -> str:
     return key("auth", "refresh", str(user_id), "*")
 
 
-def _normalize_account(username: str) -> str:
+def normalize_username(username: str) -> str:
+    """统一登录、创建与初始化时的用户名规范。"""
     return username.strip().casefold()
 
 
@@ -100,7 +101,7 @@ def _login_ip_key(client_ip: str) -> str:
 
 
 def _login_account_key(username: str) -> str:
-    return key("auth", "login", "account", _normalize_account(username))
+    return key("auth", "login", "account", normalize_username(username))
 
 
 async def invalidate_refresh_tokens(redis: Redis, user_id: int) -> None:
@@ -183,7 +184,7 @@ async def authenticate_local_user(
     username: str,
     password: str,
 ) -> User:
-    normalized_username = _normalize_account(username)
+    normalized_username = normalize_username(username)
     user = await user_repository.get_by_username(session, normalized_username)
     password_hash = (
         user.password_hash
@@ -377,8 +378,10 @@ async def login_with_feishu(
     redis: Redis,
     code: str,
     *,
+    client_ip: str,
     client: FeishuClient | None = None,
 ) -> LoginResult:
+    await enforce_login_ip_rate_limit(redis, client_ip=client_ip)
     feishu_client = client or FeishuClient()
     user_access_token = await feishu_client.exchange_code(code)
     info = await feishu_client.get_user_info(user_access_token)
@@ -485,18 +488,14 @@ async def logout_refresh_token(redis: Redis, refresh_token: str) -> None:
     )
 
 
-async def enforce_login_rate_limit(
+async def _enforce_login_rate_limit(
     redis: Redis,
-    *,
-    client_ip: str,
-    username: str,
+    keys: tuple[str, ...],
 ) -> None:
-    """原子预占 IP 与账号两个限流桶，超过阈值时拒绝登录。"""
     exceeded = await redis.eval(
         _LOGIN_RATE_LIMIT_SCRIPT,
-        2,
-        _login_ip_key(client_ip),
-        _login_account_key(username),
+        len(keys),
+        *keys,
         str(LOGIN_RATE_LIMIT_WINDOW_SECONDS),
         str(LOGIN_RATE_LIMIT_ATTEMPTS),
     )
@@ -506,6 +505,28 @@ async def enforce_login_rate_limit(
             "Too many login attempts",
             http_status=429,
         )
+
+
+async def enforce_login_rate_limit(
+    redis: Redis,
+    *,
+    client_ip: str,
+    username: str,
+) -> None:
+    """原子预占 IP 与账号两个限流桶，超过阈值时拒绝登录。"""
+    await _enforce_login_rate_limit(
+        redis,
+        (_login_ip_key(client_ip), _login_account_key(username)),
+    )
+
+
+async def enforce_login_ip_rate_limit(
+    redis: Redis,
+    *,
+    client_ip: str,
+) -> None:
+    """仅按 IP 预占登录限流桶，供无本地账号的登录方式复用。"""
+    await _enforce_login_rate_limit(redis, (_login_ip_key(client_ip),))
 
 
 async def clear_login_account_failures(

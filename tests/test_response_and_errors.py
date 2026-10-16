@@ -18,6 +18,28 @@ def test_success_returns_unified_envelope() -> None:
     }
 
 
+def test_business_routes_expose_success_envelope_in_openapi() -> None:
+    document = create_app().openapi()
+    components = document["components"]["schemas"]
+
+    for path, path_item in document["paths"].items():
+        if not path.startswith("/api/v1"):
+            continue
+        for method, operation in path_item.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            responses = operation["responses"]
+            success_response = next(
+                response
+                for status_code, response in responses.items()
+                if status_code.startswith("2")
+            )
+            schema = success_response["content"]["application/json"]["schema"]
+            if "$ref" in schema:
+                schema = components[schema["$ref"].rsplit("/", 1)[-1]]
+            assert {"code", "message", "data"} <= set(schema["properties"])
+
+
 def test_page_serializes_pagination_metadata() -> None:
     page = Page[int](items=[1, 2], total=5, page=1, page_size=2)
 

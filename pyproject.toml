@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]",
     "sqlalchemy[asyncio]>=2.0",
     "asyncmy",
+    "cryptography",
     "alembic",
     "redis",
     "pydantic>=2",

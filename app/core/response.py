@@ -10,6 +10,12 @@ def success(data: Any = None, message: str = "ok") -> dict[str, Any]:
     return {"code": 0, "message": message, "data": data}
 
 
+class SuccessEnvelope[T](BaseModel):
+    code: int = 0
+    message: str = "ok"
+    data: T
+
+
 class Page[T](BaseModel):
     items: list[T]
     total: int
@@ -17,4 +23,9 @@ class Page[T](BaseModel):
     page_size: PageNumber
 
 
-__all__: tuple[str, ...] = ("MAX_PAGE_SIZE", "Page", "success")
+__all__: tuple[str, ...] = (
+    "MAX_PAGE_SIZE",
+    "Page",
+    "SuccessEnvelope",
+    "success",
+)

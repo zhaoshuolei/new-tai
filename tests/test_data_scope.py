@@ -127,7 +127,7 @@ async def scope_data(session: AsyncSession) -> ScopeData:
     for label, department in department_by_label.items():
         user = await create_local_user(
             session,
-            UserCreate(username=f"{prefix}-{label}", password="password"),
+            UserCreate(username=f"{prefix}-{label}", password="password1"),
         )
         user.department_id = department.id
         await session.commit()
@@ -386,7 +386,7 @@ async def test_detail_endpoint_is_scoped_too(
         ("PATCH", "/role", {"role_id": None}),
         ("PATCH", "/department", {"department_id": None}),
         ("PATCH", "/status", {"status": "disabled"}),
-        ("POST", "/password/reset", {"new_password": "new-password"}),
+        ("POST", "/password/reset", {"new_password": "new-password1"}),
     ],
 )
 async def test_write_on_invisible_user_returns_403(

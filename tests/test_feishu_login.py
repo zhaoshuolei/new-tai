@@ -172,6 +172,7 @@ async def test_first_login_auto_provisions_user(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=feishu_client,
     )
     user = result.user
@@ -196,6 +197,7 @@ async def test_new_user_lands_in_pending_department_with_default_role(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(open_id="ou-provisioned"),
     )
     user = result.user
@@ -217,6 +219,7 @@ async def test_existing_user_reuses_record_by_open_id(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(open_id="ou-existing"),
     )
     user = result.user
@@ -240,6 +243,7 @@ async def test_login_backfills_only_empty_profile_fields(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(
             open_id="ou-backfill",
             name="Filled Nickname",
@@ -268,6 +272,7 @@ async def test_admin_edited_nickname_is_not_overwritten(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(
             open_id="ou-admin-edited",
             name="Feishu Name",
@@ -297,6 +302,7 @@ async def test_avatar_and_last_login_always_refreshed(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(
             open_id="ou-refresh",
             avatar_url="https://example.com/new.png",
@@ -330,6 +336,7 @@ async def test_empty_feishu_avatar_does_not_clear_stored_avatar(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(
             open_id="ou-avatar-preserved",
             avatar_url=empty_avatar,
@@ -380,6 +387,7 @@ async def test_pending_department_lookup_is_identity_based(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(open_id="ou-pending-identity"),
     )
     user = result.user
@@ -419,6 +427,7 @@ async def test_duplicate_open_id_race_recovers_existing_user(
         session,
         fake_redis,
         "valid-code",
+        client_ip="203.0.113.10",
         client=FakeFeishuClient(open_id=open_id),
     )
     logged_in = result.user
@@ -465,6 +474,7 @@ async def test_duplicate_open_id_race_without_winner_returns_business_error(
             session,
             fake_redis,
             "valid-code",
+            client_ip="203.0.113.10",
             client=FakeFeishuClient(open_id=open_id),
         )
 
@@ -485,6 +495,7 @@ async def test_disabled_user_login_returns_1002(
             session,
             fake_redis,
             "valid-code",
+            client_ip="203.0.113.10",
             client=FakeFeishuClient(open_id="ou-disabled"),
         )
 
@@ -594,6 +605,59 @@ async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
         avatar_url="https://example.com/avatar.png",
         email="test@example.com",
     )
+
+
+async def test_feishu_login_rate_limit_precedes_upstream_exchange(
+    session: AsyncSession,
+    fake_redis: Any,
+    feishu_defaults: tuple[Department, Role],
+) -> None:
+    class CountingFeishuClient(FakeFeishuClient):
+        def __init__(self) -> None:
+            super().__init__(open_id="ou-rate-limited")
+            self.exchange_calls = 0
+            self.info_calls = 0
+
+        async def exchange_code(self, code: str) -> str:
+            self.exchange_calls += 1
+            return await super().exchange_code(code)
+
+        async def get_user_info(self, user_access_token: str) -> FeishuUserInfo:
+            self.info_calls += 1
+            return await super().get_user_info(user_access_token)
+
+    application = create_app()
+    feishu_client = CountingFeishuClient()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_redis] = lambda: fake_redis
+    application.dependency_overrides[get_feishu_client] = lambda: feishu_client
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as test_client:
+            for _ in range(auth_service.LOGIN_RATE_LIMIT_ATTEMPTS):
+                response = await test_client.post(
+                    "/api/v1/auth/feishu/login",
+                    json={"code": "valid-code"},
+                )
+                assert response.status_code == 200
+
+            blocked = await test_client.post(
+                "/api/v1/auth/feishu/login",
+                json={"code": "valid-code"},
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert blocked.status_code == 429
+    assert blocked.json()["code"] == ErrorCode.RATE_LIMITED
+    assert feishu_client.exchange_calls == auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
+    assert feishu_client.info_calls == auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
 
 
 async def test_login_endpoint_returns_local_token_shape(

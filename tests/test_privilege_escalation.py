@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from starlette.requests import Request
 
 from app.core.auth_context import AuthContext
 from app.core.config import settings
@@ -222,6 +223,17 @@ def context_for(
     )
 
 
+def auth_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        }
+    )
+
+
 async def seed_refresh_tokens(redis: RecordingRedis, user_id: int) -> None:
     await redis.set(key("auth", "refresh", str(user_id), "device-a"), "refresh-a")
     await redis.set(key("auth", "refresh", str(user_id), "device-b"), "refresh-b")
@@ -350,6 +362,105 @@ async def test_anyone_cannot_change_own_status(
     assert user.status == UserStatus.ACTIVE
 
 
+async def test_non_super_admin_cannot_disable_non_last_super_admin(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    admin_role = await add_role(session)
+    caller = await add_user(session, role=admin_role)
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    target = await add_user(session, role=super_admin, feishu=True)
+    await add_user(session, role=super_admin, feishu=True)
+
+    with pytest.raises(BusinessError) as error:
+        await update_user_status(
+            session,
+            target.id,
+            UserStatusUpdate(status=UserStatus.DISABLED),
+            context=context_for(caller, admin_role),
+            redis=redis,
+        )
+
+    assert error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
+    assert error.value.http_status == 403
+    await session.refresh(target)
+    assert target.status == UserStatus.ACTIVE
+
+
+async def test_non_super_admin_cannot_enable_disabled_super_admin(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    admin_role = await add_role(session)
+    caller = await add_user(session, role=admin_role)
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    target = await add_user(
+        session,
+        role=super_admin,
+        status=UserStatus.DISABLED,
+        feishu=True,
+    )
+    await add_user(session, role=super_admin, feishu=True)
+
+    with pytest.raises(BusinessError) as error:
+        await update_user_status(
+            session,
+            target.id,
+            UserStatusUpdate(status=UserStatus.ACTIVE),
+            context=context_for(caller, admin_role),
+            redis=redis,
+        )
+
+    assert error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
+    assert error.value.http_status == 403
+    await session.refresh(target)
+    assert target.status == UserStatus.DISABLED
+
+
+async def test_super_admin_can_disable_and_enable_super_admin_when_allowed(
+    session: AsyncSession,
+    redis: RecordingRedis,
+) -> None:
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    caller = await add_user(session, role=super_admin, feishu=True)
+    target = await add_user(session, role=super_admin, feishu=True)
+    context = context_for(caller, super_admin, is_super_admin=True)
+
+    disabled = await update_user_status(
+        session,
+        target.id,
+        UserStatusUpdate(status=UserStatus.DISABLED),
+        context=context,
+        redis=redis,
+    )
+    disabled_status = disabled.status
+    disabled_token_version = disabled.token_version
+    enabled = await update_user_status(
+        session,
+        target.id,
+        UserStatusUpdate(status=UserStatus.ACTIVE),
+        context=context,
+        redis=redis,
+    )
+
+    assert disabled_status == UserStatus.DISABLED
+    assert disabled_token_version == 1
+    assert enabled.status == UserStatus.ACTIVE
+    assert enabled.token_version == 2
+
+
 async def test_cannot_disable_last_super_admin(
     session: AsyncSession,
     redis: RecordingRedis,
@@ -368,7 +479,7 @@ async def test_cannot_disable_last_super_admin(
             session,
             target.id,
             UserStatusUpdate(status=UserStatus.DISABLED),
-            context=context_for(caller, admin_role),
+            context=context_for(caller, admin_role, is_super_admin=True),
             redis=redis,
         )
 
@@ -706,7 +817,7 @@ async def test_password_reset_bumps_token_version_and_clears_refresh_tokens(
     reset = await reset_user_password(
         session,
         target.id,
-        UserPasswordReset(new_password="new-password"),
+        UserPasswordReset(new_password="new-password1"),
         context=context_for(caller, role),
         redis=redis,
     )
@@ -726,7 +837,7 @@ async def test_non_super_admin_cannot_reset_local_emergency_superadmin_password(
         is_system=True,
     )
     username = unique_code("emergency")
-    old_password = "emergency-old-password"
+    old_password = "emergency-old-password1"
     emergency = await create_local_user(
         session,
         UserCreate(username=username, password=old_password),
@@ -752,7 +863,7 @@ async def test_non_super_admin_cannot_reset_local_emergency_superadmin_password(
         ) as client:
             response = await client.post(
                 f"/api/v1/users/{emergency.id}/password/reset",
-                json={"new_password": "attacker-password"},
+                json={"new_password": "attacker-password1"},
             )
     finally:
         application.dependency_overrides.clear()
@@ -811,6 +922,7 @@ async def test_security_change_rejects_old_access_token_and_accepts_new_one(
         device_id="before-change",
     )
     before = await get_current_context(
+        request=auth_request(),
         session=session,
         authorization=f"Bearer {old_tokens.access_token}",
     )
@@ -837,6 +949,7 @@ async def test_security_change_rejects_old_access_token_and_accepts_new_one(
 
     with pytest.raises(BusinessError) as error:
         await get_current_context(
+            request=auth_request(),
             session=session,
             authorization=f"Bearer {old_tokens.access_token}",
         )
@@ -849,6 +962,7 @@ async def test_security_change_rejects_old_access_token_and_accepts_new_one(
         device_id="after-change",
     )
     context = await get_current_context(
+        request=auth_request(),
         session=session,
         authorization=f"Bearer {new_tokens.access_token}",
     )
@@ -874,6 +988,7 @@ async def test_disabled_user_existing_access_token_is_rejected(
 
     with pytest.raises(BusinessError) as error:
         await get_current_context(
+            request=auth_request(),
             session=session,
             authorization=f"Bearer {tokens.access_token}",
         )
@@ -906,6 +1021,7 @@ async def test_token_issued_after_status_change_works(
     tokens = await auth_service.issue_token_pair(redis, target)
 
     context = await get_current_context(
+        request=auth_request(),
         session=session,
         authorization=f"Bearer {tokens.access_token}",
     )

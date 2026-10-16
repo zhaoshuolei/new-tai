@@ -87,21 +87,21 @@ async def test_create_local_user_hashes_password(session: AsyncSession) -> None:
 
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="initial-password"),
+        UserCreate(username=username, password="initial-password1"),
     )
 
     assert user.username == username
     assert user.password_hash is not None
-    assert user.password_hash != "initial-password"
+    assert user.password_hash != "initial-password1"
     assert user.password_hash.startswith("$argon2id$")
-    assert verify_password("initial-password", user.password_hash) is True
+    assert verify_password("initial-password1", user.password_hash) is True
     assert user.status == UserStatus.ACTIVE
     assert user.token_version == 0
 
 
 def test_create_local_user_requires_username_and_password() -> None:
     with pytest.raises(ValidationError):
-        UserCreate.model_validate({"password": "initial-password"})
+        UserCreate.model_validate({"password": "initial-password1"})
 
     with pytest.raises(ValidationError):
         UserCreate.model_validate({"username": "alice"})
@@ -111,17 +111,41 @@ async def test_duplicate_username_returns_2001(session: AsyncSession) -> None:
     username = unique_username("duplicate")
     await create_local_user(
         session,
-        UserCreate(username=username, password="initial-password"),
+        UserCreate(username=username, password="initial-password1"),
     )
 
     with pytest.raises(BusinessError) as error:
         await create_local_user(
             session,
-            UserCreate(username=username, password="another-password"),
+            UserCreate(username=username, password="another-password1"),
         )
 
     assert error.value.code == ErrorCode.USERNAME_EXISTS
     assert error.value.http_status == 409
+
+
+async def test_duplicate_username_check_uses_normalization(
+    session: AsyncSession,
+) -> None:
+    username = unique_username("normalized-duplicate")
+    await create_local_user(
+        session,
+        UserCreate(
+            username=f" {username.upper()} ",
+            password="initial-password1",
+        ),
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await create_local_user(
+            session,
+            UserCreate(
+                username=f"  {username.casefold()}  ",
+                password="another-password1",
+            ),
+        )
+
+    assert error.value.code == ErrorCode.USERNAME_EXISTS
 
 
 async def test_create_user_without_role_or_department_is_allowed(
@@ -129,7 +153,7 @@ async def test_create_user_without_role_or_department_is_allowed(
 ) -> None:
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("unassigned"), password="password"),
+        UserCreate(username=unique_username("unassigned"), password="password1"),
     )
 
     assert user.role_id is None
@@ -147,7 +171,7 @@ async def test_get_user_raises_user_not_found(session: AsyncSession) -> None:
 async def test_patch_user_updates_profile_fields(session: AsyncSession) -> None:
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("profile"), password="password"),
+        UserCreate(username=unique_username("profile"), password="password1"),
     )
 
     updated = await update_user(
@@ -171,7 +195,7 @@ async def test_assignments_and_status_have_separate_operations(
 ) -> None:
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("assignment"), password="password"),
+        UserCreate(username=unique_username("assignment"), password="password1"),
     )
     department = await create_department(session, DepartmentCreate(name="研发部"))
     role = await create_role(
@@ -220,7 +244,7 @@ async def test_password_reset_on_feishu_user_returns_error(
         await reset_user_password(
             session,
             feishu_user.id,
-            UserPasswordReset(new_password="new-password"),
+            UserPasswordReset(new_password="new-password1"),
             context=ALL_SCOPE_CONTEXT,
         )
 
@@ -231,26 +255,26 @@ async def test_password_reset_on_feishu_user_returns_error(
 async def test_password_reset_updates_local_password(session: AsyncSession) -> None:
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("local-reset"), password="old-password"),
+        UserCreate(username=unique_username("local-reset"), password="old-password1"),
     )
 
     reset = await reset_user_password(
         session,
         user.id,
-        UserPasswordReset(new_password="new-password"),
+        UserPasswordReset(new_password="new-password1"),
         context=ALL_SCOPE_CONTEXT,
     )
 
     assert reset.password_hash is not None
-    assert verify_password("new-password", reset.password_hash) is True
-    assert verify_password("old-password", reset.password_hash) is False
+    assert verify_password("new-password1", reset.password_hash) is True
+    assert verify_password("old-password1", reset.password_hash) is False
 
 
 async def test_list_users_filters_and_paginates(session: AsyncSession) -> None:
     username = unique_username("listed")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
     await update_user(
         session,
@@ -277,7 +301,7 @@ async def test_delete_department_with_real_user_returns_5002(
     department = await create_department(session, DepartmentCreate(name="有用户的部门"))
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("dept-user"), password="password"),
+        UserCreate(username=unique_username("dept-user"), password="password1"),
     )
     await assign_user_department(
         session,
@@ -302,7 +326,7 @@ async def test_delete_role_with_real_user_returns_3002(
     )
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("role-user"), password="password"),
+        UserCreate(username=unique_username("role-user"), password="password1"),
     )
     await assign_user_role(
         session,
@@ -372,7 +396,7 @@ async def test_user_api_crud_and_extra_fields_are_rejected(
         ) as client:
             created = await client.post(
                 "/api/v1/users",
-                json={"username": username, "password": "initial-password"},
+                json={"username": username, "password": "initial-password1"},
             )
             user_id = created.json()["data"]["id"]
             loaded = await client.get(f"/api/v1/users/{user_id}")
@@ -382,13 +406,13 @@ async def test_user_api_crud_and_extra_fields_are_rejected(
             )
             reset = await client.post(
                 f"/api/v1/users/{user_id}/password/reset",
-                json={"new_password": "new-password"},
+                json={"new_password": "new-password1"},
             )
             forbidden_write = await client.post(
                 "/api/v1/users",
                 json={
                     "username": unique_username("feishu-write"),
-                    "password": "password",
+                    "password": "password1",
                     "feishu_open_id": "ou-should-not-be-writable",
                 },
             )
@@ -414,7 +438,7 @@ async def test_role_and_department_are_not_writable_through_profile_patch(
 ) -> None:
     user = await create_local_user(
         session,
-        UserCreate(username=unique_username("profile-only"), password="password"),
+        UserCreate(username=unique_username("profile-only"), password="password1"),
     )
     role = await create_role(
         session,

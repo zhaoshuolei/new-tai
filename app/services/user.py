@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
+from app.core.password_policy import validate_password_policy
 from app.core.redis import redis_scope
 from app.core.security import hash_password
 from app.models.role import Role
@@ -35,14 +36,27 @@ def _username_exists_error() -> BusinessError:
     )
 
 
+def _validate_local_password(password: str) -> None:
+    try:
+        validate_password_policy(password)
+    except ValueError as error:
+        raise BusinessError(
+            ErrorCode.INVALID_PARAMETER,
+            str(error),
+            http_status=422,
+        ) from error
+
+
 async def create_local_user(session: AsyncSession, payload: UserCreate) -> User:
-    existing = await user_repository.get_by_username(session, payload.username)
+    _validate_local_password(payload.password)
+    normalized_username = auth_service.normalize_username(payload.username)
+    existing = await user_repository.get_by_username(session, normalized_username)
     if existing is not None:
         raise _username_exists_error()
 
     user = User(
         feishu_open_id=None,
-        username=payload.username,
+        username=normalized_username,
         password_hash=hash_password(payload.password),
         nickname=payload.nickname,
         email=payload.email,
@@ -264,15 +278,14 @@ async def update_user_status(
 ) -> User:
     user = await _get_writable_user(session, user_id, context)
     authorization_service.assert_not_self(context, user)
-
-    if user.status == UserStatus.ACTIVE and payload.status == UserStatus.DISABLED:
-        current_role = await _get_current_role(session, user)
-        await authorization_service.assert_can_reduce_super_admin(
-            session,
-            user,
-            current_role,
-            "disable",
-        )
+    current_role = await _get_current_role(session, user)
+    await authorization_service.assert_can_change_super_admin_status(
+        session,
+        context,
+        user,
+        current_role,
+        payload.status,
+    )
 
     if user.status == payload.status:
         return user
@@ -299,6 +312,7 @@ async def reset_user_password(
             ErrorCode.INVALID_PARAMETER,
             "Password reset is only available for local accounts",
         )
+    _validate_local_password(payload.new_password)
 
     user.password_hash = hash_password(payload.new_password)
     await _commit_user_security_change(session, user.id, redis)

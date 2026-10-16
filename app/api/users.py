@@ -10,7 +10,7 @@ from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
 from app.core.redis import get_redis
-from app.core.response import MAX_PAGE_SIZE, Page, success
+from app.core.response import MAX_PAGE_SIZE, Page, SuccessEnvelope, success
 from app.db.session import get_session
 from app.models.user import UserStatus
 from app.schemas.user import (
@@ -29,6 +29,7 @@ router = APIRouter(prefix="/users", tags=["用户"])
 
 @router.get(
     "",
+    response_model=SuccessEnvelope[Page[UserRead]],
     dependencies=[Depends(require_permission("user:read"))],
 )
 async def list_users(
@@ -63,6 +64,7 @@ async def list_users(
 
 @router.post(
     "",
+    response_model=SuccessEnvelope[UserRead],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("user:create"))],
 )
@@ -77,6 +79,7 @@ async def create_user(
 
 @router.get(
     "/{user_id}",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:read"))],
 )
 async def get_user(
@@ -90,6 +93,7 @@ async def get_user(
 
 @router.patch(
     "/{user_id}",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:update"))],
 )
 async def update_user(
@@ -109,6 +113,7 @@ async def update_user(
 
 @router.delete(
     "/{user_id}",
+    response_model=SuccessEnvelope[None],
     dependencies=[Depends(require_permission("user:delete"))],
 )
 async def delete_user(
@@ -128,6 +133,7 @@ async def delete_user(
 
 @router.patch(
     "/{user_id}/role",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:assign"))],
 )
 async def assign_user_role(
@@ -149,6 +155,7 @@ async def assign_user_role(
 
 @router.patch(
     "/{user_id}/department",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:assign"))],
 )
 async def assign_user_department(
@@ -170,6 +177,7 @@ async def assign_user_department(
 
 @router.patch(
     "/{user_id}/status",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:update"))],
 )
 async def update_user_status(
@@ -191,6 +199,7 @@ async def update_user_status(
 
 @router.post(
     "/{user_id}/password/reset",
+    response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:update"))],
 )
 async def reset_user_password(

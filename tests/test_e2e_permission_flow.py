@@ -285,7 +285,7 @@ async def test_full_flow_from_seed_to_scoped_admin_operations(
     验证 /auth/me、/me/menus、/me/permissions 与受限的 /users 列表。"""
     prefix = f"e2e-{uuid4().hex[:10]}"
     superadmin_username = f"{prefix}-super"
-    superadmin_password = "superadmin-password"
+    superadmin_password = "superadmin-password1"
 
     await init_data(
         session,
@@ -346,7 +346,7 @@ async def test_full_flow_from_seed_to_scoped_admin_operations(
     scoped_username = f"{prefix}-scoped"
     child_username = f"{prefix}-child"
     outside_username = f"{prefix}-outside"
-    scoped_password = "scoped-password"
+    scoped_password = "scoped-password1"
     scoped_id = await _create_user(
         client,
         super_headers,
@@ -357,13 +357,13 @@ async def test_full_flow_from_seed_to_scoped_admin_operations(
         client,
         super_headers,
         username=child_username,
-        password="child-password",
+        password="child-password1",
     )
     outside_id = await _create_user(
         client,
         super_headers,
         username=outside_username,
-        password="outside-password",
+        password="outside-password1",
     )
 
     for user_id, department_id in (

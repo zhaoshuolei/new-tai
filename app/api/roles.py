@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
-from app.core.response import success
+from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.schemas.role import (
     RoleCreate,
@@ -24,6 +24,7 @@ router = APIRouter(prefix="/roles", tags=["角色"])
 
 @router.get(
     "",
+    response_model=SuccessEnvelope[list[RoleRead]],
     dependencies=[Depends(require_permission("role:read"))],
 )
 async def list_roles(
@@ -35,6 +36,7 @@ async def list_roles(
 
 @router.post(
     "",
+    response_model=SuccessEnvelope[RoleRead],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("role:create"))],
 )
@@ -48,6 +50,7 @@ async def create_role(
 
 @router.get(
     "/{role_id}",
+    response_model=SuccessEnvelope[RoleRead],
     dependencies=[Depends(require_permission("role:read"))],
 )
 async def get_role(
@@ -60,6 +63,7 @@ async def get_role(
 
 @router.patch(
     "/{role_id}",
+    response_model=SuccessEnvelope[RoleRead],
     dependencies=[Depends(require_permission("role:update"))],
 )
 async def update_role(
@@ -79,6 +83,7 @@ async def update_role(
 
 @router.delete(
     "/{role_id}",
+    response_model=SuccessEnvelope[None],
     dependencies=[Depends(require_permission("role:delete"))],
 )
 async def delete_role(
@@ -96,6 +101,7 @@ async def delete_role(
 
 @router.put(
     "/{role_id}/menus",
+    response_model=SuccessEnvelope[RoleRead],
     dependencies=[Depends(require_permission("role:assign"))],
 )
 async def assign_role_menus(
@@ -113,6 +119,7 @@ async def assign_role_menus(
 
 @router.put(
     "/{role_id}/data-scope",
+    response_model=SuccessEnvelope[RoleRead],
     dependencies=[Depends(require_permission("role:assign"))],
 )
 async def set_role_data_scope(

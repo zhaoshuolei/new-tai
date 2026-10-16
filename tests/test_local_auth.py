@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Response
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from starlette.requests import Request
 
 from app.core.config import settings
 from app.core.deps import get_current_context
@@ -218,6 +220,17 @@ def unique_username(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:12]}"
 
 
+def auth_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        }
+    )
+
+
 async def login(
     client: AsyncClient,
     username: str,
@@ -247,7 +260,7 @@ async def test_local_login_returns_tokens_and_profile(
     session: AsyncSession,
 ) -> None:
     username = unique_username("login")
-    password = "correct-password"
+    password = "correct-password1"
     user = await create_local_user(
         session,
         UserCreate(username=username, password=password),
@@ -264,9 +277,60 @@ async def test_local_login_returns_tokens_and_profile(
     assert data["refresh_token"]
     assert data["profile"]["id"] == user.id
     assert data["profile"]["username"] == username
+    last_login_at = datetime.fromisoformat(data["profile"]["last_login_at"])
+    assert last_login_at.tzinfo is not None
 
     await session.refresh(user)
     assert user.last_login_at is not None
+
+
+async def test_authenticated_request_log_contains_user_id(
+    client: AsyncClient,
+    session: AsyncSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    username = unique_username("access-log")
+    password = "correct-password1"
+    user = await create_local_user(
+        session,
+        UserCreate(username=username, password=password),
+    )
+    login_response = await login(client, username, password)
+    access_token = login_response.json()["data"]["access_token"]
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO, logger="app.request"):
+        response = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    assert response.status_code == 200
+    records = [record for record in caplog.records if record.name == "app.request"]
+    assert len(records) == 1
+    assert records[0].user_id == user.id
+
+
+async def test_created_username_is_normalized_for_lookup(
+    client: AsyncClient,
+    session: AsyncSession,
+) -> None:
+    username = unique_username("normalized")
+    password = "correct-password1"
+    user = await create_local_user(
+        session,
+        UserCreate(
+            username=f"  {username.upper()}  ",
+            password=password,
+        ),
+    )
+
+    assert user.username == username.casefold()
+
+    response = await login(client, f" {username.lower()} ", password)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["profile"]["id"] == user.id
 
 
 async def test_local_login_with_wrong_password_returns_1001(
@@ -276,7 +340,7 @@ async def test_local_login_with_wrong_password_returns_1001(
     username = unique_username("wrong-password")
     await create_local_user(
         session,
-        UserCreate(username=username, password="correct-password"),
+        UserCreate(username=username, password="correct-password1"),
     )
 
     response = await login(client, username, "wrong-password")
@@ -292,12 +356,12 @@ async def test_disabled_user_cannot_login(
     username = unique_username("disabled")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
     user.status = UserStatus.DISABLED
     await session.commit()
 
-    response = await login(client, username, "password")
+    response = await login(client, username, "password1")
 
     assert response.status_code == 401
     assert response.json()["code"] == ErrorCode.ACCOUNT_DISABLED
@@ -310,9 +374,9 @@ async def test_me_returns_effective_data_scope(
     username = unique_username("me-scope")
     await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     access_token = login_response.json()["data"]["access_token"]
 
     response = await client.get(
@@ -334,10 +398,10 @@ async def test_access_token_carries_token_version(
     username = unique_username("claims")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
 
-    response = await login(client, username, "password")
+    response = await login(client, username, "password1")
 
     token = response.json()["data"]["access_token"]
     claims = decode_access_token(token)
@@ -354,9 +418,9 @@ async def test_refresh_rotates_and_old_refresh_is_rejected(
     username = unique_username("refresh")
     await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     old_refresh_token = login_response.json()["data"]["refresh_token"]
 
     rotated = await refresh(client, old_refresh_token)
@@ -381,9 +445,9 @@ async def test_logout_invalidates_refresh_token(
     username = unique_username("logout")
     await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     refresh_token = login_response.json()["data"]["refresh_token"]
 
     response = await client.post(
@@ -404,10 +468,10 @@ async def test_logout_all_removes_every_device(
     username = unique_username("logout-all")
     await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    first = await login(client, username, "password", device_id="device-a")
-    second = await login(client, username, "password", device_id="device-b")
+    first = await login(client, username, "password1", device_id="device-a")
+    second = await login(client, username, "password1", device_id="device-b")
     first_data = first.json()["data"]
     second_data = second.json()["data"]
 
@@ -429,9 +493,9 @@ async def test_access_token_rejected_after_token_version_bump(
     username = unique_username("version")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     access_token = login_response.json()["data"]["access_token"]
     headers = {"Authorization": f"Bearer {access_token}"}
 
@@ -453,12 +517,13 @@ async def test_authentication_reads_database_without_authorization_cache(
     username = unique_username("database-authority")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     access_token = login_response.json()["data"]["access_token"]
 
     context = await get_current_context(
+        request=auth_request(),
         session=session,
         authorization=f"Bearer {access_token}",
     )
@@ -477,7 +542,7 @@ async def test_disabled_or_missing_role_degrades_to_self_without_permissions(
     username = unique_username(f"degraded-{role_kind}")
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
     if role_kind == "disabled":
         role = Role(
@@ -494,10 +559,11 @@ async def test_disabled_or_missing_role_degrades_to_self_without_permissions(
         user.role_id = role.id
         await session.commit()
 
-    login_response = await login(client, username, "password")
+    login_response = await login(client, username, "password1")
     access_token = login_response.json()["data"]["access_token"]
 
     context = await get_current_context(
+        request=auth_request(),
         session=session,
         authorization=f"Bearer {access_token}",
     )
@@ -515,7 +581,7 @@ async def test_login_rate_limit_returns_1005_after_threshold(
     username = unique_username("rate-limit")
     await create_local_user(
         session,
-        UserCreate(username=username, password="correct-password"),
+        UserCreate(username=username, password="correct-password1"),
     )
 
     for _ in range(auth_service.LOGIN_RATE_LIMIT_ATTEMPTS):
@@ -536,7 +602,7 @@ async def test_account_rate_limit_normalizes_case_and_whitespace(
     username = unique_username("rate-case")
     await create_local_user(
         session,
-        UserCreate(username=username, password="correct-password"),
+        UserCreate(username=username, password="correct-password1"),
     )
     variants = [
         username.upper(),
@@ -642,7 +708,7 @@ async def test_rate_limit_increments_before_password_verification(
     username = unique_username("rate-order")
     await create_local_user(
         session,
-        UserCreate(username=username, password="correct-password"),
+        UserCreate(username=username, password="correct-password1"),
     )
     client_ip = "198.51.100.100"
     observed_counts: dict[str, str | None] = {}
@@ -679,7 +745,7 @@ async def test_successful_login_clears_only_account_rate_limit(
     fake_redis: FakeRedis,
 ) -> None:
     username = unique_username("rate-clear")
-    password = "correct-password"
+    password = "correct-password1"
     client_ip = "198.51.100.200"
     await create_local_user(
         session,
@@ -753,12 +819,12 @@ async def test_refresh_rotation_uses_real_redis_lua_and_resets_ttl(
     device_id = f"live-{uuid4().hex}"
     user = await create_local_user(
         session,
-        UserCreate(username=username, password="password"),
+        UserCreate(username=username, password="password1"),
     )
     login_response = await login(
         live_client,
         username,
-        "password",
+        "password1",
         device_id=device_id,
     )
     old_refresh_token = login_response.json()["data"]["refresh_token"]

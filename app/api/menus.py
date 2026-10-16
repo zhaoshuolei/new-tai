@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.permissions import require_permission
-from app.core.response import success
+from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.schemas.menu import MenuCreate, MenuNode, MenuUpdate
 from app.services import menu as menu_service
@@ -19,6 +19,7 @@ me_router = APIRouter(prefix="/me", tags=["当前用户"])
 
 @router.get(
     "/tree",
+    response_model=SuccessEnvelope[list[MenuNode]],
     dependencies=[Depends(require_permission("menu:read"))],
 )
 async def get_menu_tree(
@@ -34,6 +35,7 @@ async def get_menu_tree(
 
 @router.post(
     "",
+    response_model=SuccessEnvelope[MenuNode],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("menu:create"))],
 )
@@ -50,6 +52,7 @@ async def create_menu(
 
 @router.patch(
     "/{menu_id}",
+    response_model=SuccessEnvelope[MenuNode],
     dependencies=[Depends(require_permission("menu:update"))],
 )
 async def update_menu(
@@ -63,6 +66,7 @@ async def update_menu(
 
 @router.delete(
     "/{menu_id}",
+    response_model=SuccessEnvelope[None],
     dependencies=[Depends(require_permission("menu:delete"))],
 )
 async def delete_menu(
@@ -73,14 +77,20 @@ async def delete_menu(
     return success(message="deleted")
 
 
-@me_router.get("/permissions")
+@me_router.get(
+    "/permissions",
+    response_model=SuccessEnvelope[list[str]],
+)
 async def get_my_permissions(
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     return success(sorted(context.permission_codes))
 
 
-@me_router.get("/menus")
+@me_router.get(
+    "/menus",
+    response_model=SuccessEnvelope[list[MenuNode]],
+)
 async def get_my_menus(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],

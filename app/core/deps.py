@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
@@ -15,6 +15,7 @@ from app.services.auth import build_auth_context
 
 
 async def get_current_context(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> AuthContext:
@@ -58,7 +59,9 @@ async def get_current_context(
             http_status=401,
         )
 
-    return await build_auth_context(session, user)
+    context = await build_auth_context(session, user)
+    request.state.user_id = context.user_id
+    return context
 
 
 __all__: tuple[str, ...] = ("get_current_context",)

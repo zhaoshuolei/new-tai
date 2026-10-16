@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import require_permission
-from app.core.response import success
+from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.schemas.department import (
     DepartmentCreate,
@@ -21,6 +21,7 @@ router = APIRouter(prefix="/departments", tags=["部门"])
 
 @router.get(
     "/tree",
+    response_model=SuccessEnvelope[list[DepartmentNode]],
     dependencies=[Depends(require_permission("dept:read"))],
 )
 async def get_department_tree(
@@ -36,6 +37,7 @@ async def get_department_tree(
 
 @router.post(
     "",
+    response_model=SuccessEnvelope[DepartmentNode],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("dept:create"))],
 )
@@ -52,6 +54,7 @@ async def create_department(
 
 @router.patch(
     "/{department_id}",
+    response_model=SuccessEnvelope[DepartmentNode],
     dependencies=[Depends(require_permission("dept:update"))],
 )
 async def update_department(
@@ -69,6 +72,7 @@ async def update_department(
 
 @router.patch(
     "/{department_id}/move",
+    response_model=SuccessEnvelope[DepartmentNode],
     dependencies=[Depends(require_permission("dept:update"))],
 )
 async def move_department(
@@ -86,6 +90,7 @@ async def move_department(
 
 @router.delete(
     "/{department_id}",
+    response_model=SuccessEnvelope[None],
     dependencies=[Depends(require_permission("dept:delete"))],
 )
 async def delete_department(

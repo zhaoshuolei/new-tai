@@ -1,6 +1,8 @@
 """部门请求与响应模型。"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.department import DepartmentStatus
 
@@ -19,6 +21,16 @@ class DepartmentUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     sort_order: int | None = None
     status: DepartmentStatus | None = None
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self) -> Self:
+        for field_name in ("name", "sort_order", "status"):
+            if (
+                field_name in self.model_fields_set
+                and getattr(self, field_name) is None
+            ):
+                raise ValueError(f"{field_name} cannot be null")
+        return self
 
 
 class DepartmentMove(BaseModel):

@@ -283,6 +283,45 @@ async def test_get_tree_attaches_child_to_nearest_visible_ancestor(
     assert [node.id for node in tree[0].children] == [child.id]
 
 
+@pytest.mark.parametrize("field_name", ["name", "sort_order", "status"])
+async def test_department_patch_rejects_explicit_null_for_non_nullable_fields(
+    session: AsyncSession,
+    field_name: str,
+) -> None:
+    department = await create_department(
+        session,
+        DepartmentCreate(name="总部", sort_order=3),
+    )
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    async def override_context() -> AuthContext:
+        return DEPT_PERMISSION_CONTEXT
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.patch(
+                f"/api/v1/departments/{department.id}",
+                json={field_name: None},
+            )
+    finally:
+        application.dependency_overrides.clear()
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.INVALID_PARAMETER
+    await session.refresh(department)
+    assert department.name == "总部"
+    assert department.sort_order == 3
+    assert department.status == DepartmentStatus.ACTIVE
+
+
 async def test_department_endpoints_return_success_envelope(
     session: AsyncSession,
 ) -> None:
