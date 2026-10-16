@@ -1,10 +1,10 @@
 """部门数据访问。"""
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.base import Base
 from app.models.department import Department, DepartmentStatus
+from app.models.user import User
 
 
 async def get_by_id(
@@ -44,35 +44,9 @@ async def has_children(session: AsyncSession, department_id: int) -> bool:
     return await session.scalar(statement) is not None
 
 
-def _user_table_is_defined() -> bool:
-    """判断用户模型是否已注册；当前部门任务阶段该表尚未创建。"""
-    return "user" in Base.metadata.tables
-
-
 async def has_users(session: AsyncSession, department_id: int) -> bool:
-    # TODO（Task 9 用户模型与本地账号 CRUD）：当前任务阶段 user 表尚未创建，
-    # 因此仅在 ORM 元数据已注册 user 表时执行引用检查，避免提前依赖未来 schema。
-    # 后续用户任务必须改为依赖真实 user.department_id 外键 ON DELETE RESTRICT，
-    # 将外键约束冲突映射为 DEPT_HAS_USERS=5002，并补充真实数据库集成测试。
-    # 若 user 模型已注册但数据库表缺失，本函数不吞掉查询异常，以暴露 schema drift。
-    if not _user_table_is_defined():
-        return False
-
-    statement = text(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM `user`
-            WHERE department_id = :department_id
-        )
-        """
-    )
-    return bool(
-        await session.scalar(
-            statement,
-            {"department_id": department_id},
-        )
-    )
+    statement = select(User.id).where(User.department_id == department_id).limit(1)
+    return await session.scalar(statement) is not None
 
 
 async def list_by_path_prefix(

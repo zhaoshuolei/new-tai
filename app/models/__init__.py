@@ -9,6 +9,7 @@ from app.models.role import (
     RoleStatus,
 )
 from app.models.role_department import RoleDepartment
+from app.models.user import User, UserStatus
 
 __all__: tuple[str, ...] = (
     "DataScope",
@@ -21,4 +22,6 @@ __all__: tuple[str, ...] = (
     "RoleDepartment",
     "RoleMenu",
     "RoleStatus",
+    "User",
+    "UserStatus",
 )

@@ -1,5 +1,6 @@
 """部门树业务逻辑。"""
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import BusinessError, ErrorCode
@@ -10,6 +11,16 @@ from app.schemas.department import (
     DepartmentNode,
     DepartmentUpdate,
 )
+
+
+def _is_user_delete_fk_error(error: IntegrityError) -> bool:
+    args = getattr(error.orig, "args", ())
+    return bool(
+        args
+        and args[0] == 1451
+        and "foreign key" in str(error.orig).lower()
+        and "`user`" in str(error.orig).lower()
+    )
 
 
 async def _require_department(
@@ -208,7 +219,16 @@ async def delete_department(
         )
 
     await session.delete(department)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        if _is_user_delete_fk_error(error):
+            raise BusinessError(
+                ErrorCode.DEPT_HAS_USERS,
+                "Department has users",
+            ) from error
+        raise
 
 
 async def list_subtree_ids(

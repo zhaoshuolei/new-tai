@@ -2,14 +2,14 @@
 
 from collections.abc import Iterable
 
-from sqlalchemy import delete, insert, select, text
+from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.base import Base
 from app.models.department import Department
 from app.models.menu import Menu
 from app.models.role import Role, RoleMenu
 from app.models.role_department import RoleDepartment
+from app.models.user import User
 
 
 async def get_by_id(session: AsyncSession, role_id: int) -> Role | None:
@@ -111,34 +111,9 @@ async def replace_role_departments(
         )
 
 
-def _user_table_is_defined() -> bool:
-    """判断用户模型是否已注册；当前角色任务阶段该表尚未创建。"""
-    return "user" in Base.metadata.tables
-
-
 async def has_users(session: AsyncSession, role_id: int) -> bool:
-    # TODO（Task 9 用户模型与本地账号 CRUD）：当前 user 表尚未创建，这里是
-    # ROLE_IN_USE 的临时守卫。Task 9 必须替换为真实 User.role_id 外键
-    # ON DELETE RESTRICT，将外键删除异常映射为 ROLE_IN_USE=3002，并补充
-    # “删除被用户引用的角色失败”的真实数据库集成测试。
-    if not _user_table_is_defined():
-        return False
-
-    statement = text(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM `user`
-            WHERE role_id = :role_id
-        )
-        """
-    )
-    return bool(
-        await session.scalar(
-            statement,
-            {"role_id": role_id},
-        )
-    )
+    statement = select(User.id).where(User.role_id == role_id).limit(1)
+    return await session.scalar(statement) is not None
 
 
 __all__: tuple[str, ...] = (
