@@ -12,7 +12,7 @@ os.environ.setdefault(
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 
 
 class FakeRedis:
@@ -70,6 +70,11 @@ class FakeRedis:
             if count > threshold:
                 exceeded = 1
         return exceeded
+
+
+@pytest.fixture(autouse=True)
+def _disable_monitor_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "monitor_enabled", False)
 
 
 @pytest_asyncio.fixture(autouse=True)

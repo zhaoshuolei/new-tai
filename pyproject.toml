@@ -16,6 +16,7 @@ dependencies = [
     "pyjwt",
     "argon2-cffi",
     "httpx",
+    "psutil>=7.2.2",
 ]
 
 [dependency-groups]
@@ -25,6 +26,7 @@ dev = [
     "ruff",
     "mypy",
     "pre-commit",
+    "types-psutil>=7.2.2.20260906",
 ]
 
 [tool.pytest.ini_options]

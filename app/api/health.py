@@ -1,11 +1,11 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import redis_client
 from app.db.session import get_session
+from app.services.health import check_database, check_redis
 
 router = APIRouter(tags=["健康"])
 
@@ -19,12 +19,8 @@ async def liveness() -> dict[str, str]:
 async def readiness(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> dict[str, str]:
-    try:
-        await session.execute(select(1))
-        if not await redis_client.ping():
-            raise RuntimeError("Redis ping failed")
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Service unavailable") from exc
+    if not await check_database(session) or not await check_redis(redis_client):
+        raise HTTPException(status_code=503, detail="Service unavailable")
 
     return {"status": "ok"}
 
