@@ -1,8 +1,10 @@
 """用户业务逻辑。"""
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.core.security import hash_password
 from app.models.user import User, UserStatus
@@ -17,6 +19,7 @@ from app.schemas.user import (
     UserStatusUpdate,
     UserUpdate,
 )
+from app.services.data_scope import apply_user_scope, build_user_scope_filter
 
 
 def _username_exists_error() -> BusinessError:
@@ -63,8 +66,23 @@ def _is_duplicate_username(error: IntegrityError) -> bool:
     return bool(args and args[0] == 1062)
 
 
-async def get_user(session: AsyncSession, user_id: int) -> User:
-    user = await user_repository.get_by_id(session, user_id)
+async def _get_scoped_user(
+    session: AsyncSession,
+    user_id: int,
+    context: AuthContext,
+) -> User | None:
+    statement = apply_user_scope(select(User).where(User.id == user_id), context)
+    user = await session.scalar(statement)
+    return user if isinstance(user, User) else None
+
+
+async def get_user(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    context: AuthContext,
+) -> User:
+    user = await _get_scoped_user(session, user_id, context)
     if user is None:
         raise BusinessError(
             ErrorCode.USER_NOT_FOUND,
@@ -74,9 +92,32 @@ async def get_user(session: AsyncSession, user_id: int) -> User:
     return user
 
 
+async def _get_writable_user(
+    session: AsyncSession,
+    user_id: int,
+    context: AuthContext,
+) -> User:
+    user = await _get_scoped_user(session, user_id, context)
+    if user is not None:
+        return user
+
+    if await user_repository.get_by_id(session, user_id) is None:
+        raise BusinessError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found",
+            http_status=404,
+        )
+    raise BusinessError(
+        ErrorCode.FORBIDDEN,
+        "User is outside the current data scope",
+        http_status=403,
+    )
+
+
 async def list_users(
     session: AsyncSession,
     *,
+    context: AuthContext,
     page: int,
     page_size: int,
     department_id: int | None = None,
@@ -88,6 +129,7 @@ async def list_users(
         session,
         page=page,
         page_size=page_size,
+        scope_filter=build_user_scope_filter(context),
         department_id=department_id,
         role_id=role_id,
         user_status=user_status,
@@ -99,8 +141,10 @@ async def update_user(
     session: AsyncSession,
     user_id: int,
     payload: UserUpdate,
+    *,
+    context: AuthContext,
 ) -> User:
-    user = await get_user(session, user_id)
+    user = await _get_writable_user(session, user_id, context)
     for field_name, value in payload.model_dump(exclude_unset=True).items():
         setattr(user, field_name, value)
 
@@ -113,8 +157,10 @@ async def assign_user_role(
     session: AsyncSession,
     user_id: int,
     payload: UserRoleUpdate,
+    *,
+    context: AuthContext,
 ) -> User:
-    user = await get_user(session, user_id)
+    user = await _get_writable_user(session, user_id, context)
     if payload.role_id is not None:
         role = await role_repository.get_by_id(session, payload.role_id)
         if role is None:
@@ -134,8 +180,10 @@ async def assign_user_department(
     session: AsyncSession,
     user_id: int,
     payload: UserDepartmentUpdate,
+    *,
+    context: AuthContext,
 ) -> User:
-    user = await get_user(session, user_id)
+    user = await _get_writable_user(session, user_id, context)
     if payload.department_id is not None:
         department = await department_repository.get_by_id(
             session,
@@ -158,8 +206,10 @@ async def update_user_status(
     session: AsyncSession,
     user_id: int,
     payload: UserStatusUpdate,
+    *,
+    context: AuthContext,
 ) -> User:
-    user = await get_user(session, user_id)
+    user = await _get_writable_user(session, user_id, context)
     user.status = payload.status
     await session.commit()
     await session.refresh(user)
@@ -170,8 +220,10 @@ async def reset_user_password(
     session: AsyncSession,
     user_id: int,
     payload: UserPasswordReset,
+    *,
+    context: AuthContext,
 ) -> User:
-    user = await get_user(session, user_id)
+    user = await _get_writable_user(session, user_id, context)
     if user.feishu_open_id is not None:
         raise BusinessError(
             ErrorCode.INVALID_PARAMETER,
@@ -184,8 +236,13 @@ async def reset_user_password(
     return user
 
 
-async def delete_user(session: AsyncSession, user_id: int) -> None:
-    user = await get_user(session, user_id)
+async def delete_user(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    context: AuthContext,
+) -> None:
+    user = await _get_writable_user(session, user_id, context)
     await user_repository.delete(session, user)
     await session.commit()
 

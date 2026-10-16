@@ -27,12 +27,13 @@ async def list_users(
     *,
     page: int,
     page_size: int,
+    scope_filter: ColumnElement[bool],
     department_id: int | None,
     role_id: int | None,
     user_status: UserStatus | None,
     keyword: str | None,
 ) -> tuple[list[User], int]:
-    conditions: list[ColumnElement[bool]] = []
+    conditions: list[ColumnElement[bool]] = [scope_filter]
     if department_id is not None:
         conditions.append(User.department_id == department_id)
     if role_id is not None:

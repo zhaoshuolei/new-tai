@@ -5,6 +5,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.response import MAX_PAGE_SIZE, Page, success
 from app.db.session import get_session
 from app.models.user import UserStatus
@@ -48,6 +50,7 @@ async def require_user_delete() -> None:
 )
 async def list_users(
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 20,
     department_id: int | None = None,
@@ -57,6 +60,7 @@ async def list_users(
 ) -> dict[str, Any]:
     users, total = await user_service.list_users(
         session,
+        context=context,
         page=page,
         page_size=page_size,
         department_id=department_id,
@@ -82,6 +86,7 @@ async def list_users(
 async def create_user(
     payload: UserCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    _context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     user = await user_service.create_local_user(session, payload)
     return success(UserRead.model_validate(user), message="created")
@@ -94,8 +99,9 @@ async def create_user(
 async def get_user(
     user_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.get_user(session, user_id)
+    user = await user_service.get_user(session, user_id, context=context)
     return success(UserRead.model_validate(user))
 
 
@@ -107,8 +113,14 @@ async def update_user(
     user_id: int,
     payload: UserUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.update_user(session, user_id, payload)
+    user = await user_service.update_user(
+        session,
+        user_id,
+        payload,
+        context=context,
+    )
     return success(UserRead.model_validate(user))
 
 
@@ -119,8 +131,9 @@ async def update_user(
 async def delete_user(
     user_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    await user_service.delete_user(session, user_id)
+    await user_service.delete_user(session, user_id, context=context)
     return success(message="deleted")
 
 
@@ -132,8 +145,14 @@ async def assign_user_role(
     user_id: int,
     payload: UserRoleUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.assign_user_role(session, user_id, payload)
+    user = await user_service.assign_user_role(
+        session,
+        user_id,
+        payload,
+        context=context,
+    )
     return success(UserRead.model_validate(user))
 
 
@@ -145,8 +164,14 @@ async def assign_user_department(
     user_id: int,
     payload: UserDepartmentUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.assign_user_department(session, user_id, payload)
+    user = await user_service.assign_user_department(
+        session,
+        user_id,
+        payload,
+        context=context,
+    )
     return success(UserRead.model_validate(user))
 
 
@@ -158,8 +183,14 @@ async def update_user_status(
     user_id: int,
     payload: UserStatusUpdate,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.update_user_status(session, user_id, payload)
+    user = await user_service.update_user_status(
+        session,
+        user_id,
+        payload,
+        context=context,
+    )
     return success(UserRead.model_validate(user))
 
 
@@ -171,8 +202,14 @@ async def reset_user_password(
     user_id: int,
     payload: UserPasswordReset,
     session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    user = await user_service.reset_user_password(session, user_id, payload)
+    user = await user_service.reset_user_password(
+        session,
+        user_id,
+        payload,
+        context=context,
+    )
     return success(UserRead.model_validate(user), message="password reset")
 
 

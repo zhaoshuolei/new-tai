@@ -8,6 +8,8 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.core.auth_context import AuthContext
+from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
 from app.core.security import verify_password
 from app.db.session import get_session
@@ -37,6 +39,17 @@ from app.services.user import (
     reset_user_password,
     update_user,
     update_user_status,
+)
+
+ALL_SCOPE_CONTEXT = AuthContext(
+    user_id=1,
+    role_id=1,
+    department_id=None,
+    data_scope=DataScope.ALL,
+    custom_department_ids=frozenset(),
+    include_children=True,
+    permission_codes=frozenset(),
+    is_super_admin=False,
 )
 
 TEST_DATABASE_URL = os.environ.get(
@@ -123,7 +136,7 @@ async def test_create_user_without_role_or_department_is_allowed(
 
 async def test_get_user_raises_user_not_found(session: AsyncSession) -> None:
     with pytest.raises(BusinessError) as error:
-        await get_user(session, 999_999_999)
+        await get_user(session, 999_999_999, context=ALL_SCOPE_CONTEXT)
 
     assert error.value.code == ErrorCode.USER_NOT_FOUND
     assert error.value.http_status == 404
@@ -143,6 +156,7 @@ async def test_patch_user_updates_profile_fields(session: AsyncSession) -> None:
             email="alice@example.com",
             avatar="https://example.com/alice.png",
         ),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     assert updated.nickname == "Alice"
@@ -167,16 +181,19 @@ async def test_assignments_and_status_have_separate_operations(
         session,
         user.id,
         UserDepartmentUpdate(department_id=department.id),
+        context=ALL_SCOPE_CONTEXT,
     )
     assigned_role = await assign_user_role(
         session,
         user.id,
         UserRoleUpdate(role_id=role.id),
+        context=ALL_SCOPE_CONTEXT,
     )
     disabled = await update_user_status(
         session,
         user.id,
         UserStatusUpdate(status=UserStatus.DISABLED),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     assert assigned_department.department_id == department.id
@@ -202,6 +219,7 @@ async def test_password_reset_on_feishu_user_returns_error(
             session,
             feishu_user.id,
             UserPasswordReset(new_password="new-password"),
+            context=ALL_SCOPE_CONTEXT,
         )
 
     assert error.value.code == ErrorCode.INVALID_PARAMETER
@@ -218,6 +236,7 @@ async def test_password_reset_updates_local_password(session: AsyncSession) -> N
         session,
         user.id,
         UserPasswordReset(new_password="new-password"),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     assert reset.password_hash is not None
@@ -235,10 +254,12 @@ async def test_list_users_filters_and_paginates(session: AsyncSession) -> None:
         session,
         user.id,
         UserUpdate(nickname="Listed User", email="listed@example.com"),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     items, total = await list_users(
         session,
+        context=ALL_SCOPE_CONTEXT,
         page=1,
         page_size=10,
         keyword=username,
@@ -260,13 +281,14 @@ async def test_delete_department_with_real_user_returns_5002(
         session,
         user.id,
         UserDepartmentUpdate(department_id=department.id),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     with pytest.raises(BusinessError) as error:
         await delete_department(session, department.id)
 
     assert error.value.code == ErrorCode.DEPT_HAS_USERS
-    assert await get_user(session, user.id) is not None
+    assert await get_user(session, user.id, context=ALL_SCOPE_CONTEXT) is not None
 
 
 async def test_delete_role_with_real_user_returns_3002(
@@ -284,13 +306,14 @@ async def test_delete_role_with_real_user_returns_3002(
         session,
         user.id,
         UserRoleUpdate(role_id=role.id),
+        context=ALL_SCOPE_CONTEXT,
     )
 
     with pytest.raises(BusinessError) as error:
         await delete_role(session, role.id)
 
     assert error.value.code == ErrorCode.ROLE_IN_USE
-    assert await get_user(session, user.id) is not None
+    assert await get_user(session, user.id, context=ALL_SCOPE_CONTEXT) is not None
 
 
 async def test_delete_department_referenced_by_custom_role_scope_returns_5005(
@@ -330,7 +353,11 @@ async def test_user_api_crud_and_extra_fields_are_rejected(
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
+    async def override_context() -> AuthContext:
+        return ALL_SCOPE_CONTEXT
+
     application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
     username = unique_username("api")
     try:
         async with AsyncClient(
@@ -397,6 +424,6 @@ async def test_role_and_department_are_not_writable_through_profile_patch(
     with pytest.raises(ValidationError):
         UserUpdate.model_validate({"department_id": department.id})
 
-    loaded = await get_user(session, user.id)
+    loaded = await get_user(session, user.id, context=ALL_SCOPE_CONTEXT)
     assert loaded.role_id is None
     assert loaded.department_id is None
