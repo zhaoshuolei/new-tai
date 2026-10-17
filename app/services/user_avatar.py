@@ -42,7 +42,17 @@ async def upload_avatar(
         chunks=chunks,
     )
     user.avatar = url
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        async def remove_failed_upload() -> None:
+            await remove_user_avatar(url)
+
+        await run_best_effort(
+            remove_failed_upload,
+            description="remove avatar from failed upload commit",
+        )
+        raise
 
     async def remove_previous() -> None:
         await remove_user_avatar(previous_url)

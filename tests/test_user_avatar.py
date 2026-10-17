@@ -1,5 +1,6 @@
 """Current-user avatar API tests."""
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from app.core.audit_meta import ActorSnapshot
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.deps import get_current_context
+from app.core.rate_limit import avatar_upload_rate_limit_key
 from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
@@ -28,6 +30,7 @@ from app.models.audit_log import AuditLog, AuditResult
 from app.models.user import User, UserStatus
 from app.models.user_profile import UserProfile
 from app.services import audit as audit_service
+from app.services import user_avatar as user_avatar_service
 from tests.conftest import FakeRedis
 from tests.test_system_setting_asset import ICO, JPEG, PNG, WEBP
 
@@ -295,12 +298,31 @@ async def test_replacing_managed_avatar_removes_old_file_after_commit(
     session: AsyncSession,
     fake_redis: FakeRedis,
     media_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old_name = f"{UUID(int=7)}.png"
+    old_url = f"/media/user/avatar/{old_name}"
     old_path = media_root / "user" / "avatar" / old_name
     old_path.parent.mkdir(parents=True)
     old_path.write_bytes(ICO)
-    user = await _make_user(session, avatar=f"/media/user/avatar/{old_name}")
+    user = await _make_user(session, avatar=old_url)
+    await session.commit()
+
+    events: list[str] = []
+    real_commit = session.commit
+    real_remove = user_avatar_service.remove_user_avatar
+
+    async def observed_commit() -> None:
+        events.append("commit")
+        await real_commit()
+
+    async def observed_remove(url: str | None) -> bool:
+        events.append("remove")
+        return await real_remove(url)
+
+    monkeypatch.setattr(session, "commit", observed_commit)
+    monkeypatch.setattr(user_avatar_service, "remove_user_avatar", observed_remove)
+
     try:
         async with api_client(session, _context(user.id), fake_redis) as client:
             response = await client.post(
@@ -310,10 +332,95 @@ async def test_replacing_managed_avatar_removes_old_file_after_commit(
             )
 
         assert response.status_code == 200, response.text
+        assert events == ["commit", "remove"]
         new_url = response.json()["data"]["url"]
         new_path = media_root / "user" / "avatar" / Path(new_url).name
-        assert new_url != f"/media/user/avatar/{old_name}"
+        assert new_url != old_url
         assert old_path.exists() is False
+        assert new_path.read_bytes() == PNG
+
+        await session.refresh(user)
+        assert user.avatar == new_url
+    finally:
+        await _cleanup_user(session, user.id)
+
+
+async def test_upload_commit_failure_removes_new_file_and_keeps_old_state(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    media_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_name = f"{UUID(int=8)}.png"
+    old_url = f"/media/user/avatar/{old_name}"
+    old_path = media_root / "user" / "avatar" / old_name
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(ICO)
+    user = await _make_user(session, avatar=old_url)
+    await session.commit()
+
+    async def failing_commit() -> None:
+        raise RuntimeError("avatar commit failed")
+
+    monkeypatch.setattr(session, "commit", failing_commit)
+
+    try:
+        with pytest.raises(RuntimeError, match="avatar commit failed"):
+            async with api_client(session, _context(user.id), fake_redis) as client:
+                await client.post(
+                    "/api/v1/me/profile/avatar",
+                    content=PNG,
+                    headers={"Content-Type": "image/png"},
+                )
+
+        assert set(_files(media_root)) == {old_path}
+        assert old_path.read_bytes() == ICO
+
+        await session.rollback()
+        await session.refresh(user)
+        assert user.avatar == old_url
+    finally:
+        await _cleanup_user(session, user.id)
+
+
+async def test_old_avatar_removal_failure_does_not_fail_upload(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    media_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    old_name = f"{UUID(int=9)}.png"
+    old_url = f"/media/user/avatar/{old_name}"
+    old_path = media_root / "user" / "avatar" / old_name
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(ICO)
+    user = await _make_user(session, avatar=old_url)
+    await session.commit()
+
+    async def failing_remove(url: str | None) -> bool:
+        assert url == old_url
+        raise RuntimeError("avatar removal failed")
+
+    monkeypatch.setattr(user_avatar_service, "remove_user_avatar", failing_remove)
+
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="app.core.best_effort",
+        ):
+            async with api_client(session, _context(user.id), fake_redis) as client:
+                response = await client.post(
+                    "/api/v1/me/profile/avatar",
+                    content=PNG,
+                    headers={"Content-Type": "image/png"},
+                )
+
+        assert response.status_code == 200, response.text
+        assert "remove superseded user avatar failed" in caplog.text
+        new_url = response.json()["data"]["url"]
+        new_path = media_root / "user" / "avatar" / Path(new_url).name
+        assert old_path.exists()
         assert new_path.read_bytes() == PNG
 
         await session.refresh(user)
@@ -379,13 +486,14 @@ async def test_delete_clears_avatar_and_removes_managed_file(
 async def test_eleventh_avatar_upload_is_rate_limited_before_file_access(
     session: AsyncSession,
     fake_redis: FakeRedis,
+    audit_session_factory: async_sessionmaker[AsyncSession],
     media_root: Path,
 ) -> None:
     user = await _make_user(session)
     try:
         async with api_client(session, _context(user.id), fake_redis) as client:
             responses = []
-            for _ in range(11):
+            for _ in range(10):
                 responses.append(
                     await client.post(
                         "/api/v1/me/profile/avatar",
@@ -394,13 +502,32 @@ async def test_eleventh_avatar_upload_is_rate_limited_before_file_access(
                     )
                 )
 
-        assert [response.status_code for response in responses[:10]] == [200] * 10
-        assert responses[10].status_code == 429, responses[10].text
-        assert responses[10].json()["code"] == 1005
-        assert len(_files(media_root)) == 1
-        assert len(fake_redis.values) == 1
-        assert next(iter(fake_redis.values.values())) == "11"
-        assert next(iter(fake_redis.expirations.values())) == 3600
+            assert [response.status_code for response in responses] == [200] * 10
+            await session.refresh(user)
+            files_before = set(_files(media_root))
+            avatar_before = user.avatar
+            audit_count_before = len(await _audit_rows(audit_session_factory))
+            assert len(files_before) == 1
+            assert avatar_before is not None
+            assert audit_count_before == 10
+
+            rejected = await client.post(
+                "/api/v1/me/profile/avatar",
+                content=PNG,
+                headers={"Content-Type": "image/png"},
+            )
+
+        assert rejected.status_code == 429, rejected.text
+        assert rejected.json()["code"] == 1005
+        assert set(_files(media_root)) == files_before
+        await session.refresh(user)
+        assert user.avatar == avatar_before
+        assert len(await _audit_rows(audit_session_factory)) == audit_count_before
+
+        expected_key = avatar_upload_rate_limit_key(user.id)
+        assert set(fake_redis.values) == {expected_key}
+        assert fake_redis.values[expected_key] == "11"
+        assert fake_redis.expirations == {expected_key: 3600}
     finally:
         await _cleanup_user(session, user.id)
 
