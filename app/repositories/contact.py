@@ -107,6 +107,26 @@ async def count_contacts_referencing(
     return int(total or 0)
 
 
+async def lock_contact_ids_referencing(
+    session: AsyncSession,
+    function_id: int,
+) -> list[int]:
+    """以当前读取出引用该职能的对接人 ID，并锁住这些行。
+
+    删除职能在 REPEATABLE READ 下不能使用普通 COUNT：事务快照可能早于并发
+    创建的对接人提交，计数会漏掉它。``FOR UPDATE`` 是当前读，且与对接人写入
+    （先共享锁职能行、再插行）共用"先职能后对接人"的加锁顺序。
+    """
+    statement = (
+        select(CustomerContact.id)
+        .where(CustomerContact.function_id == function_id)
+        .order_by(CustomerContact.id)
+        .with_for_update()
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
 async def reassign_contacts(
     session: AsyncSession,
     from_function_id: int,
@@ -178,6 +198,7 @@ __all__: tuple[str, ...] = (
     "list_contacts",
     "list_functions_for_customer",
     "list_shared_functions",
+    "lock_contact_ids_referencing",
     "lock_function_for_update",
     "lock_function_shared",
     "lock_functions_for_update",

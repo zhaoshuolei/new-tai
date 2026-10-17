@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -310,3 +311,86 @@ async def test_concurrent_create_and_function_delete_leave_no_dangling_reference
                 await cleanup.commit()
         finally:
             await engine.dispose()
+
+
+async def test_delete_sees_contact_committed_after_snapshot() -> None:
+    """删除职能的引用计数必须是当前读。
+
+    会话 A 先建立事务快照，会话 B 随后创建并提交对接人；A 再删除职能。
+    若计数使用普通 SELECT，A 看不到 B 的对接人并会错误删除职能；
+    正确行为是返回 7008（该职能仍有引用，必须指定替代）。
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    customer_id: int | None = None
+    f_id: int | None = None
+
+    try:
+        async with factory() as setup:
+            user = await make_user(setup)
+            customer = await make_customer_row(setup, owner=user)
+            function = await add_function(
+                setup,
+                name=f"snapshot-gap-{user.id}",
+                customer_id=None,
+            )
+            user_id = user.id
+            customer_id = customer.id
+            f_id = function.id
+            await setup.commit()
+
+        context = AuthContext(
+            user_id=user_id,
+            role_id=1,
+            department_id=None,
+            data_scope=DataScope.ALL,
+            custom_department_ids=frozenset(),
+            include_children=False,
+            permission_codes=frozenset({"customer:update", "customer:delete"}),
+            is_super_admin=True,
+        )
+
+        async with factory() as stale_session:
+            # 建立 A 的 REPEATABLE READ 快照。
+            await stale_session.scalar(
+                select(ContactFunction.id).where(ContactFunction.id == f_id)
+            )
+
+            async with factory() as writer:
+                await create_contact(
+                    writer,
+                    customer_id,
+                    ContactCreate(name="late-contact", function_id=f_id),
+                    context=context,
+                )
+
+            with pytest.raises(BusinessError) as exc:
+                await delete_shared_function(
+                    stale_session,
+                    f_id,
+                    replacement_function_id=None,
+                    context=context,
+                )
+            assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_REQUIRED
+            await stale_session.rollback()
+
+        async with factory() as check:
+            function = await check.get(ContactFunction, f_id)
+            assert function is not None
+            assert function.status == ContactStatus.ACTIVE
+    finally:
+        async with factory() as cleanup:
+            await cleanup.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
+            await cleanup.execute(
+                delete(CustomerContact).where(
+                    CustomerContact.customer_id == customer_id
+                )
+            )
+            await cleanup.execute(
+                delete(ContactFunction).where(ContactFunction.id == f_id)
+            )
+            await cleanup.execute(delete(Customer).where(Customer.id == customer_id))
+            await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+        await engine.dispose()

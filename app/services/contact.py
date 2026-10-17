@@ -382,10 +382,12 @@ async def _delete_function(
         else None
     )
 
-    contact_count = await contact_repository.count_contacts_referencing(
+    # 当前读：快照式 COUNT 会漏掉等待函数锁期间提交的对接人。
+    locked_contact_ids = await contact_repository.lock_contact_ids_referencing(
         session,
         function_id,
     )
+    contact_count = len(locked_contact_ids)
     replacement = await _validate_replacement(
         target,
         replacement,
