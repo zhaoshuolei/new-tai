@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.password_policy import validate_password_policy
 from app.core.security import hash_password
 from app.db.session import session_factory
+from app.models.contact import ContactFunction, ContactStatus
 from app.models.department import Department, DepartmentStatus
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
@@ -21,6 +22,7 @@ _PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 _SUPER_ADMIN_ROLE_CODE = "super_admin"
 _DEFAULT_ROLE_CODE = "default"
 _PROFILE_MENU_NAME = "个人资料"
+_SHARED_CONTACT_FUNCTION_NAMES = ("商务", "运营", "研发", "产品")
 
 
 @dataclass(frozen=True)
@@ -496,6 +498,28 @@ async def _get_or_create_superadmin(
     return user
 
 
+async def _ensure_shared_contact_functions(session: AsyncSession) -> None:
+    for name in _SHARED_CONTACT_FUNCTION_NAMES:
+        existing_id = await session.scalar(
+            select(ContactFunction.id).where(
+                ContactFunction.customer_id.is_(None),
+                ContactFunction.active_name == name,
+            )
+        )
+        if existing_id is not None:
+            continue
+
+        session.add(
+            ContactFunction(
+                name=name,
+                customer_id=None,
+                scope_key=0,
+                status=ContactStatus.ACTIVE,
+            )
+        )
+        await session.flush()
+
+
 async def init_data(
     session: AsyncSession,
     *,
@@ -541,6 +565,7 @@ async def init_data(
         pending_department=pending_department,
         super_admin_role=super_admin_role,
     )
+    await _ensure_shared_contact_functions(session)
     await session.commit()
 
 
