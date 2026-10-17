@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.clients.feishu import FeishuClient, get_feishu_client
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
@@ -63,14 +62,12 @@ async def feishu_login(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     redis: Annotated[Redis, Depends(get_redis)],
-    feishu_client: Annotated[FeishuClient, Depends(get_feishu_client)],
 ) -> dict[str, Any]:
     result = await auth_service.login_with_feishu(
         session,
         redis,
         payload.code,
         client_ip=(request.client.host if request.client is not None else "unknown"),
-        client=feishu_client,
     )
     response = LoginRead(
         access_token=result.tokens.access_token,

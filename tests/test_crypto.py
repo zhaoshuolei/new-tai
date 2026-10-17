@@ -57,3 +57,17 @@ def test_valid_token_with_invalid_utf8_plaintext_raises_unreadable() -> None:
         decrypt_secret(token)
     assert exc.value.code == ErrorCode.TIANYANCHA_TOKEN_UNREADABLE
     assert exc.value.http_status == 503
+
+
+def test_decrypt_secret_can_use_caller_error_code() -> None:
+    tampered = _tamper(encrypt_secret("x"))
+
+    with pytest.raises(BusinessError) as error:
+        decrypt_secret(
+            tampered,
+            error_code=ErrorCode.FEISHU_CONFIG_UNREADABLE,
+            error_message="Feishu configuration cannot be read",
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_CONFIG_UNREADABLE
+    assert error.value.http_status == 503

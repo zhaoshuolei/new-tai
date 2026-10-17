@@ -9,6 +9,9 @@ import httpx
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
 
+FEISHU_APP_ACCESS_TOKEN_URL = (
+    "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
+)
 FEISHU_TOKEN_URL = "https://accounts.feishu.cn/oauth/v3/token"
 FEISHU_USER_INFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 DEFAULT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -86,6 +89,44 @@ class FeishuClient:
             settings.feishu_redirect_uri if redirect_uri is None else redirect_uri
         )
 
+    async def verify_app_credentials(self) -> None:
+        """验证当前应用凭证；响应中的任何 token 都只丢弃。"""
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    FEISHU_APP_ACCESS_TOKEN_URL,
+                    json={
+                        "app_id": self._app_id,
+                        "app_secret": self._app_secret,
+                    },
+                    headers={"Accept": "application/json"},
+                )
+        except httpx.HTTPError as error:
+            _raise_upstream_error("verify_app_credentials", type(error).__name__)
+
+        if not response.is_success:
+            _raise_upstream_error(
+                "verify_app_credentials",
+                f"HTTP {response.status_code} returned unsuccessful response",
+            )
+
+        payload = _decode_response(response, "verify_app_credentials")
+        code = payload.get("code")
+        if not isinstance(code, int) or isinstance(code, bool):
+            _raise_upstream_error(
+                "verify_app_credentials",
+                "response is missing integer code",
+            )
+        if code != 0:
+            raise BusinessError(
+                ErrorCode.FEISHU_CREDENTIALS_REJECTED,
+                "Feishu credentials rejected",
+                http_status=422,
+            )
+
     async def exchange_code(self, code: str) -> str:
         body = {
             "grant_type": "authorization_code",
@@ -159,6 +200,7 @@ def get_feishu_client() -> FeishuClient:
 
 __all__: tuple[str, ...] = (
     "DEFAULT_TIMEOUT",
+    "FEISHU_APP_ACCESS_TOKEN_URL",
     "FEISHU_TOKEN_URL",
     "FEISHU_USER_INFO_URL",
     "FeishuClient",

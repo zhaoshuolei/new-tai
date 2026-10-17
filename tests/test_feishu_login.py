@@ -1,7 +1,9 @@
+import json
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qsl
 from uuid import uuid4
 
@@ -14,21 +16,31 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.clients.feishu import (
+    FEISHU_APP_ACCESS_TOKEN_URL,
     FEISHU_TOKEN_URL,
     FEISHU_USER_INFO_URL,
     FeishuClient,
     FeishuUserInfo,
-    get_feishu_client,
 )
+from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
 from app.models.department import Department, DepartmentStatus
+from app.models.integration_config import IntegrationConfig
 from app.models.role import DataScope, Role, RoleStatus
 from app.models.user import User, UserStatus
+from app.schemas.integration import FeishuConfigSource, FeishuIntegrationUpdate
 from app.services import auth as auth_service
+from app.services.feishu_integration import (
+    EffectiveFeishuConfig,
+    build_feishu_client,
+    resolve_feishu_config,
+    save_feishu_integration,
+)
+from tests.feishu_helpers import add_feishu_config
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -49,12 +61,16 @@ class FakeFeishuClient(FeishuClient):
         self.name = name
         self.avatar_url = avatar_url
         self.email = email
+        self.exchange_calls = 0
+        self.info_calls = 0
 
     async def exchange_code(self, code: str) -> str:
+        self.exchange_calls += 1
         assert code == "valid-code"
         return "user-access-token"
 
     async def get_user_info(self, user_access_token: str) -> FeishuUserInfo:
+        self.info_calls += 1
         assert user_access_token == "user-access-token"
         return FeishuUserInfo(
             open_id=self.open_id,
@@ -107,6 +123,11 @@ async def feishu_defaults(
     return pending, default_role
 
 
+@pytest_asyncio.fixture
+async def configured_feishu(session: AsyncSession) -> IntegrationConfig:
+    return await add_feishu_config(session)
+
+
 @pytest.fixture(autouse=True)
 def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "jwt_secret", "test-secret-" + "x" * 32)
@@ -116,16 +137,22 @@ def strong_test_jwt_secret(monkeypatch: pytest.MonkeyPatch) -> None:
 async def client(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     application = create_app()
     feishu_client = FakeFeishuClient(open_id="ou-api-login")
+    monkeypatch.setattr(
+        auth_service,
+        "build_feishu_client",
+        lambda _config: feishu_client,
+    )
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
     application.dependency_overrides[get_session] = override_session
     application.dependency_overrides[get_redis] = lambda: fake_redis
-    application.dependency_overrides[get_feishu_client] = lambda: feishu_client
 
     try:
         async with AsyncClient(
@@ -163,6 +190,7 @@ async def _add_existing_user(
 async def test_first_login_auto_provisions_user(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     feishu_defaults: tuple[Department, Role],
 ) -> None:
     pending, default_role = feishu_defaults
@@ -189,6 +217,7 @@ async def test_first_login_auto_provisions_user(
 async def test_new_user_lands_in_pending_department_with_default_role(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     feishu_defaults: tuple[Department, Role],
 ) -> None:
     pending, default_role = feishu_defaults
@@ -212,6 +241,7 @@ async def test_new_user_lands_in_pending_department_with_default_role(
 async def test_existing_user_reuses_record_by_open_id(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     existing = await _add_existing_user(session, open_id="ou-existing")
 
@@ -236,6 +266,7 @@ async def test_existing_user_reuses_record_by_open_id(
 async def test_login_backfills_only_empty_profile_fields(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     user = await _add_existing_user(session, open_id="ou-backfill")
 
@@ -260,6 +291,7 @@ async def test_login_backfills_only_empty_profile_fields(
 async def test_admin_edited_nickname_is_not_overwritten(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     user = await _add_existing_user(
         session,
@@ -289,6 +321,7 @@ async def test_admin_edited_nickname_is_not_overwritten(
 async def test_avatar_and_last_login_always_refreshed(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     previous_login = datetime(2026, 1, 1)
     user = await _add_existing_user(
@@ -322,6 +355,7 @@ async def test_avatar_and_last_login_always_refreshed(
 async def test_empty_feishu_avatar_does_not_clear_stored_avatar(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     empty_avatar: str | None,
 ) -> None:
     previous_login = datetime(2026, 1, 1)
@@ -353,6 +387,7 @@ async def test_empty_feishu_avatar_does_not_clear_stored_avatar(
 async def test_pending_department_lookup_is_identity_based(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     other_system_department = Department(
         name="其他系统节点",
@@ -399,6 +434,7 @@ async def test_pending_department_lookup_is_identity_based(
 async def test_duplicate_open_id_race_recovers_existing_user(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     feishu_defaults: tuple[Department, Role],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -440,6 +476,7 @@ async def test_duplicate_open_id_race_recovers_existing_user(
 async def test_duplicate_open_id_race_without_winner_returns_business_error(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     feishu_defaults: tuple[Department, Role],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -454,12 +491,14 @@ async def test_duplicate_open_id_race_without_winner_returns_business_error(
     monkeypatch.setattr(auth_service, "_get_feishu_user_by_open_id", missing_lookup)
 
     original_commit = session.commit
-    commit_calls = 0
+    failed_user_commit = False
 
     async def racing_commit() -> None:
-        nonlocal commit_calls
-        commit_calls += 1
-        if commit_calls == 1:
+        nonlocal failed_user_commit
+        if not failed_user_commit and any(
+            isinstance(item, User) for item in session.new
+        ):
+            failed_user_commit = True
             raise IntegrityError(
                 "INSERT user",
                 {},
@@ -485,6 +524,7 @@ async def test_duplicate_open_id_race_without_winner_returns_business_error(
 async def test_disabled_user_login_returns_1002(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
 ) -> None:
     user = await _add_existing_user(session, open_id="ou-disabled")
     user.status = UserStatus.DISABLED
@@ -576,6 +616,124 @@ async def test_exchange_code_uses_v3_endpoint_and_form_body() -> None:
     }
 
 
+async def test_database_empty_redirect_does_not_use_environment_redirect(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await add_feishu_config(session, redirect_uri="")
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(
+        settings,
+        "feishu_redirect_uri",
+        "https://environment.example.com/callback",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"code": 0, "access_token": "user-access-token"},
+        )
+
+    config = await resolve_feishu_config(session)
+    feishu_client = build_feishu_client(config)
+    feishu_client._transport = httpx.MockTransport(handler)
+
+    await feishu_client.exchange_code("authorization-code")
+
+    assert len(requests) == 1
+    body = dict(parse_qsl(requests[0].content.decode()))
+    assert body["client_id"] == "cli-test"
+    assert "redirect_uri" not in body
+
+
+async def test_verify_app_credentials_posts_json_and_discards_tokens() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "app_access_token": "must-not-be-returned",
+                "tenant_access_token": "must-not-be-returned",
+                "expire": 7200,
+            },
+        )
+
+    client = FeishuClient(
+        transport=httpx.MockTransport(handler),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    assert await client.verify_app_credentials() is None
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == FEISHU_APP_ACCESS_TOKEN_URL
+    assert requests[0].headers["content-type"].startswith("application/json")
+    assert json.loads(requests[0].content) == {
+        "app_id": "cli-test",
+        "app_secret": "secret-value",
+    }
+
+
+async def test_verify_app_credentials_maps_rejection_to_8011() -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"code": 10003, "msg": "no"})
+        ),
+        app_id="cli-bad",
+        app_secret="bad-secret",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_CREDENTIALS_REJECTED
+    assert error.value.http_status == 422
+
+
+async def test_verify_app_credentials_maps_bad_response_to_1011() -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"msg": "missing-code"})
+        ),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+@pytest.mark.parametrize("code", [0, 10003])
+async def test_verify_app_credentials_maps_non_success_http_to_1011(
+    status_code: int,
+    code: int,
+) -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(status_code, json={"code": code})
+        ),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
+
+
 async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -610,31 +768,23 @@ async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
 async def test_feishu_login_rate_limit_precedes_upstream_exchange(
     session: AsyncSession,
     fake_redis: Any,
+    configured_feishu: IntegrationConfig,
     feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class CountingFeishuClient(FakeFeishuClient):
-        def __init__(self) -> None:
-            super().__init__(open_id="ou-rate-limited")
-            self.exchange_calls = 0
-            self.info_calls = 0
-
-        async def exchange_code(self, code: str) -> str:
-            self.exchange_calls += 1
-            return await super().exchange_code(code)
-
-        async def get_user_info(self, user_access_token: str) -> FeishuUserInfo:
-            self.info_calls += 1
-            return await super().get_user_info(user_access_token)
-
     application = create_app()
-    feishu_client = CountingFeishuClient()
+    feishu_client = FakeFeishuClient(open_id="ou-rate-limited")
+    monkeypatch.setattr(
+        auth_service,
+        "build_feishu_client",
+        lambda _config: feishu_client,
+    )
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         yield session
 
     application.dependency_overrides[get_session] = override_session
     application.dependency_overrides[get_redis] = lambda: fake_redis
-    application.dependency_overrides[get_feishu_client] = lambda: feishu_client
     try:
         async with AsyncClient(
             transport=ASGITransport(app=application),
@@ -658,6 +808,185 @@ async def test_feishu_login_rate_limit_precedes_upstream_exchange(
     assert blocked.json()["code"] == ErrorCode.RATE_LIMITED
     assert feishu_client.exchange_calls == auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
     assert feishu_client.info_calls == auth_service.LOGIN_RATE_LIMIT_ATTEMPTS
+
+
+async def test_login_resolves_database_config_after_rate_limit(
+    session: AsyncSession,
+    fake_redis: Any,
+    configured_feishu: IntegrationConfig,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    fake = FakeFeishuClient(open_id="ou-db-config")
+    seen: list[EffectiveFeishuConfig] = []
+
+    def build(config: EffectiveFeishuConfig) -> FeishuClient:
+        seen.append(config)
+        return fake
+
+    monkeypatch.setattr(auth_service, "build_feishu_client", build)
+
+    await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client_ip="203.0.113.30",
+    )
+
+    assert len(seen) == 1
+    assert seen[0].source is FeishuConfigSource.DATABASE
+    assert seen[0].app_id == "cli-test"
+    assert seen[0].app_secret == "secret-value"
+
+
+async def test_login_commits_config_read_before_exchange(
+    session: AsyncSession,
+    fake_redis: Any,
+    configured_feishu: IntegrationConfig,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeFeishuClient(open_id="ou-committed-config")
+    transaction_states: list[bool] = []
+
+    async def exchange_code(_code: str) -> str:
+        transaction_states.append(session.in_transaction())
+        return "user-access-token"
+
+    monkeypatch.setattr(client, "exchange_code", exchange_code)
+
+    await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client_ip="203.0.113.36",
+        client=client,
+    )
+
+    assert transaction_states == [False]
+
+
+async def test_login_without_config_returns_8009_before_upstream(
+    session: AsyncSession,
+    fake_redis: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "")
+    monkeypatch.setattr(settings, "feishu_app_secret", "")
+    client = FakeFeishuClient(open_id="ou-no-config")
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client_ip="203.0.113.31",
+            client=client,
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_NOT_CONFIGURED
+    assert client.exchange_calls == 0
+
+
+async def test_login_with_damaged_database_config_returns_8010(
+    session: AsyncSession,
+    fake_redis: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    session.add(
+        IntegrationConfig(
+            provider="feishu",
+            secret_ciphertext="not-a-fernet-token",
+            updated_by=1,
+        )
+    )
+    await session.flush()
+    client = FakeFeishuClient(open_id="ou-damaged-config")
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client_ip="203.0.113.32",
+            client=client,
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_CONFIG_UNREADABLE
+    assert client.exchange_calls == 0
+
+
+async def test_rate_limit_precedes_config_resolution(
+    session: AsyncSession,
+    fake_redis: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_ip = "203.0.113.34"
+    for _ in range(auth_service.LOGIN_RATE_LIMIT_ATTEMPTS):
+        await auth_service.enforce_login_ip_rate_limit(fake_redis, client_ip=client_ip)
+    resolve = AsyncMock(side_effect=AssertionError("resolver must not run"))
+    monkeypatch.setattr(auth_service, "resolve_feishu_config", resolve)
+
+    with pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client_ip=client_ip,
+        )
+
+    assert error.value.code == ErrorCode.RATE_LIMITED
+    assert resolve.await_count == 0
+
+
+async def test_saved_config_is_used_by_next_login_without_restart(
+    session: AsyncSession,
+    fake_redis: Any,
+    configured_feishu: IntegrationConfig,
+    feishu_defaults: tuple[Department, Role],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeFeishuClient(open_id="ou-after-save")
+    seen: list[EffectiveFeishuConfig] = []
+    monkeypatch.setattr(
+        FeishuClient,
+        "verify_app_credentials",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        auth_service,
+        "build_feishu_client",
+        lambda config: seen.append(config) or fake,
+    )
+    context = AuthContext(
+        user_id=7,
+        role_id=None,
+        department_id=None,
+        data_scope=None,
+        custom_department_ids=frozenset(),
+        include_children=False,
+        permission_codes=frozenset({"integration_feishu:update"}),
+        is_super_admin=False,
+    )
+
+    await save_feishu_integration(
+        session,
+        FeishuIntegrationUpdate(app_id="cli-new", app_secret="new-secret"),
+        context=context,
+    )
+    await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client_ip="203.0.113.33",
+    )
+
+    assert seen[-1].app_id == "cli-new"
+    assert seen[-1].app_secret == "new-secret"
 
 
 async def test_login_endpoint_returns_local_token_shape(

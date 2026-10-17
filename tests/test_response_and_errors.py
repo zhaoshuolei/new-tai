@@ -53,6 +53,9 @@ def test_customer_and_tianyancha_error_codes_are_stable() -> None:
     assert ErrorCode.TIANYANCHA_AUTH_FAILED == 8006
     assert ErrorCode.TIANYANCHA_NOT_FOUND == 8007
     assert ErrorCode.TIANYANCHA_MALFORMED_RESPONSE == 8008
+    assert ErrorCode.FEISHU_NOT_CONFIGURED == 8009
+    assert ErrorCode.FEISHU_CONFIG_UNREADABLE == 8010
+    assert ErrorCode.FEISHU_CREDENTIALS_REJECTED == 8011
 
 
 def test_page_serializes_pagination_metadata() -> None:
