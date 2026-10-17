@@ -642,6 +642,27 @@ async def test_verify_app_credentials_maps_bad_response_to_1011() -> None:
     assert error.value.http_status == 502
 
 
+@pytest.mark.parametrize("status_code", [400, 500])
+@pytest.mark.parametrize("code", [0, 10003])
+async def test_verify_app_credentials_maps_non_success_http_to_1011(
+    status_code: int,
+    code: int,
+) -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(status_code, json={"code": code})
+        ),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
+
+
 async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"

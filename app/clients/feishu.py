@@ -107,6 +107,12 @@ class FeishuClient:
         except httpx.HTTPError as error:
             _raise_upstream_error("verify_app_credentials", type(error).__name__)
 
+        if not response.is_success:
+            _raise_upstream_error(
+                "verify_app_credentials",
+                f"HTTP {response.status_code} returned unsuccessful response",
+            )
+
         payload = _decode_response(response, "verify_app_credentials")
         code = payload.get("code")
         if not isinstance(code, int) or isinstance(code, bool):
