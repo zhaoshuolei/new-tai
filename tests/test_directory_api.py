@@ -413,6 +413,105 @@ async def test_directory_profile_hidden_and_unfilled_bio_are_indistinguishable(
     assert hidden_data["personal_links"] == []
 
 
+async def test_directory_profile_without_profile_row_returns_empty_lists(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(
+        session,
+        username=f"no-profile-{uuid4().hex}",
+        nickname="No Profile",
+    )
+
+    async with api_client(session, _context(999_999_994)) as client:
+        response = await client.get(f"/api/v1/directory/{user.id}")
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["expertise_tags"] == []
+    assert data["personal_links"] == []
+
+
+async def test_directory_profile_clips_hidden_list_fields_by_contents(
+    session: AsyncSession,
+) -> None:
+    hidden_tags_with_values = await _make_user(
+        session,
+        username=f"hidden-tags-values-{uuid4().hex}",
+        nickname="Hidden Tags With Values",
+    )
+    hidden_tags_empty = await _make_user(
+        session,
+        username=f"hidden-tags-empty-{uuid4().hex}",
+        nickname="Hidden Tags Empty",
+    )
+    hidden_links_with_values = await _make_user(
+        session,
+        username=f"hidden-links-values-{uuid4().hex}",
+        nickname="Hidden Links With Values",
+    )
+    hidden_links_empty = await _make_user(
+        session,
+        username=f"hidden-links-empty-{uuid4().hex}",
+        nickname="Hidden Links Empty",
+    )
+    await _make_profile(
+        session,
+        user_id=hidden_tags_with_values.id,
+        expertise_tags=["Python"],
+        personal_links=[],
+        hidden_public_fields=["expertise_tags"],
+    )
+    await _make_profile(
+        session,
+        user_id=hidden_tags_empty.id,
+        expertise_tags=[],
+        personal_links=[],
+        hidden_public_fields=["expertise_tags"],
+    )
+    await _make_profile(
+        session,
+        user_id=hidden_links_with_values.id,
+        expertise_tags=[],
+        personal_links=[
+            {"label": "Profile", "url": "https://example.com/profile"},
+        ],
+        hidden_public_fields=["personal_links"],
+    )
+    await _make_profile(
+        session,
+        user_id=hidden_links_empty.id,
+        expertise_tags=[],
+        personal_links=[],
+        hidden_public_fields=["personal_links"],
+    )
+
+    async with api_client(session, _context(999_999_993)) as client:
+        responses = {
+            user_id: await client.get(f"/api/v1/directory/{user_id}")
+            for user_id in (
+                hidden_tags_with_values.id,
+                hidden_tags_empty.id,
+                hidden_links_with_values.id,
+                hidden_links_empty.id,
+            )
+        }
+
+    data = {}
+    for user_id, response in responses.items():
+        assert response.status_code == 200, response.text
+        data[user_id] = response.json()["data"]
+
+    tags_with_values = data[hidden_tags_with_values.id]
+    assert tags_with_values["expertise_tags"] is None
+    assert tags_with_values["personal_links"] == []
+    assert data[hidden_tags_empty.id]["expertise_tags"] is None
+    assert data[hidden_tags_empty.id]["personal_links"] == []
+    assert data[hidden_links_with_values.id]["expertise_tags"] == []
+    assert data[hidden_links_with_values.id]["personal_links"] is None
+    assert data[hidden_links_empty.id]["expertise_tags"] == []
+    assert data[hidden_links_empty.id]["personal_links"] is None
+
+
 async def test_directory_profile_self_view_uses_colleague_clipping(
     session: AsyncSession,
 ) -> None:

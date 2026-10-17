@@ -72,23 +72,15 @@ def build_directory_profile(row: DirectoryProfileRow) -> DirectoryProfileRead:
             hidden=hidden,
         ),
         seat=clip_scalar(row.seat, key="seat", hidden=hidden),
-        expertise_tags=(
-            clip_list(
-                row.expertise_tags,
-                key="expertise_tags",
-                hidden=hidden,
-            )
-            if row.expertise_tags is not None
-            else None
+        expertise_tags=clip_list(
+            row.expertise_tags or [],
+            key="expertise_tags",
+            hidden=hidden,
         ),
-        personal_links=(
-            clip_list(
-                row.personal_links,
-                key="personal_links",
-                hidden=hidden,
-            )
-            if row.personal_links is not None
-            else None
+        personal_links=clip_list(
+            row.personal_links or [],
+            key="personal_links",
+            hidden=hidden,
         ),
     )
 
