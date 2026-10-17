@@ -748,6 +748,24 @@ async def list_contacts(
     )
 
 
+async def list_deleted_contacts(
+    session: AsyncSession,
+    customer_id: int,
+    *,
+    context: AuthContext,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[CustomerContact, ContactFunction]], int]:
+    await _require_visible_active_customer(session, customer_id, context)
+    return await contact_repository.list_contacts(
+        session,
+        customer_id,
+        status=ContactStatus.DELETED,
+        page=page,
+        page_size=page_size,
+    )
+
+
 @audited(
     action="contact:create",
     resource_type="customer_contact",
@@ -875,6 +893,7 @@ __all__: tuple[str, ...] = (
     "list_contacts",
     "list_customer_functions",
     "list_customer_recycle_functions",
+    "list_deleted_contacts",
     "list_shared_functions",
     "restore_contact",
     "restore_custom_function",

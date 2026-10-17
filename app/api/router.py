@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.api.contacts import router as contacts_router
 from app.api.customers import router as customers_router
 from app.api.departments import router as departments_router
 from app.api.integrations import router as integrations_router
@@ -14,6 +15,7 @@ from app.api.roles import router as roles_router
 from app.api.users import router as users_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
+api_v1_router.include_router(contacts_router)
 api_v1_router.include_router(customers_router)
 api_v1_router.include_router(departments_router)
 api_v1_router.include_router(exceptions_monitor_router)
