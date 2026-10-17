@@ -18,6 +18,7 @@ from app.core.errors import BusinessError, ErrorCode
 
 MCP_URL = "https://mcp.tianyancha.com/mcp"
 DEFAULT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+MCP_PROTOCOL_VERSION = "2024-11-05"
 EMPTY_RESULT_MARKER = "空结果：未发现该维度记录"
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,7 @@ class TianyanchaClient:
         self._transport = transport
         self._timeout = DEFAULT_TIMEOUT
         self._session_id: str | None = None
+        self._protocol_version: str | None = None
         self._request_id = 0
 
     def _next_id(self) -> int:
@@ -364,6 +366,9 @@ class TianyanchaClient:
         }
         if self._session_id is not None:
             headers["mcp-session-id"] = self._session_id
+            # 会话建立后，每个请求都带上协商出的协议版本。
+            if self._protocol_version is not None:
+                headers["MCP-Protocol-Version"] = self._protocol_version
         return headers
 
     async def _post(self, body: dict[str, Any], *, operation: str) -> httpx.Response:
@@ -399,7 +404,7 @@ class TianyanchaClient:
             "id": self._next_id(),
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "tianxiadmin", "version": "1.0.0"},
             },
@@ -411,6 +416,45 @@ class TianyanchaClient:
         if not session_id:
             raise _malformed_error()
         self._session_id = session_id
+        self._protocol_version = self._read_negotiated_protocol_version(response)
+        # 会话建立后必须先发 initialized 通知，再发 tools/call。
+        await self._send_initialized_notification()
+
+    def _read_negotiated_protocol_version(self, response: httpx.Response) -> str:
+        """取 initialize 结果中的协议版本，缺失或不可解析时回退为发送值。"""
+        try:
+            payload = _decode_json_payload(response)
+        except BusinessError:
+            return MCP_PROTOCOL_VERSION
+        result = payload.get("result")
+        if isinstance(result, dict):
+            version = result.get("protocolVersion")
+            if isinstance(version, str) and version:
+                return version
+        return MCP_PROTOCOL_VERSION
+
+    async def _send_initialized_notification(self) -> None:
+        """发送 ``notifications/initialized``；失败仅告警，不影响后续调用。"""
+        body = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        try:
+            response = await self._post(
+                body, operation="notifications/initialized"
+            )
+        except BusinessError:
+            logger.warning(
+                "Tianyancha initialized notification failed; continuing"
+            )
+            return
+        if response.status_code >= 400:
+            logger.warning(
+                "Tianyancha rejected initialized notification: status=%s; "
+                "continuing",
+                response.status_code,
+            )
 
     async def _call_tool(
         self, tool_name: str, arguments: dict[str, Any]

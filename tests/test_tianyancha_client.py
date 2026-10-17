@@ -238,6 +238,14 @@ INITIALIZE_RESPONSE: dict[str, Any] = {
 }
 
 
+def _ack_notification(request: httpx.Request) -> httpx.Response | None:
+    """``notifications/initialized`` carries no id; ack it so tools/call proceeds."""
+    body = json.loads(request.content)
+    if body.get("method") == "notifications/initialized":
+        return httpx.Response(202)
+    return None
+
+
 def _tools_result(request_id: int, text: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -252,6 +260,9 @@ async def test_client_search_initializes_and_reuses_session() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -275,6 +286,7 @@ async def test_client_search_initializes_and_reuses_session() -> None:
     # initialize 只发生一次：后续调用复用会话。
     assert [json.loads(r.content)["method"] for r in requests] == [
         "initialize",
+        "notifications/initialized",
         "tools/call",
     ]
     assert requests[0].headers["authorization"] == "test-api-key"
@@ -286,6 +298,9 @@ async def test_client_sends_authorization_exactly_api_key() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         auth_headers.append(request.headers["authorization"])
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -299,11 +314,14 @@ async def test_client_sends_authorization_exactly_api_key() -> None:
 
     await client.search_candidates("x", page=1, page_size=1)
 
-    assert auth_headers == ["abc123", "abc123"]
+    assert auth_headers == ["abc123", "abc123", "abc123"]
 
 
 async def test_invalid_token_maps_to_auth_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -331,6 +349,9 @@ async def test_invalid_token_maps_to_auth_error() -> None:
 
 async def test_quota_error_maps_to_quota_exceeded() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -351,6 +372,9 @@ async def test_quota_error_maps_to_quota_exceeded() -> None:
 
 async def test_rate_limit_maps_to_rate_limited() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -371,6 +395,9 @@ async def test_rate_limit_maps_to_rate_limited() -> None:
 
 async def test_server_error_maps_to_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -391,6 +418,9 @@ async def test_server_error_maps_to_unavailable() -> None:
 
 async def test_malformed_body_maps_to_malformed_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -413,6 +443,9 @@ async def test_sse_response_parses_like_json() -> None:
     search_text = _read_extra("search_companies.md")
 
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -440,6 +473,9 @@ async def test_sse_response_parses_like_json() -> None:
 
 async def test_fetch_registration_empty_result_raises_not_found() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -466,6 +502,9 @@ async def test_fetch_registration_uses_call_tool_payload() -> None:
     captured: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -498,6 +537,9 @@ async def test_fetch_historical_registration_text_returns_raw_markdown() -> None
     captured: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -524,6 +566,9 @@ async def test_fetch_historical_registration_empty_result_returns_empty_string()
     None
 ):
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
@@ -545,6 +590,10 @@ async def test_connection_invokes_tools_call() -> None:
     methods: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            methods.append("notifications/initialized")
+            return ack
         body = json.loads(request.content)
         methods.append(body["method"])
         if body["method"] == "initialize":
@@ -559,4 +608,109 @@ async def test_connection_invokes_tools_call() -> None:
 
     await client.test_connection()
 
-    assert methods == ["initialize", "tools/call"]
+    assert methods == ["initialize", "notifications/initialized", "tools/call"]
+
+
+async def test_initialized_notification_is_posted_without_id() -> None:
+    notifications: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
+            )
+        if body["method"] == "notifications/initialized":
+            notifications.append(request)
+            return httpx.Response(202)
+        return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
+
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
+
+    await client.search_candidates("x", page=1, page_size=1)
+
+    assert len(notifications) == 1
+    notification = json.loads(notifications[0].content)
+    assert "id" not in notification
+    assert notification["method"] == "notifications/initialized"
+    assert notification["params"] == {}
+    assert notifications[0].headers["mcp-session-id"] == "s"
+
+
+async def test_tools_call_carries_session_and_protocol_version() -> None:
+    tool_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200, headers={"Mcp-Session-Id": "session-abc"},
+                json=INITIALIZE_RESPONSE,
+            )
+        tool_requests.append(request)
+        return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
+
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
+
+    await client.search_candidates("x", page=1, page_size=1)
+
+    assert len(tool_requests) == 1
+    assert tool_requests[0].headers["mcp-session-id"] == "session-abc"
+    assert tool_requests[0].headers["MCP-Protocol-Version"] == "2024-11-05"
+
+
+async def test_missing_protocol_version_falls_back_to_sent_version() -> None:
+    response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"capabilities": {}, "serverInfo": {"name": "t", "version": "1"}},
+    }
+    tool_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ack = _ack_notification(request)
+        if ack is not None:
+            return ack
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200, headers={"Mcp-Session-Id": "s"}, json=response
+            )
+        tool_requests.append(request)
+        return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
+
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
+
+    await client.search_candidates("x", page=1, page_size=1)
+
+    assert tool_requests[0].headers["MCP-Protocol-Version"] == "2024-11-05"
+
+
+@pytest.mark.parametrize("status", [400, 500])
+async def test_rejected_initialized_notification_does_not_block_tool_call(
+    status: int,
+) -> None:
+    tool_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
+            )
+        if body["method"] == "notifications/initialized":
+            return httpx.Response(status, text="notification rejected")
+        tool_calls.append(body["method"])
+        return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
+
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
+
+    candidates, total = await client.search_candidates("x", page=1, page_size=1)
+
+    assert total == 0
+    assert candidates == []
+    assert tool_calls == ["tools/call"]
+
