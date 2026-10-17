@@ -94,6 +94,42 @@ def test_api_key_is_masked_in_json_style() -> None:
     assert mask_sensitive_text('"api_key": "mcpk2_secret"') == '"api_key": "***"'
 
 
+def test_app_secret_is_masked_in_structured_log_extra() -> None:
+    output = _capture_with_existing_handler(
+        "tests.redaction.app-secret-structured",
+        {"app_secret": "secret-value"},
+    )
+
+    assert "secret-value" not in output
+    assert "***" in output
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "app_secret=secret-value",
+        '{"app_secret":"secret-value"}',
+        'app_secret="secret-value"',
+    ],
+)
+def test_app_secret_is_masked_in_message_text(text: str) -> None:
+    output = mask_sensitive_text(text)
+
+    assert "secret-value" not in output
+    assert "***" in output
+
+
+def test_formatted_app_secret_argument_is_redacted_before_handler() -> None:
+    output = _capture_message_with_existing_handler(
+        "tests.redaction.app-secret-formatted",
+        "app_secret=%s",
+        "secret-value",
+    )
+
+    assert "secret-value" not in output
+    assert "app_secret=***" in output
+
+
 @pytest.mark.parametrize(
     "text",
     [

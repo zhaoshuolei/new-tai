@@ -17,6 +17,7 @@ SENSITIVE_KEYS = {
     "code",
     "authorization",
     "api_key",
+    "app_secret",
 }
 MASK = "***"
 
@@ -27,7 +28,7 @@ _request_id_context: ContextVar[str | None] = ContextVar(
 
 _SENSITIVE_VALUE_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?P<key_quote>[\"']?)\b"
-    r"(?P<key>access_token|refresh_token|api_key|authorization|password|token|code)"
+    r"(?P<key>app_secret|access_token|refresh_token|api_key|authorization|password|token|code)"
     r"(?P=key_quote)\s*[:=]\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\\\])*\"|'(?:\\.|[^'\\\\])*'"
     r"|[^,\r\n}\]]+)",
