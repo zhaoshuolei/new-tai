@@ -56,6 +56,7 @@ async def lock_function_for_update(
         select(ContactFunction)
         .where(ContactFunction.id == function_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     return await session.scalar(statement)
 
@@ -68,6 +69,7 @@ async def lock_function_shared(
         select(ContactFunction)
         .where(ContactFunction.id == function_id)
         .with_for_update(read=True)
+        .execution_options(populate_existing=True)
     )
     return await session.scalar(statement)
 

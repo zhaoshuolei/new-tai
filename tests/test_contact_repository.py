@@ -1,9 +1,38 @@
-from app.models.contact import ContactStatus
+from typing import Any, cast
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.dialects import mysql
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.models.contact import ContactFunction, ContactStatus
 from app.repositories import contact as contact_repository
 from tests.contact_helpers import add_contact, add_function
-from tests.customer_helpers import make_customer_row, make_user, session
+from tests.customer_helpers import (
+    TEST_DATABASE_URL,
+    make_customer_row,
+    make_user,
+    session,
+)
 
 __all__ = ("session",)
+
+
+class _RecordingResult:
+    def all(self) -> list[Any]:
+        return []
+
+
+class _RecordingSession:
+    statement: Any = None
+
+    async def scalar(self, statement: Any) -> None:
+        self.statement = statement
+        return None
+
+    async def scalars(self, statement: Any) -> _RecordingResult:
+        self.statement = statement
+        return _RecordingResult()
 
 
 async def test_list_functions_for_customer_includes_shared_and_own_only(
@@ -97,3 +126,81 @@ async def test_list_contacts_excludes_deleted(session) -> None:
     )
     assert total == 1
     assert items[0][0].name == "在岗"
+
+
+@pytest.mark.parametrize(
+    "lock_function",
+    [
+        contact_repository.lock_function_for_update,
+        contact_repository.lock_function_shared,
+    ],
+)
+async def test_lock_functions_refresh_stale_identity_map(lock_function) -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    function_id: int | None = None
+    try:
+        async with factory() as setup:
+            function = ContactFunction(
+                name=f"锁测试-{uuid4().hex}",
+                customer_id=None,
+                scope_key=0,
+                status=ContactStatus.ACTIVE,
+            )
+            setup.add(function)
+            await setup.commit()
+            created_id = function.id
+            function_id = created_id
+
+        async with factory() as reader:
+            stale = await contact_repository.get_function(reader, created_id)
+            assert stale is not None
+            assert stale.status == ContactStatus.ACTIVE
+
+            async with factory() as writer:
+                current = await writer.get(ContactFunction, created_id)
+                assert current is not None
+                current.status = ContactStatus.DELETED
+                await writer.commit()
+
+            locked = await lock_function(reader, created_id)
+            assert locked is not None
+            assert locked.status == ContactStatus.DELETED
+    finally:
+        if function_id is not None:
+            async with factory() as cleanup:
+                function = await cleanup.get(ContactFunction, function_id)
+                if function is not None:
+                    await cleanup.delete(function)
+                    await cleanup.commit()
+        await engine.dispose()
+
+
+async def test_lock_function_shared_uses_shared_lock() -> None:
+    recording = _RecordingSession()
+
+    await contact_repository.lock_function_shared(
+        cast(AsyncSession, recording),
+        10,
+    )
+
+    compiled = str(
+        recording.statement.compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "LOCK IN SHARE MODE" in compiled
+
+
+@pytest.mark.parametrize(
+    "lock_function",
+    [
+        contact_repository.lock_function_for_update,
+        contact_repository.lock_function_shared,
+    ],
+)
+async def test_lock_functions_return_none_for_missing_id(
+    session, lock_function
+) -> None:
+    assert await lock_function(session, -1) is None

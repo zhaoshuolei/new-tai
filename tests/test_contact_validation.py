@@ -16,10 +16,17 @@ def test_plain_mobile_is_accepted() -> None:
     assert normalize_phone("13800138000") == "13800138000"
 
 
-@pytest.mark.parametrize("raw", ["12345", "abc1234567", "1" * 21, "+", "1+2345678"])
+@pytest.mark.parametrize(
+    "raw", ["1" * 6, "12345", "abc1234567", "1" * 21, "+", "1+2345678"]
+)
 def test_invalid_phone_is_rejected(raw: str) -> None:
     with pytest.raises(ValueError):
         normalize_phone(raw)
+
+
+@pytest.mark.parametrize("raw", ["1" * 7, "1" * 20])
+def test_phone_length_boundaries_are_accepted(raw: str) -> None:
+    assert normalize_phone(raw) == raw
 
 
 @pytest.mark.parametrize("raw", [None, "", "   "])
