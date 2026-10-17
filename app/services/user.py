@@ -12,6 +12,7 @@ from app.core.redis import redis_scope
 from app.core.security import hash_password
 from app.models.role import Role
 from app.models.user import User, UserStatus
+from app.repositories import customer as customer_repository
 from app.repositories import department as department_repository
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
@@ -362,6 +363,12 @@ async def delete_user(
         None,
         "delete",
     )
+    if await customer_repository.has_customers(session, user_id):
+        raise BusinessError(
+            ErrorCode.USER_HAS_CUSTOMERS,
+            "User still owns customers; transfer those customers first",
+            http_status=409,
+        )
 
     await user_repository.delete(session, user)
     await _commit_user_security_change(

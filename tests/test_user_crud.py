@@ -15,10 +15,12 @@ from app.core.errors import BusinessError, ErrorCode
 from app.core.security import verify_password
 from app.db.session import get_session
 from app.main import create_app
+from app.models.customer import Customer, CustomerSource
 from app.models.department import DepartmentStatus
 from app.models.role import DataScope, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import department as department_repository
+from app.repositories import user as user_repository
 from app.schemas.department import DepartmentCreate
 from app.schemas.role import RoleCreate, RoleDataScopeUpdate
 from app.schemas.user import (
@@ -35,12 +37,14 @@ from app.services.user import (
     assign_user_department,
     assign_user_role,
     create_local_user,
+    delete_user,
     get_user,
     list_users,
     reset_user_password,
     update_user,
     update_user_status,
 )
+from tests.conftest import FakeRedis
 
 ALL_SCOPE_CONTEXT = AuthContext(
     user_id=1,
@@ -495,3 +499,53 @@ async def test_role_and_department_are_not_writable_through_profile_patch(
     loaded = await get_user(session, user.id, context=ALL_SCOPE_CONTEXT)
     assert loaded.role_id is None
     assert loaded.department_id is None
+
+
+async def test_delete_user_with_owned_customers_returns_2005(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    user = await create_local_user(
+        session,
+        UserCreate(username=unique_username("owner"), password="password1"),
+    )
+    session.add(
+        Customer(
+            name="归属客户",
+            source=CustomerSource.MANUAL,
+            owner_user_id=user.id,
+            owner_department_id=user.department_id,
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(BusinessError) as error:
+        await delete_user(
+            session,
+            user.id,
+            context=ALL_SCOPE_CONTEXT,
+            redis=fake_redis,
+        )
+
+    assert error.value.code == ErrorCode.USER_HAS_CUSTOMERS
+    assert error.value.http_status == 409
+    assert await user_repository.get_by_id(session, user.id) is not None
+
+
+async def test_delete_user_without_customers_succeeds(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    user = await create_local_user(
+        session,
+        UserCreate(username=unique_username("no-customers"), password="password1"),
+    )
+
+    await delete_user(
+        session,
+        user.id,
+        context=ALL_SCOPE_CONTEXT,
+        redis=fake_redis,
+    )
+
+    assert await user_repository.get_by_id(session, user.id) is None

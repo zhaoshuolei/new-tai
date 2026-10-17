@@ -32,6 +32,11 @@ async def delete(session: AsyncSession, customer: Customer) -> None:
     await session.delete(customer)
 
 
+async def has_customers(session: AsyncSession, user_id: int) -> bool:
+    statement = select(Customer.id).where(Customer.owner_user_id == user_id).limit(1)
+    return await session.scalar(statement) is not None
+
+
 async def list_customers(
     session: AsyncSession,
     *,
@@ -89,5 +94,6 @@ __all__: tuple[str, ...] = (
     "delete",
     "get_by_credit_code",
     "get_by_id",
+    "has_customers",
     "list_customers",
 )
