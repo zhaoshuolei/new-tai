@@ -37,6 +37,21 @@ async def has_customers(session: AsyncSession, user_id: int) -> bool:
     return await session.scalar(statement) is not None
 
 
+async def has_customers_for_update(session: AsyncSession, user_id: int) -> bool:
+    """以加锁读（当前读）判断用户是否仍拥有客户。
+
+    MySQL 默认 REPEATABLE READ：普通 SELECT 会固定事务快照，并发提交的客户行
+    可能不可见；`FOR UPDATE` 是当前读，会读取最新已提交的数据。删除用户后发生
+    外键冲突时用它复核归属，避免漏判导致裸 IntegrityError 冒泡成 500。
+    """
+    statement = (
+        select(Customer.id)
+        .where(Customer.owner_user_id == user_id)
+        .with_for_update()
+    )
+    return (await session.scalars(statement)).first() is not None
+
+
 async def list_customers(
     session: AsyncSession,
     *,
@@ -95,5 +110,6 @@ __all__: tuple[str, ...] = (
     "get_by_credit_code",
     "get_by_id",
     "has_customers",
+    "has_customers_for_update",
     "list_customers",
 )

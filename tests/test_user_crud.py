@@ -6,8 +6,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
@@ -571,6 +575,21 @@ async def test_delete_user_race_with_new_customer_returns_2005(
         _precheck_misses_customer,
     )
 
+    # 复核必须走加锁的当前读，否则 REPEATABLE READ 快照可能漏判并发提交的客户。
+    locking_calls = {"n": 0}
+    real_has_customers_for_update = customer_repository.has_customers_for_update
+
+    async def _spy_has_customers_for_update(
+        _session: AsyncSession, _user_id: int
+    ) -> bool:
+        locking_calls["n"] += 1
+        return await real_has_customers_for_update(_session, _user_id)
+
+    monkeypatch.setattr(
+        "app.services.user.customer_repository.has_customers_for_update",
+        _spy_has_customers_for_update,
+    )
+
     with pytest.raises(BusinessError) as error:
         await delete_user(
             session,
@@ -579,9 +598,70 @@ async def test_delete_user_race_with_new_customer_returns_2005(
             redis=fake_redis,
         )
 
+    assert locking_calls["n"] == 1
     assert error.value.code == ErrorCode.USER_HAS_CUSTOMERS
     assert error.value.http_status == 409
     assert await user_repository.get_by_id(session, user.id) is not None
+
+
+async def test_has_customers_for_update_sees_row_committed_after_snapshot() -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    reader: AsyncSession | None = None
+    try:
+        async with factory() as setup:
+            owner = User(
+                feishu_open_id=None,
+                username=unique_username("current-read-owner"),
+                password_hash="x",
+                nickname=None,
+                email=None,
+                avatar=None,
+                department_id=None,
+                role_id=None,
+                status=UserStatus.ACTIVE,
+                token_version=0,
+                last_login_at=None,
+            )
+            setup.add(owner)
+            await setup.commit()
+            user_id = owner.id
+        assert user_id is not None
+
+        # 连接 A 先执行一次普通读固定 REPEATABLE READ 快照，此时该用户还没有客户。
+        reader = factory()
+        assert await customer_repository.has_customers(reader, user_id) is False
+
+        # 连接 B 并发插入并提交一条归属该用户的客户。
+        async with factory() as writer:
+            writer.add(
+                Customer(
+                    name="快照后新增客户",
+                    source=CustomerSource.MANUAL,
+                    owner_user_id=user_id,
+                    owner_department_id=None,
+                )
+            )
+            await writer.commit()
+
+        # A 的普通读仍停留在旧快照（看不到新行）；加锁读是当前读，能看到新行。
+        assert await customer_repository.has_customers(reader, user_id) is False
+        assert (
+            await customer_repository.has_customers_for_update(reader, user_id) is True
+        )
+    finally:
+        if reader is not None:
+            await reader.rollback()
+            await reader.close()
+        async with factory() as cleanup:
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.owner_user_id == user_id)
+                )
+                await cleanup.execute(delete(User).where(User.id == user_id))
+                await cleanup.commit()
+        await engine.dispose()
 
 
 async def test_delete_user_without_customers_succeeds(

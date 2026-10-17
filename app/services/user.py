@@ -377,7 +377,7 @@ async def delete_user(
         async with session.begin_nested():
             await user_repository.delete(session, user)
     except IntegrityError as error:
-        if await customer_repository.has_customers(session, user_id):
+        if await customer_repository.has_customers_for_update(session, user_id):
             raise BusinessError(
                 ErrorCode.USER_HAS_CUSTOMERS,
                 "User still owns customers; transfer those customers first",
