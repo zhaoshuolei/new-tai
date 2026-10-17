@@ -1,6 +1,7 @@
 """领域模型包，模型模块导入后向 Base.metadata 注册表定义。"""
 
 from app.models.audit_log import AuditLog, AuditResult
+from app.models.contact import ContactStatus
 from app.models.customer import Customer, CustomerSource
 from app.models.department import Department, DepartmentStatus
 from app.models.exception_log import ExceptionLevel, ExceptionLog
@@ -20,6 +21,7 @@ from app.models.user import User, UserStatus
 __all__: tuple[str, ...] = (
     "AuditLog",
     "AuditResult",
+    "ContactStatus",
     "Customer",
     "CustomerSource",
     "DataScope",

@@ -6,6 +6,7 @@ from enum import StrEnum
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Computed,
     Date,
     Enum,
     ForeignKey,
@@ -17,6 +18,7 @@ from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.models.contact import ContactStatus
 
 
 class CustomerSource(StrEnum):
@@ -25,7 +27,7 @@ class CustomerSource(StrEnum):
 
 
 class Customer(Base):
-    """客户档案，统一社会信用代码非空时全局唯一。"""
+    """客户档案。未删除客户的信用代码全局唯一（见 active_credit_code）。"""
 
     __tablename__ = "customer"
 
@@ -34,9 +36,31 @@ class Customer(Base):
     credit_code: Mapped[str | None] = mapped_column(
         String(18),
         nullable=True,
-        unique=True,
-        index=True,
     )
+    active_credit_code: Mapped[str | None] = mapped_column(
+        String(18),
+        Computed(
+            "CASE WHEN status = 'ACTIVE' THEN credit_code END",
+            persisted=True,
+        ),
+        index=True,
+        unique=True,
+    )
+    status: Mapped[ContactStatus] = mapped_column(
+        Enum(
+            ContactStatus,
+            name="contact_status",
+            values_callable=lambda enum_type: [item.value for item in enum_type],
+        ),
+        nullable=False,
+        default=ContactStatus.ACTIVE,
+        server_default="ACTIVE",
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DATETIME(fsp=6),
+        nullable=True,
+    )
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     legal_person: Mapped[str | None] = mapped_column(String(255), nullable=True)
     registered_capital: Mapped[str | None] = mapped_column(
         String(255),
