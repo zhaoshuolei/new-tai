@@ -247,6 +247,33 @@ async def test_remove_system_asset_deletes_only_managed_files(
     assert external_removed is False
 
 
+async def test_directory_fsync_failure_removes_published_file(
+    media_root: Path,
+    context: AuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        await upload_system_asset(
+            asset_type=SystemAssetType.LOGO,
+            content_type="image/png",
+            chunks=chunks(PNG),
+            context=context,
+        )
+
+    assert not media_root.exists() or not any(
+        path.is_file() for path in media_root.rglob("*")
+    )
+
+
 async def test_atomic_write_fsyncs_destination_directory(
     context: AuthContext,
     monkeypatch: pytest.MonkeyPatch,

@@ -107,6 +107,8 @@ async def _read_bounded(
 
 def _write_atomic(directory: Path, filename: str, content: bytes) -> None:
     temporary_path: Path | None = None
+    target_path = directory / filename
+    published = False
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=directory,
@@ -118,7 +120,8 @@ def _write_atomic(directory: Path, filename: str, content: bytes) -> None:
             temporary_file.write(content)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
-        temporary_path.replace(directory / filename)
+        temporary_path.replace(target_path)
+        published = True
         directory_descriptor = os.open(
             directory,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
@@ -130,6 +133,8 @@ def _write_atomic(directory: Path, filename: str, content: bytes) -> None:
     except BaseException:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+        if published:
+            target_path.unlink(missing_ok=True)
         raise
 
 

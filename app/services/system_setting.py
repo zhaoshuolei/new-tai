@@ -86,9 +86,9 @@ async def update_setting(
     await session.commit()
     await session.refresh(setting)
 
-    current_urls = (setting.logo_url, setting.favicon_url)
-    for previous_url, current_url in zip(previous_urls, current_urls, strict=True):
-        if previous_url is None or previous_url == current_url:
+    current_urls = {setting.logo_url, setting.favicon_url}
+    for previous_url in previous_urls:
+        if previous_url is None or previous_url in current_urls:
             continue
 
         async def remove_previous(url: str = previous_url) -> None:

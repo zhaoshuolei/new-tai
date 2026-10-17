@@ -438,6 +438,73 @@ async def test_update_setting_removes_replaced_managed_assets(
     assert new_path.exists() is True
 
 
+async def test_update_setting_keeps_asset_shared_by_logo_and_favicon(
+    session: AsyncSession,
+    context: AuthContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "media"
+    monkeypatch.setattr(settings, "media_root", str(media_root))
+    shared_url = f"/media/system/logo/{UUID(int=4)}.png"
+    new_logo = f"/media/system/logo/{UUID(int=5)}.png"
+    shared_path = media_root / "system" / "logo" / Path(shared_url).name
+    shared_path.parent.mkdir(parents=True)
+    shared_path.write_bytes(b"shared")
+
+    await update_setting(
+        session,
+        SystemSettingUpdate.model_validate(
+            _payload(logo_url=shared_url, favicon_url=shared_url)
+        ),
+        context=context,
+    )
+    await update_setting(
+        session,
+        SystemSettingUpdate.model_validate(
+            _payload(logo_url=new_logo, favicon_url=shared_url)
+        ),
+        context=context,
+    )
+
+    assert shared_path.exists() is True
+
+
+async def test_update_setting_keeps_assets_whose_urls_are_swapped(
+    session: AsyncSession,
+    context: AuthContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "media"
+    monkeypatch.setattr(settings, "media_root", str(media_root))
+    first_url = f"/media/system/logo/{UUID(int=6)}.png"
+    second_url = f"/media/system/logo/{UUID(int=7)}.png"
+    first_path = media_root / "system" / "logo" / Path(first_url).name
+    second_path = media_root / "system" / "logo" / Path(second_url).name
+    first_path.parent.mkdir(parents=True)
+    first_path.write_bytes(b"first")
+    second_path.write_bytes(b"second")
+
+    await update_setting(
+        session,
+        SystemSettingUpdate.model_validate(
+            _payload(logo_url=first_url, favicon_url=second_url)
+        ),
+        context=context,
+    )
+    await update_setting(
+        session,
+        SystemSettingUpdate.model_validate(
+            _payload(logo_url=second_url, favicon_url=first_url)
+        ),
+        context=context,
+    )
+
+    assert first_path.exists() is True
+    assert second_path.exists() is True
+
+
 async def test_update_setting_keeps_unchanged_managed_asset(
     session: AsyncSession,
     context: AuthContext,
