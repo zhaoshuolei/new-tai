@@ -19,6 +19,7 @@ from app.models.customer import Customer, CustomerSource
 from app.models.department import DepartmentStatus
 from app.models.role import DataScope, RoleStatus
 from app.models.user import User, UserStatus
+from app.repositories import customer as customer_repository
 from app.repositories import department as department_repository
 from app.repositories import user as user_repository
 from app.schemas.department import DepartmentCreate
@@ -518,6 +519,57 @@ async def test_delete_user_with_owned_customers_returns_2005(
         )
     )
     await session.flush()
+
+    with pytest.raises(BusinessError) as error:
+        await delete_user(
+            session,
+            user.id,
+            context=ALL_SCOPE_CONTEXT,
+            redis=fake_redis,
+        )
+
+    assert error.value.code == ErrorCode.USER_HAS_CUSTOMERS
+    assert error.value.http_status == 409
+    assert await user_repository.get_by_id(session, user.id) is not None
+
+
+async def test_delete_user_race_with_new_customer_returns_2005(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = await create_local_user(
+        session,
+        UserCreate(username=unique_username("race-owner"), password="password1"),
+    )
+    session.add(
+        Customer(
+            name="并发归属客户",
+            source=CustomerSource.MANUAL,
+            owner_user_id=user.id,
+            owner_department_id=user.department_id,
+        )
+    )
+    await session.flush()
+
+    # 模拟并发 TOCTOU：预检查时返回 False（假装当时还没有客户），但表里其实
+    # 已有归属该用户的客户行，于是删除会触发 owner_user_id 外键 RESTRICT；
+    # 随后的复核委托真实实现，返回 True 以命中业务错误。
+    real_has_customers = customer_repository.has_customers
+    call_count = {"n": 0}
+
+    async def _precheck_misses_customer(
+        _session: AsyncSession, _user_id: int
+    ) -> bool:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return False
+        return await real_has_customers(_session, _user_id)
+
+    monkeypatch.setattr(
+        "app.services.user.customer_repository.has_customers",
+        _precheck_misses_customer,
+    )
 
     with pytest.raises(BusinessError) as error:
         await delete_user(

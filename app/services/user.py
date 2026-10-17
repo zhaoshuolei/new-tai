@@ -370,7 +370,21 @@ async def delete_user(
             http_status=409,
         )
 
-    await user_repository.delete(session, user)
+    # 在 SAVEPOINT 内删除：预检查与删除之间存在 TOCTOU 竞争，并发的客户插入/转移
+    # 可能在此用户下新建客户，导致 owner_user_id 外键 RESTRICT 触发裸 IntegrityError。
+    # 捕获后复核归属并转为业务错误，同时回滚会让会话保持可用。
+    try:
+        async with session.begin_nested():
+            await user_repository.delete(session, user)
+    except IntegrityError as error:
+        if await customer_repository.has_customers(session, user_id):
+            raise BusinessError(
+                ErrorCode.USER_HAS_CUSTOMERS,
+                "User still owns customers; transfer those customers first",
+                http_status=409,
+            ) from error
+        raise
+
     await _commit_user_security_change(
         session,
         user_id,
