@@ -1,9 +1,9 @@
 import pytest
-from pydantic import ValidationError
 
 from app.core.errors import BusinessError, ErrorCode
 from app.models.contact import ContactStatus
 from app.models.role import DataScope
+from app.repositories import contact as contact_repository
 from app.schemas.contact import ContactCreate, ContactUpdate
 from app.services.contact import (
     create_contact,
@@ -124,6 +124,227 @@ async def test_blank_name_returns_7003(session) -> None:
         )
 
     assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+async def test_create_without_name_or_function_returns_7003(session) -> None:
+    _, context, customer, _ = await _setup(session)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(ContactCreate(name="张三"), id="missing"),
+        pytest.param(ContactCreate(name="张三", function_id=None), id="none"),
+    ],
+)
+async def test_create_without_function_returns_7003(session, payload) -> None:
+    _, context, customer, _ = await _setup(session)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_contact(
+            session,
+            customer.id,
+            payload,
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+@pytest.mark.parametrize(
+    "field_name,value",
+    [
+        ("name", "x" * 256),
+        ("position", "x" * 129),
+        ("home_address", "x" * 513),
+    ],
+)
+async def test_create_overlong_field_returns_7003(
+    session,
+    field_name: str,
+    value: str,
+) -> None:
+    _, context, customer, shared = await _setup(session)
+    payload_values: dict[str, object] = {
+        "function_id": shared.id,
+        field_name: value,
+    }
+    if field_name != "name":
+        payload_values["name"] = "张三"
+    payload = ContactCreate(**payload_values)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_contact(
+            session,
+            customer.id,
+            payload,
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+@pytest.mark.parametrize(
+    "field_name,value",
+    [
+        ("position", "x" * 129),
+        ("home_address", "x" * 513),
+    ],
+)
+async def test_create_validates_fields_before_function_lock(
+    session,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    value: str,
+) -> None:
+    _, context, customer, shared = await _setup(session)
+
+    async def unexpected_lock(*args, **kwargs):
+        raise AssertionError("function lock must not be acquired")
+
+    monkeypatch.setattr(
+        contact_repository,
+        "lock_function_shared",
+        unexpected_lock,
+    )
+    payload = ContactCreate(
+        name="张三",
+        function_id=shared.id,
+        **{field_name: value},
+    )
+
+    with pytest.raises(BusinessError) as exc:
+        await create_contact(
+            session,
+            customer.id,
+            payload,
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+async def test_update_validates_fields_before_function_lock(
+    session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, context, customer, shared = await _setup(session)
+    contact = await add_contact(session, customer, shared, name="张三")
+
+    async def unexpected_lock(*args, **kwargs):
+        raise AssertionError("function lock must not be acquired")
+
+    monkeypatch.setattr(
+        contact_repository,
+        "lock_function_shared",
+        unexpected_lock,
+    )
+
+    with pytest.raises(BusinessError) as exc:
+        await update_contact(
+            session,
+            customer.id,
+            contact.id,
+            ContactUpdate(function_id=shared.id, position="x" * 129),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+async def test_empty_update_preserves_all_persisted_values(session) -> None:
+    _, context, customer, shared = await _setup(session)
+    contact = await create_contact(
+        session,
+        customer.id,
+        ContactCreate(
+            name="张三",
+            function_id=shared.id,
+            position="经理",
+            phone="13800138000",
+            email="zhangsan@example.com",
+            home_address="北京市",
+            remark="重点客户",
+        ),
+        context=context,
+    )
+    before = {
+        "name": contact.name,
+        "function_id": contact.function_id,
+        "position": contact.position,
+        "phone": contact.phone,
+        "email": contact.email,
+        "home_address": contact.home_address,
+        "remark": contact.remark,
+        "status": contact.status,
+    }
+
+    updated = await update_contact(
+        session,
+        customer.id,
+        contact.id,
+        ContactUpdate(),
+        context=context,
+    )
+
+    assert {
+        "name": updated.name,
+        "function_id": updated.function_id,
+        "position": updated.position,
+        "phone": updated.phone,
+        "email": updated.email,
+        "home_address": updated.home_address,
+        "remark": updated.remark,
+        "status": updated.status,
+    } == before
+
+
+async def test_update_blank_optional_fields_clears_them_to_none(session) -> None:
+    _, context, customer, shared = await _setup(session)
+    contact = await create_contact(
+        session,
+        customer.id,
+        ContactCreate(
+            name="张三",
+            function_id=shared.id,
+            position="经理",
+            phone="13800138000",
+            email="zhangsan@example.com",
+            home_address="北京市",
+            remark="重点客户",
+        ),
+        context=context,
+    )
+
+    updated = await update_contact(
+        session,
+        customer.id,
+        contact.id,
+        ContactUpdate(
+            position=" ",
+            phone="",
+            email=" ",
+            home_address=None,
+            remark="",
+        ),
+        context=context,
+    )
+
+    assert updated.position is None
+    assert updated.phone is None
+    assert updated.email is None
+    assert updated.home_address is None
+    assert updated.remark is None
 
 
 async def test_blank_optional_strings_are_stored_as_none(session) -> None:
@@ -331,7 +552,7 @@ async def test_list_is_paginated(session) -> None:
     assert all(contact.customer_id == customer.id for contact, _ in items)
 
 
-async def test_name_length_boundary(session) -> None:
+async def test_name_at_maximum_length_is_accepted(session) -> None:
     _, context, customer, shared = await _setup(session)
 
     created = await create_contact(
@@ -342,18 +563,3 @@ async def test_name_length_boundary(session) -> None:
     )
 
     assert len(created.name) == 255
-    with pytest.raises(ValidationError):
-        ContactCreate(name="x" * 256, function_id=shared.id)
-
-
-async def test_name_over_length_is_also_rejected_by_service(session) -> None:
-    _, context, customer, shared = await _setup(session)
-    payload = ContactCreate.model_construct(
-        name="x" * 256,
-        function_id=shared.id,
-    )
-
-    with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, payload, context=context)
-
-    assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD

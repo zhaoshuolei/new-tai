@@ -20,7 +20,6 @@ from app.models.contact import (
 from app.models.customer import Customer
 from app.repositories import contact as contact_repository
 from app.schemas.contact import ContactCreate, ContactUpdate
-from app.services import customer as customer_service
 from app.services.audit import audited
 from app.services.contact_validation import normalize_email, normalize_phone
 from app.services.data_scope import apply_customer_scope
@@ -739,7 +738,7 @@ async def list_contacts(
     page: int,
     page_size: int,
 ) -> tuple[list[tuple[CustomerContact, ContactFunction]], int]:
-    await customer_service._require_scoped_customer(session, customer_id, context)
+    await _require_visible_active_customer(session, customer_id, context)
     return await contact_repository.list_contacts(
         session,
         customer_id,
@@ -761,16 +760,14 @@ async def create_contact(
     *,
     context: AuthContext,
 ) -> CustomerContact:
-    await customer_service._require_scoped_customer(session, customer_id, context)
+    await _require_visible_active_customer(session, customer_id, context)
 
     changes: dict[str, object] = payload.model_dump()
     function_id = changes.pop("function_id")
-    await _assert_contact_function_usable(
-        session,
-        customer_id,
-        function_id if isinstance(function_id, int) else None,
-    )
     changes = _validate_contact_fields(changes)
+    if not isinstance(function_id, int):
+        raise _invalid_contact_field_error("Contact function is required")
+    await _assert_contact_function_usable(session, customer_id, function_id)
 
     contact = CustomerContact(
         customer_id=customer_id,
@@ -798,19 +795,17 @@ async def update_contact(
     *,
     context: AuthContext,
 ) -> CustomerContact:
-    await customer_service._require_scoped_customer(session, customer_id, context)
+    await _require_visible_active_customer(session, customer_id, context)
     contact = await _require_active_contact(session, customer_id, contact_id)
     changes: dict[str, object] = payload.model_dump(exclude_unset=True)
+    changes = _validate_contact_fields(changes)
 
     if "function_id" in changes:
         function_id = changes["function_id"]
-        await _assert_contact_function_usable(
-            session,
-            customer_id,
-            function_id if isinstance(function_id, int) else None,
-        )
+        if not isinstance(function_id, int):
+            raise _invalid_contact_field_error("Contact function is required")
+        await _assert_contact_function_usable(session, customer_id, function_id)
 
-    changes = _validate_contact_fields(changes)
     for field_name, value in changes.items():
         setattr(contact, field_name, value)
 
@@ -832,7 +827,7 @@ async def delete_contact(
     *,
     context: AuthContext,
 ) -> None:
-    await customer_service._require_scoped_customer(session, customer_id, context)
+    await _require_visible_active_customer(session, customer_id, context)
     contact = await _require_active_contact(session, customer_id, contact_id)
 
     contact.status = ContactStatus.DELETED
@@ -854,7 +849,7 @@ async def restore_contact(
     *,
     context: AuthContext,
 ) -> CustomerContact:
-    await customer_service._require_scoped_customer(session, customer_id, context)
+    await _require_visible_active_customer(session, customer_id, context)
     contact = await contact_repository.get_contact(session, customer_id, contact_id)
     if contact is None:
         raise _contact_not_found_error()

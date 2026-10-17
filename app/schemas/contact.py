@@ -1,19 +1,19 @@
 """客户对接人请求模型。"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class ContactCreate(BaseModel):
-    """新增客户对接人。"""
+    """新增客户对接人；业务字段由服务层校验并返回 7003。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=255)
-    function_id: int
-    position: str | None = Field(default=None, max_length=128)
-    phone: str | None = Field(default=None, max_length=32)
-    email: str | None = Field(default=None, max_length=255)
-    home_address: str | None = Field(default=None, max_length=512)
+    name: str | None = None
+    function_id: int | None = None
+    position: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    home_address: str | None = None
     remark: str | None = None
 
 
@@ -22,12 +22,12 @@ class ContactUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str | None = Field(default=None, min_length=1, max_length=255)
+    name: str | None = None
     function_id: int | None = None
-    position: str | None = Field(default=None, max_length=128)
-    phone: str | None = Field(default=None, max_length=32)
-    email: str | None = Field(default=None, max_length=255)
-    home_address: str | None = Field(default=None, max_length=512)
+    position: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    home_address: str | None = None
     remark: str | None = None
 
 
