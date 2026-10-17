@@ -20,6 +20,7 @@ from app.services.department import (
     delete_department,
     get_tree,
     list_subtree_ids,
+    restore_department,
     update_department,
 )
 
@@ -119,6 +120,49 @@ async def test_get_tree_nests_children(session: AsyncSession) -> None:
     assert [node.id for node in root_node.children] == [child.id]
 
 
+async def test_delete_department_locks_department_before_guards(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    department = await create_department(session, DepartmentCreate(name="总部"))
+    original_lock = department_repository.lock_by_id
+    original_has_children = department_repository.has_children
+    events: list[str] = []
+
+    async def record_lock(
+        lock_session: AsyncSession,
+        department_id: int,
+        *,
+        for_share: bool = False,
+        include_deleted: bool = False,
+    ) -> Department | None:
+        events.append("lock")
+        return await original_lock(
+            lock_session,
+            department_id,
+            for_share=for_share,
+            include_deleted=include_deleted,
+        )
+
+    async def record_has_children(
+        check_session: AsyncSession,
+        department_id: int,
+    ) -> bool:
+        events.append("has_children")
+        return await original_has_children(check_session, department_id)
+
+    monkeypatch.setattr(department_repository, "lock_by_id", record_lock)
+    monkeypatch.setattr(
+        department_repository,
+        "has_children",
+        record_has_children,
+    )
+
+    await delete_department(session, department.id)
+
+    assert events == ["lock", "has_children"]
+
+
 async def test_delete_department_with_children_returns_5001(
     session: AsyncSession,
 ) -> None:
@@ -162,6 +206,44 @@ async def test_delete_department_without_users_succeeds(
     await delete_department(session, department.id)
 
     assert await department_repository.get_by_id(session, department.id) is None
+
+
+async def test_restore_department_locks_target_and_parent(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = await create_department(session, DepartmentCreate(name="总部"))
+    child = await create_department(
+        session,
+        DepartmentCreate(name="研发部", parent_id=parent.id),
+    )
+    await delete_department(session, child.id)
+    original_lock = department_repository.lock_by_id
+    lock_calls: list[tuple[int, bool, bool]] = []
+
+    async def record_lock(
+        lock_session: AsyncSession,
+        department_id: int,
+        *,
+        for_share: bool = False,
+        include_deleted: bool = False,
+    ) -> Department | None:
+        lock_calls.append((department_id, for_share, include_deleted))
+        return await original_lock(
+            lock_session,
+            department_id,
+            for_share=for_share,
+            include_deleted=include_deleted,
+        )
+
+    monkeypatch.setattr(department_repository, "lock_by_id", record_lock)
+
+    await restore_department(session, child.id)
+
+    assert lock_calls == [
+        (child.id, False, True),
+        (parent.id, True, False),
+    ]
 
 
 async def test_system_department_cannot_be_renamed_or_deleted(

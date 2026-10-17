@@ -38,6 +38,22 @@ def _username_exists_error() -> BusinessError:
     )
 
 
+def _identity_exists_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CONFLICT,
+        "Feishu identity already exists",
+        http_status=409,
+    )
+
+
+def _restore_reference_error(message: str) -> BusinessError:
+    return BusinessError(
+        ErrorCode.CONFLICT,
+        message,
+        http_status=409,
+    )
+
+
 def _validate_local_password(password: str) -> None:
     try:
         validate_password_policy(password)
@@ -108,8 +124,19 @@ async def _get_scoped_user(
     session: AsyncSession,
     user_id: int,
     context: AuthContext,
+    *,
+    deleted: bool = False,
 ) -> User | None:
-    statement = apply_user_scope(select(User).where(User.id == user_id), context)
+    deletion_filter = (
+        User.deleted_at.is_not(None) if deleted else User.deleted_at.is_(None)
+    )
+    statement = apply_user_scope(
+        select(User).where(
+            User.id == user_id,
+            deletion_filter,
+        ),
+        context,
+    )
     user = await session.scalar(statement)
     return user if isinstance(user, User) else None
 
@@ -134,8 +161,14 @@ async def _get_writable_user(
     session: AsyncSession,
     user_id: int,
     context: AuthContext,
+    *,
+    for_update: bool = False,
 ) -> User:
-    user = await user_repository.get_by_id(session, user_id)
+    user = (
+        await user_repository.lock_by_id(session, user_id)
+        if for_update
+        else await user_repository.get_by_id(session, user_id)
+    )
     if user is None:
         raise BusinessError(
             ErrorCode.USER_NOT_FOUND,
@@ -194,6 +227,21 @@ async def list_users(
     )
 
 
+async def list_deleted_users(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+    page: int,
+    page_size: int,
+) -> tuple[list[User], int]:
+    return await user_repository.list_deleted_users(
+        session,
+        page=page,
+        page_size=page_size,
+        scope_filter=build_user_scope_filter(context),
+    )
+
+
 @audited(action="user:update", resource_type="user", resource_id_param="user_id")
 async def update_user(
     session: AsyncSession,
@@ -226,7 +274,11 @@ async def assign_user_role(
 
     target_role: Role | None = None
     if payload.role_id is not None:
-        target_role = await role_repository.get_by_id(session, payload.role_id)
+        target_role = await role_repository.lock_by_id(
+            session,
+            payload.role_id,
+            for_share=True,
+        )
         if target_role is None:
             raise BusinessError(
                 ErrorCode.ROLE_NOT_FOUND,
@@ -265,9 +317,10 @@ async def assign_user_department(
     authorization_service.assert_not_self(context, user)
 
     if payload.department_id is not None:
-        department = await department_repository.get_by_id(
+        department = await department_repository.lock_by_id(
             session,
             payload.department_id,
+            for_share=True,
         )
         if department is None:
             raise BusinessError(
@@ -352,7 +405,12 @@ async def delete_user(
     context: AuthContext,
     redis: Redis | None = None,
 ) -> None:
-    user = await _get_writable_user(session, user_id, context)
+    user = await _get_writable_user(
+        session,
+        user_id,
+        context,
+        for_update=True,
+    )
     authorization_service.assert_not_self(context, user)
     current_role = await _get_current_role(session, user)
     await authorization_service.assert_can_revoke_super_admin(
@@ -370,27 +428,101 @@ async def delete_user(
             http_status=409,
         )
 
-    # 在 SAVEPOINT 内删除：预检查与删除之间存在 TOCTOU 竞争，并发的客户插入/转移
-    # 可能在此用户下新建客户，导致 owner_user_id 外键 RESTRICT 触发裸 IntegrityError。
-    # 捕获后复核归属并转为业务错误，同时回滚会让会话保持可用。
     try:
         async with session.begin_nested():
-            await user_repository.delete(session, user)
+            await user_repository.soft_delete(
+                session,
+                user,
+                deleted_by=context.user_id,
+            )
+            await session.flush()
+            if await customer_repository.has_customers_for_update(session, user_id):
+                raise BusinessError(
+                    ErrorCode.USER_HAS_CUSTOMERS,
+                    "User still owns customers; transfer those customers first",
+                    http_status=409,
+                )
+    except BusinessError:
+        await session.refresh(user)
+        raise
+    await _commit_user_security_change(session, user_id, redis)
+
+
+@audited(
+    action="user:restore",
+    resource_type="user",
+    resource_id_param="user_id",
+)
+async def restore_user(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    context: AuthContext,
+    redis: Redis | None = None,
+) -> User:
+    user = await _get_scoped_user(session, user_id, context, deleted=True)
+    if user is None:
+        raise BusinessError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found",
+            http_status=404,
+        )
+    restored_role: Role | None = None
+    if user.role_id is not None:
+        restored_role = await role_repository.lock_by_id(
+            session,
+            user.role_id,
+            for_share=True,
+        )
+        if restored_role is None:
+            raise _restore_reference_error("Assigned role is unavailable")
+        authorization_service.assert_can_manage_super_admin_role(
+            context,
+            restored_role,
+        )
+    if user.department_id is not None:
+        restored_department = await department_repository.lock_by_id(
+            session,
+            user.department_id,
+            for_share=True,
+        )
+        if restored_department is None:
+            raise _restore_reference_error("Assigned department is unavailable")
+
+    username = user.username
+    feishu_open_id = user.feishu_open_id
+    if username is not None:
+        existing = await user_repository.get_by_username(session, username)
+        if existing is not None and existing.id != user.id:
+            raise _username_exists_error()
+    if feishu_open_id is not None:
+        existing = await user_repository.get_by_feishu_open_id(
+            session,
+            feishu_open_id,
+        )
+        if existing is not None and existing.id != user.id:
+            raise _identity_exists_error()
+
+    try:
+        async with session.begin_nested():
+            await user_repository.restore(session, user)
+            await session.flush()
     except IntegrityError as error:
-        if await customer_repository.has_customers_for_update(session, user_id):
-            raise BusinessError(
-                ErrorCode.USER_HAS_CUSTOMERS,
-                "User still owns customers; transfer those customers first",
-                http_status=409,
-            ) from error
+        message = str(error.orig).lower()
+        if _is_duplicate_username(error):
+            if "active_username" in message or "user.username" in message:
+                raise _username_exists_error() from error
+            if "active_feishu_open_id" in message or "user.feishu_open_id" in message:
+                raise _identity_exists_error() from error
+            if username is not None:
+                raise _username_exists_error() from error
+            if feishu_open_id is not None:
+                raise _identity_exists_error() from error
         raise
 
-    await _commit_user_security_change(
-        session,
-        user_id,
-        redis,
-        increment_token_version=False,
-    )
+    await _commit_user_security_change(session, user.id, redis)
+    await session.refresh(user)
+    return user
 
 
 __all__: tuple[str, ...] = (
@@ -399,8 +531,10 @@ __all__: tuple[str, ...] = (
     "create_local_user",
     "delete_user",
     "get_user",
+    "list_deleted_users",
     "list_users",
     "reset_user_password",
+    "restore_user",
     "update_user",
     "update_user_status",
 )

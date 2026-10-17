@@ -307,6 +307,45 @@ async def test_lock_role_by_id_uses_for_update_query() -> None:
     assert "FOR UPDATE" in compiled
 
 
+async def test_delete_role_locks_role_before_in_use_check(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = await create_role(session, RoleCreate(code="operator", name="运营"))
+    original_lock = role_repository.lock_by_id
+    original_has_users = role_repository.has_users
+    events: list[str] = []
+
+    async def record_lock(
+        lock_session: AsyncSession,
+        role_id: int,
+        *,
+        for_share: bool = False,
+        include_deleted: bool = False,
+    ) -> Role | None:
+        events.append("lock")
+        return await original_lock(
+            lock_session,
+            role_id,
+            for_share=for_share,
+            include_deleted=include_deleted,
+        )
+
+    async def record_has_users(
+        check_session: AsyncSession,
+        role_id: int,
+    ) -> bool:
+        events.append("has_users")
+        return await original_has_users(check_session, role_id)
+
+    monkeypatch.setattr(role_repository, "lock_by_id", record_lock)
+    monkeypatch.setattr(role_repository, "has_users", record_has_users)
+
+    await delete_role(session, role.id, context=ROLE_PERMISSION_CONTEXT)
+
+    assert events == ["lock", "has_users"]
+
+
 async def test_assign_menus_locks_role_before_replacement(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,6 +402,32 @@ async def test_assign_menus_maps_deadlock_to_conflict(
     assert error.value.code == ErrorCode.CONFLICT
     assert error.value.http_status == 409
     assert "稍后重试" in error.value.message
+
+
+async def test_create_role_maps_active_code_duplicate_to_code_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def duplicate(
+        _session: AsyncSession,
+        _role: Role,
+    ) -> Role:
+        raise IntegrityError(
+            "INSERT",
+            {},
+            Exception(
+                1062,
+                "Duplicate entry 'operator' for key 'role.ix_role_active_code'",
+            ),
+        )
+
+    monkeypatch.setattr(role_repository, "add", duplicate)
+
+    with pytest.raises(BusinessError) as error:
+        await create_role(session, RoleCreate(code="operator", name="运营"))
+
+    assert error.value.code == ErrorCode.CONFLICT
+    assert error.value.message == "Role code already exists"
 
 
 async def test_assign_menus_maps_duplicate_key_to_conflict(

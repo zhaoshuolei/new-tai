@@ -79,6 +79,33 @@ async def create_user(
 
 
 @router.get(
+    "/recycle-bin",
+    response_model=SuccessEnvelope[Page[UserRead]],
+    dependencies=[Depends(require_permission("user:delete"))],
+)
+async def list_deleted_users(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 20,
+) -> dict[str, Any]:
+    users, total = await user_service.list_deleted_users(
+        session,
+        context=context,
+        page=page,
+        page_size=page_size,
+    )
+    return success(
+        Page[UserRead](
+            items=[UserRead.model_validate(user) for user in users],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+    )
+
+
+@router.get(
     "/{user_id}",
     response_model=SuccessEnvelope[UserRead],
     dependencies=[Depends(require_permission("user:read"))],
@@ -130,6 +157,26 @@ async def delete_user(
         redis=redis,
     )
     return success(message="deleted")
+
+
+@router.post(
+    "/{user_id}/restore",
+    response_model=SuccessEnvelope[UserRead],
+    dependencies=[Depends(require_permission("user:delete"))],
+)
+async def restore_user(
+    user_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> dict[str, Any]:
+    user = await user_service.restore_user(
+        session,
+        user_id,
+        context=context,
+        redis=redis,
+    )
+    return success(UserRead.model_validate(user))
 
 
 @router.patch(
@@ -239,6 +286,12 @@ register_audit_route(
     resource_type="user",
 )
 register_audit_route(
+    "POST",
+    "/users/{user_id}/restore",
+    action="user:restore",
+    resource_type="user",
+)
+register_audit_route(
     "PATCH",
     "/users/{user_id}/role",
     action="user:assign",
@@ -270,8 +323,10 @@ __all__: tuple[str, ...] = (
     "create_user",
     "delete_user",
     "get_user",
+    "list_deleted_users",
     "list_users",
     "reset_user_password",
+    "restore_user",
     "router",
     "update_user",
     "update_user_status",

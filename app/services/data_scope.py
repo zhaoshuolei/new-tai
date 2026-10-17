@@ -27,6 +27,7 @@ def _current_department_is_business(department_id: int) -> ColumnElement[bool]:
         .where(
             Department.id == department_id,
             Department.is_system.is_(False),
+            Department.deleted_at.is_(None),
         )
         .exists()
     )
@@ -38,6 +39,7 @@ def _current_department_path(department_id: int) -> Any:
         .where(
             Department.id == department_id,
             Department.is_system.is_(False),
+            Department.deleted_at.is_(None),
         )
         .scalar_subquery()
     )
@@ -58,6 +60,7 @@ def _custom_subtree_condition(
             .where(
                 Department.id == department_id,
                 Department.is_system.is_(False),
+                Department.deleted_at.is_(None),
             )
             .scalar_subquery()
         )
@@ -121,6 +124,7 @@ def build_scope_filter(
                 select(Department.id).where(
                     Department.id.in_(ctx.custom_department_ids),
                     Department.is_system.is_(False),
+                    Department.deleted_at.is_(None),
                 )
             )
         return and_(current_department_is_business, condition)

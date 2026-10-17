@@ -38,6 +38,20 @@ async def get_department_tree(
     return success(tree)
 
 
+@router.get(
+    "/recycle-bin",
+    response_model=SuccessEnvelope[list[DepartmentNode]],
+    dependencies=[Depends(require_permission("dept:delete"))],
+)
+async def list_deleted_departments(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    departments = await department_service.list_deleted_departments(session)
+    return success(
+        [DepartmentNode.model_validate(department) for department in departments]
+    )
+
+
 @router.post(
     "",
     response_model=SuccessEnvelope[DepartmentNode],
@@ -118,6 +132,24 @@ async def delete_department(
     return success(message="deleted")
 
 
+@router.post(
+    "/{department_id}/restore",
+    response_model=SuccessEnvelope[DepartmentNode],
+    dependencies=[Depends(require_permission("dept:delete"))],
+)
+async def restore_department(
+    department_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    department = await department_service.restore_department(
+        session,
+        department_id,
+        context=context,
+    )
+    return success(DepartmentNode.model_validate(department))
+
+
 register_audit_route(
     "POST",
     "/departments",
@@ -142,13 +174,21 @@ register_audit_route(
     action="dept:delete",
     resource_type="department",
 )
+register_audit_route(
+    "POST",
+    "/departments/{department_id}/restore",
+    action="dept:restore",
+    resource_type="department",
+)
 
 
 __all__: tuple[str, ...] = (
     "create_department",
     "delete_department",
     "get_department_tree",
+    "list_deleted_departments",
     "move_department",
+    "restore_department",
     "router",
     "update_department",
 )

@@ -34,6 +34,18 @@ async def get_menu_tree(
     return success(tree)
 
 
+@router.get(
+    "/recycle-bin",
+    response_model=SuccessEnvelope[list[MenuNode]],
+    dependencies=[Depends(require_permission("menu:delete"))],
+)
+async def list_deleted_menus(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    menus = await menu_service.list_deleted_menus(session)
+    return success([MenuNode.model_validate(menu) for menu in menus])
+
+
 @router.post(
     "",
     response_model=SuccessEnvelope[MenuNode],
@@ -86,6 +98,20 @@ async def delete_menu(
     return success(message="deleted")
 
 
+@router.post(
+    "/{menu_id}/restore",
+    response_model=SuccessEnvelope[MenuNode],
+    dependencies=[Depends(require_permission("menu:delete"))],
+)
+async def restore_menu(
+    menu_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    menu = await menu_service.restore_menu(session, menu_id, context=context)
+    return success(MenuNode.model_validate(menu))
+
+
 @me_router.get(
     "/permissions",
     response_model=SuccessEnvelope[list[str]],
@@ -130,6 +156,12 @@ register_audit_route(
     action="menu:delete",
     resource_type="menu",
 )
+register_audit_route(
+    "POST",
+    "/menus/{menu_id}/restore",
+    action="menu:restore",
+    resource_type="menu",
+)
 
 
 __all__: tuple[str, ...] = (
@@ -138,7 +170,9 @@ __all__: tuple[str, ...] = (
     "get_menu_tree",
     "get_my_menus",
     "get_my_permissions",
+    "list_deleted_menus",
     "me_router",
+    "restore_menu",
     "router",
     "update_menu",
 )

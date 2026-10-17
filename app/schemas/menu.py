@@ -1,6 +1,7 @@
 """菜单请求与响应模型。"""
 
 import re
+from datetime import datetime
 from typing import Annotated
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
@@ -70,6 +71,8 @@ class MenuNode(BaseModel):
     sort_order: int
     visible: bool
     status: MenuStatus
+    deleted_at: datetime | None = None
+    deleted_by: int | None = None
     children: list[MenuNode] = Field(default_factory=list)
 
 

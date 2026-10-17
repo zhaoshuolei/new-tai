@@ -1,5 +1,6 @@
 """部门请求与响应模型。"""
 
+from datetime import datetime
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -49,6 +50,8 @@ class DepartmentNode(BaseModel):
     sort_order: int
     status: DepartmentStatus
     is_system: bool
+    deleted_at: datetime | None = None
+    deleted_by: int | None = None
     children: list[DepartmentNode] = Field(default_factory=list)
 
 

@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Enum, ForeignKey, Integer, String
+from sqlalchemy import BigInteger, Computed, Enum, ForeignKey, Integer, String
 from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,12 +21,26 @@ class User(Base):
     feishu_open_id: Mapped[str | None] = mapped_column(
         String(128),
         nullable=True,
+    )
+    active_feishu_open_id: Mapped[str | None] = mapped_column(
+        String(128),
+        Computed(
+            "CASE WHEN deleted_at IS NULL THEN feishu_open_id END",
+            persisted=True,
+        ),
         unique=True,
         index=True,
     )
     username: Mapped[str | None] = mapped_column(
         String(100),
         nullable=True,
+    )
+    active_username: Mapped[str | None] = mapped_column(
+        String(100),
+        Computed(
+            "CASE WHEN deleted_at IS NULL THEN username END",
+            persisted=True,
+        ),
         unique=True,
         index=True,
     )
@@ -66,6 +80,12 @@ class User(Base):
         DATETIME(fsp=6),
         nullable=True,
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DATETIME(fsp=6),
+        nullable=True,
+        index=True,
+    )
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 __all__: tuple[str, ...] = ("User", "UserStatus")

@@ -1,5 +1,7 @@
 """角色请求与响应模型。"""
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.role import DataScope, RoleStatus
@@ -54,6 +56,8 @@ class RoleRead(BaseModel):
     data_scope_include_children: bool
     is_system: bool
     status: RoleStatus
+    deleted_at: datetime | None = None
+    deleted_by: int | None = None
 
 
 __all__: tuple[str, ...] = (

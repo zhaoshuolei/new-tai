@@ -406,7 +406,10 @@ async def _get_feishu_user_by_open_id(
     open_id: str,
 ) -> User | None:
     """按飞书 open_id 查询本系统用户，供首次登录与竞争恢复复用。"""
-    statement = select(User).where(User.feishu_open_id == open_id)
+    statement = select(User).where(
+        User.feishu_open_id == open_id,
+        User.deleted_at.is_(None),
+    )
     return await session.scalar(statement)
 
 

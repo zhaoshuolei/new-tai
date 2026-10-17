@@ -63,9 +63,11 @@ class UserRead(BaseModel):
     status: UserStatus
     token_version: int
     last_login_at: datetime | None
+    deleted_at: datetime | None = None
+    deleted_by: int | None = None
 
-    @field_serializer("last_login_at", when_used="json")
-    def serialize_last_login_at(self, value: datetime | None) -> str | None:
+    @field_serializer("last_login_at", "deleted_at", when_used="json")
+    def serialize_datetime(self, value: datetime | None) -> str | None:
         if value is None:
             return None
         utc_value = value.replace(tzinfo=UTC) if value.tzinfo is None else value

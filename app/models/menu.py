@@ -1,16 +1,19 @@
 """菜单领域模型。"""
 
+from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Computed,
     Enum,
     ForeignKey,
     Integer,
     String,
     true,
 )
+from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -51,6 +54,13 @@ class Menu(Base):
     permission_code: Mapped[str | None] = mapped_column(
         String(100),
         nullable=True,
+    )
+    active_permission_code: Mapped[str | None] = mapped_column(
+        String(100),
+        Computed(
+            "CASE WHEN deleted_at IS NULL THEN permission_code END",
+            persisted=True,
+        ),
         unique=True,
         index=True,
     )
@@ -76,6 +86,12 @@ class Menu(Base):
         default=MenuStatus.ACTIVE,
         server_default=MenuStatus.ACTIVE.value,
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DATETIME(fsp=6),
+        nullable=True,
+        index=True,
+    )
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 __all__: tuple[str, ...] = ("Menu", "MenuStatus", "MenuType")

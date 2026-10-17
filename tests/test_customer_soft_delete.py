@@ -361,6 +361,31 @@ async def test_transfer_deleted_customer_keeps_deleted_status(
     assert moved.status == ContactStatus.DELETED
 
 
+async def test_transfer_to_soft_deleted_user_is_rejected(
+    session: AsyncSession,
+    fake_redis: FakeRedis,
+) -> None:
+    owner = await make_user(session)
+    target = await make_user(session)
+    customer = await make_customer_row(session, owner=owner)
+    await delete_user(
+        session,
+        target.id,
+        context=make_context(owner, is_super_admin=True),
+        redis=fake_redis,
+    )
+
+    with pytest.raises(BusinessError) as exc:
+        await transfer_owner(
+            session,
+            customer.id,
+            target.id,
+            context=make_context(owner, permission_codes={"customer:update"}),
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_OWNER_UNAVAILABLE
+
+
 async def test_super_admin_can_transfer_deleted_customer(
     session: AsyncSession,
 ) -> None:
@@ -406,7 +431,9 @@ async def test_user_with_deleted_customer_blocked_until_transferred(
         redis=fake_redis,
     )
     remaining = await session.scalar(select(User).where(User.id == owner.id))
-    assert remaining is None
+    assert remaining is not None
+    assert remaining.deleted_at is not None
+    assert remaining.deleted_by == heir.id
 
 
 async def test_recycle_bin_lists_only_deleted_within_scope(

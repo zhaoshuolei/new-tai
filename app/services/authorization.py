@@ -173,7 +173,9 @@ async def assert_super_admin_remains(
             Role.code == "super_admin",
             Role.is_system.is_(True),
             Role.status == RoleStatus.ACTIVE,
+            Role.deleted_at.is_(None),
             User.status == UserStatus.ACTIVE,
+            User.deleted_at.is_(None),
         )
         .with_for_update()
     )

@@ -35,7 +35,8 @@ TEST_DATABASE_URL = os.environ.get(
 EXPECTED_USER_DEPT_SQL = (
     "(EXISTS (SELECT department.id \n"
     "FROM department \n"
-    "WHERE department.id = 3 AND department.is_system IS false)) "
+    "WHERE department.id = 3 AND department.is_system IS false "
+    "AND department.deleted_at IS NULL)) "
     'AND "user".department_id = 3'
 )
 

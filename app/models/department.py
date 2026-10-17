@@ -1,5 +1,6 @@
 """部门领域模型。"""
 
+from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
@@ -11,6 +12,7 @@ from sqlalchemy import (
     String,
     false,
 )
+from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -54,6 +56,12 @@ class Department(Base):
         default=False,
         server_default=false(),
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DATETIME(fsp=6),
+        nullable=True,
+        index=True,
+    )
+    deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 __all__: tuple[str, ...] = ("Department", "DepartmentStatus")

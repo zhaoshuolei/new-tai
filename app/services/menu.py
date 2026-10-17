@@ -37,6 +37,30 @@ async def _collect_ancestor_ids(
         current_id = menu.parent_id
 
 
+async def _collect_restore_candidate_ids(
+    session: AsyncSession,
+    menu_id: int,
+) -> set[int]:
+    candidate_ids = {menu_id}
+    menu = await menu_repository.get_by_id(
+        session,
+        menu_id,
+        include_deleted=True,
+    )
+    parent_id = menu.parent_id if menu is not None else None
+    visited: set[int] = set()
+    while parent_id is not None and parent_id not in visited:
+        visited.add(parent_id)
+        candidate_ids.add(parent_id)
+        parent = await menu_repository.get_by_id(
+            session,
+            parent_id,
+            include_deleted=True,
+        )
+        parent_id = parent.parent_id if parent is not None else None
+    return candidate_ids
+
+
 async def _lock_menu_candidates(
     session: AsyncSession,
     root_ids: set[int],
@@ -412,8 +436,64 @@ async def delete_menu(
                 "Menu has children",
             )
 
-        await session.delete(menu)
+        async with session.begin_nested():
+            await menu_repository.soft_delete(
+                session,
+                menu,
+                deleted_by=context.user_id if context is not None else None,
+            )
+            await session.flush()
+            if await menu_repository.has_children(session, menu_id):
+                raise BusinessError(
+                    ErrorCode.INVALID_MENU_HIERARCHY,
+                    "Menu has children",
+                )
         await session.commit()
+
+
+@audited(action="menu:restore", resource_type="menu", resource_id_param="menu_id")
+async def restore_menu(
+    session: AsyncSession,
+    menu_id: int,
+    *,
+    context: AuthContext | None = None,
+) -> Menu:
+    async with _map_menu_write_errors(session):
+        candidate_ids = await _collect_restore_candidate_ids(session, menu_id)
+        locked = await menu_repository.lock_menu_nodes(
+            session,
+            candidate_ids,
+            include_deleted=True,
+        )
+        menu = locked.get(menu_id)
+        if menu is None or menu.deleted_at is None:
+            raise BusinessError(
+                ErrorCode.RECORD_NOT_DELETED,
+                "Menu is not deleted",
+                http_status=409,
+            )
+        parent = locked.get(menu.parent_id) if menu.parent_id is not None else None
+        if menu.parent_id is not None:
+            if parent is None or parent.deleted_at is not None:
+                raise BusinessError(
+                    ErrorCode.MENU_NOT_FOUND,
+                    "Parent menu is unavailable",
+                    http_status=409,
+                )
+            _validate_parent(menu.type, parent)
+        await _ensure_permission_code_available(
+            session,
+            menu.permission_code,
+            exclude_id=menu.id,
+        )
+        await menu_repository.restore(session, menu)
+        await session.commit()
+        await session.refresh(menu)
+        return menu
+
+
+async def list_deleted_menus(session: AsyncSession) -> list[Menu]:
+    return await menu_repository.list_deleted(session)
 
 
 async def list_enabled_permission_codes(
@@ -434,6 +514,8 @@ __all__: tuple[str, ...] = (
     "delete_menu",
     "get_menu_tree",
     "get_visible_menu_tree",
+    "list_deleted_menus",
     "list_enabled_permission_codes",
+    "restore_menu",
     "update_menu",
 )

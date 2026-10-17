@@ -17,6 +17,7 @@ from app.models.contact import ContactStatus
 from app.models.customer import Customer, CustomerSource
 from app.models.user import User, UserStatus
 from app.repositories import customer as customer_repository
+from app.repositories import user as user_repository
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services.audit import audited
 from app.services.customer_scope_text import (
@@ -608,12 +609,18 @@ async def transfer_owner(
     ):
         raise _forbidden_error()
 
-    target = await session.get(User, owner_user_id)
+    target = await user_repository.lock_by_id(session, owner_user_id)
     if target is None or target.status != UserStatus.ACTIVE:
         raise _owner_unavailable_error()
 
     visible = await session.scalar(
-        apply_user_scope(select(User.id).where(User.id == owner_user_id), context)
+        apply_user_scope(
+            select(User.id).where(
+                User.id == owner_user_id,
+                User.deleted_at.is_(None),
+            ),
+            context,
+        )
     )
     if visible is None:
         raise _owner_unavailable_error()

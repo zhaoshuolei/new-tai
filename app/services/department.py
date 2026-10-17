@@ -1,6 +1,5 @@
 """部门树业务逻辑。"""
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
@@ -15,21 +14,28 @@ from app.schemas.department import (
 from app.services.audit import audited
 
 
-def _is_delete_fk_error(error: IntegrityError, table_name: str) -> bool:
-    args = getattr(error.orig, "args", ())
-    return bool(
-        args
-        and args[0] == 1451
-        and "foreign key" in str(error.orig).lower()
-        and f"`{table_name}`" in str(error.orig).lower()
-    )
-
-
 async def _require_department(
     session: AsyncSession,
     department_id: int,
+    *,
+    for_share: bool = False,
+    for_update: bool = False,
+    include_deleted: bool = False,
 ) -> Department:
-    department = await department_repository.get_by_id(session, department_id)
+    department = (
+        await department_repository.lock_by_id(
+            session,
+            department_id,
+            for_share=for_share,
+            include_deleted=include_deleted,
+        )
+        if for_share or for_update
+        else await department_repository.get_by_id(
+            session,
+            department_id,
+            include_deleted=include_deleted,
+        )
+    )
     if department is None:
         raise BusinessError(
             ErrorCode.DEPT_NOT_FOUND,
@@ -48,7 +54,11 @@ async def create_department(
 ) -> Department:
     parent: Department | None = None
     if payload.parent_id is not None:
-        parent = await _require_department(session, payload.parent_id)
+        parent = await _require_department(
+            session,
+            payload.parent_id,
+            for_share=True,
+        )
         if parent.status == DepartmentStatus.DISABLED:
             raise BusinessError(
                 ErrorCode.INVALID_PARAMETER,
@@ -145,7 +155,11 @@ async def update_department(
     *,
     context: AuthContext | None = None,
 ) -> Department:
-    department = await _require_department(session, department_id)
+    department = await _require_department(
+        session,
+        department_id,
+        for_update=True,
+    )
     if department.is_system:
         raise BusinessError(
             ErrorCode.SYSTEM_DEPT_IMMUTABLE,
@@ -168,7 +182,11 @@ async def move_department(
     *,
     context: AuthContext | None = None,
 ) -> Department:
-    department = await _require_department(session, dept_id)
+    department = await _require_department(
+        session,
+        dept_id,
+        for_update=True,
+    )
     if department.is_system:
         raise BusinessError(
             ErrorCode.SYSTEM_DEPT_IMMUTABLE,
@@ -177,7 +195,11 @@ async def move_department(
 
     parent: Department | None = None
     if new_parent_id is not None:
-        parent = await _require_department(session, new_parent_id)
+        parent = await _require_department(
+            session,
+            new_parent_id,
+            for_share=True,
+        )
 
     if new_parent_id == dept_id:
         raise BusinessError(
@@ -223,7 +245,11 @@ async def delete_department(
     *,
     context: AuthContext | None = None,
 ) -> None:
-    department = await _require_department(session, department_id)
+    department = await _require_department(
+        session,
+        department_id,
+        for_update=True,
+    )
     if department.is_system:
         raise BusinessError(
             ErrorCode.SYSTEM_DEPT_IMMUTABLE,
@@ -249,23 +275,74 @@ async def delete_department(
             http_status=409,
         )
 
-    await session.delete(department)
-    try:
-        await session.commit()
-    except IntegrityError as error:
-        await session.rollback()
-        if _is_delete_fk_error(error, "user"):
+    await department_repository.soft_delete(
+        session,
+        department,
+        deleted_by=context.user_id if context is not None else None,
+    )
+    await session.commit()
+
+
+@audited(
+    action="dept:restore",
+    resource_type="department",
+    resource_id_param="department_id",
+)
+async def restore_department(
+    session: AsyncSession,
+    department_id: int,
+    *,
+    context: AuthContext | None = None,
+) -> Department:
+    department = await department_repository.lock_by_id(
+        session,
+        department_id,
+        include_deleted=True,
+    )
+    if department is None or department.deleted_at is None:
+        raise BusinessError(
+            ErrorCode.RECORD_NOT_DELETED,
+            "Department is not deleted",
+            http_status=409,
+        )
+    parent: Department | None = None
+    if department.parent_id is not None:
+        parent = await department_repository.lock_by_id(
+            session,
+            department.parent_id,
+            for_share=True,
+        )
+        if parent is None:
             raise BusinessError(
-                ErrorCode.DEPT_HAS_USERS,
-                "Department has users",
-            ) from error
-        if _is_delete_fk_error(error, "role_department"):
-            raise BusinessError(
-                ErrorCode.DEPT_REFERENCED_BY_ROLE,
-                "部门被角色自定义数据范围引用，无法删除",
+                ErrorCode.DEPT_NOT_FOUND,
+                "Parent department is unavailable",
                 http_status=409,
-            ) from error
-        raise
+            )
+        if parent.status == DepartmentStatus.DISABLED:
+            raise BusinessError(
+                ErrorCode.INVALID_PARAMETER,
+                "Cannot restore a department under a disabled department",
+            )
+    old_path = department.path
+    department.path = f"{parent.path if parent is not None else '/'}{department.id}/"
+    await department_repository.restore(session, department)
+    await session.flush()
+    if old_path != department.path:
+        await department_repository.cascade_path_prefix(
+            session,
+            old_prefix=old_path,
+            new_prefix=department.path,
+            exclude_id=department.id,
+        )
+    await session.commit()
+    await session.refresh(department)
+    return department
+
+
+async def list_deleted_departments(
+    session: AsyncSession,
+) -> list[Department]:
+    return await department_repository.list_deleted(session)
 
 
 async def list_subtree_ids(
@@ -284,7 +361,9 @@ __all__: tuple[str, ...] = (
     "create_department",
     "delete_department",
     "get_tree",
+    "list_deleted_departments",
     "list_subtree_ids",
     "move_department",
+    "restore_department",
     "update_department",
 )

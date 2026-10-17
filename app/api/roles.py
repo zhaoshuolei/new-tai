@@ -52,6 +52,18 @@ async def create_role(
 
 
 @router.get(
+    "/recycle-bin",
+    response_model=SuccessEnvelope[list[RoleRead]],
+    dependencies=[Depends(require_permission("role:delete"))],
+)
+async def list_deleted_roles(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    roles = await role_service.list_deleted_roles(session)
+    return success([RoleRead.model_validate(role) for role in roles])
+
+
+@router.get(
     "/{role_id}/assignments",
     response_model=SuccessEnvelope[RoleAssignmentsRead],
     dependencies=[Depends(require_permission("role:read"))],
@@ -115,6 +127,24 @@ async def delete_role(
     return success(message="deleted")
 
 
+@router.post(
+    "/{role_id}/restore",
+    response_model=SuccessEnvelope[RoleRead],
+    dependencies=[Depends(require_permission("role:delete"))],
+)
+async def restore_role(
+    role_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    role = await role_service.restore_role(
+        session,
+        role_id,
+        context=context,
+    )
+    return success(RoleRead.model_validate(role))
+
+
 @router.put(
     "/{role_id}/menus",
     response_model=SuccessEnvelope[RoleRead],
@@ -174,6 +204,12 @@ register_audit_route(
     resource_type="role",
 )
 register_audit_route(
+    "POST",
+    "/roles/{role_id}/restore",
+    action="role:restore",
+    resource_type="role",
+)
+register_audit_route(
     "PUT",
     "/roles/{role_id}/menus",
     action="role:assign",
@@ -193,7 +229,9 @@ __all__: tuple[str, ...] = (
     "delete_role",
     "get_role",
     "get_role_assignments",
+    "list_deleted_roles",
     "list_roles",
+    "restore_role",
     "router",
     "set_role_data_scope",
     "update_role",

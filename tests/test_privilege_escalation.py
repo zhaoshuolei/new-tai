@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -28,7 +29,11 @@ from app.schemas.user import (
     UserStatusUpdate,
 )
 from app.services import auth as auth_service
-from app.services.authorization import assert_target_visible, assignable_role_ids
+from app.services.authorization import (
+    assert_super_admin_remains,
+    assert_target_visible,
+    assignable_role_ids,
+)
 from app.services.role import delete_role, update_role
 from app.services.user import (
     assign_user_department,
@@ -1085,6 +1090,26 @@ async def test_non_super_admin_cannot_delete_super_admin(
     assert error.value.code == ErrorCode.CANNOT_GRANT_SUPER_ADMIN
     assert error.value.http_status == 403
     assert await user_repository.get_by_id(session, target.id) is not None
+
+
+async def test_soft_deleted_super_admin_is_not_usable(
+    session: AsyncSession,
+) -> None:
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        is_system=True,
+    )
+    await add_user(session, role=super_admin, feishu=True)
+    deleted = await add_user(session, role=super_admin, feishu=True)
+    deleted.deleted_at = datetime.now(UTC).replace(tzinfo=None)
+    deleted.deleted_by = deleted.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await assert_super_admin_remains(session, "delete")
+
+    assert error.value.code == ErrorCode.LAST_SUPER_ADMIN
 
 
 async def test_super_admin_can_delete_non_last_super_admin(

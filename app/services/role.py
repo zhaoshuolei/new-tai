@@ -40,7 +40,10 @@ def _raise_mapped_integrity_error(error: IntegrityError) -> NoReturn:
     message = str(error.orig).lower()
     error_number = _mysql_error_number(error)
     if error_number == 1062 and (
-        "role.ix_role_code" in message or "role.code" in message
+        "role.ix_role_code" in message
+        or "role.ix_role_active_code" in message
+        or "role.code" in message
+        or "role.active_code" in message
     ):
         raise BusinessError(
             ErrorCode.CONFLICT,
@@ -169,6 +172,10 @@ async def list_roles(session: AsyncSession) -> list[Role]:
     return await role_repository.list_all(session)
 
 
+async def list_deleted_roles(session: AsyncSession) -> list[Role]:
+    return await role_repository.list_deleted(session)
+
+
 @audited(action="role:update", resource_type="role", resource_id_param="role_id")
 async def update_role(
     session: AsyncSession,
@@ -224,7 +231,13 @@ async def delete_role(
     context: AuthContext,
 ) -> None:
     async with _map_role_write_errors(session):
-        role = await get_role(session, role_id)
+        role = await role_repository.lock_by_id(session, role_id)
+        if role is None:
+            raise BusinessError(
+                ErrorCode.ROLE_NOT_FOUND,
+                "Role not found",
+                http_status=404,
+            )
         authorization_service.assert_can_manage_super_admin_role(context, role)
         if role.is_system:
             raise BusinessError(
@@ -237,8 +250,39 @@ async def delete_role(
                 "Role is in use",
             )
 
-        await session.delete(role)
+        await role_repository.soft_delete(
+            session,
+            role,
+            deleted_by=context.user_id,
+        )
         await session.commit()
+
+
+@audited(action="role:restore", resource_type="role", resource_id_param="role_id")
+async def restore_role(
+    session: AsyncSession,
+    role_id: int,
+    *,
+    context: AuthContext,
+) -> Role:
+    async with _map_role_write_errors(session):
+        role = await role_repository.lock_by_id(
+            session,
+            role_id,
+            include_deleted=True,
+        )
+        if role is None or role.deleted_at is None:
+            raise BusinessError(
+                ErrorCode.RECORD_NOT_DELETED,
+                "Role is not deleted",
+                http_status=409,
+            )
+        authorization_service.assert_can_manage_super_admin_role(context, role)
+        await _ensure_role_code_available(session, role.code, exclude_id=role.id)
+        await role_repository.restore(session, role)
+        await session.commit()
+        await session.refresh(role)
+        return role
 
 
 async def get_role_assignments(
@@ -328,7 +372,7 @@ async def set_role_data_scope(
 
         unique_department_ids = set(payload.department_ids)
         if payload.data_scope == DataScope.CUSTOM:
-            departments = await role_repository.list_departments_by_ids(
+            departments = await role_repository.lock_departments_by_ids(
                 session,
                 unique_department_ids,
             )
@@ -382,8 +426,10 @@ __all__: tuple[str, ...] = (
     "delete_role",
     "get_role",
     "get_role_assignments",
+    "list_deleted_roles",
     "list_role_permission_codes",
     "list_roles",
+    "restore_role",
     "set_role_data_scope",
     "update_role",
 )
