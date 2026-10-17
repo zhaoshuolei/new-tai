@@ -9,8 +9,10 @@ from tests.customer_helpers import (
     make_customer_row,
     make_department,
     make_user,
-    session,  # noqa: F401  pytest fixture
+    session,
 )
+
+__all__ = ("session",)
 
 
 async def test_helpers_build_user_customer_and_context(session: AsyncSession) -> None:

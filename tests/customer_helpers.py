@@ -56,7 +56,8 @@ class FakeTianyanchaClient:
         self.registration_credit_code: str | None = None
         self.historical_text = (
             "\n##### 经营范围 2022-03-11\n###### 变更前原文\n旧的经营范围\n"
-            "###### 变更后原文\n互联网信息服务（含各类增值电信业务）完整经营范围全文。\n"
+            "###### 变更后原文\n"
+            "互联网信息服务（含各类增值电信业务）完整经营范围全文。\n"
         )
 
     async def search_candidates(

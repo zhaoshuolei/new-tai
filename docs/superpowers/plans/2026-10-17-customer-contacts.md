@@ -186,8 +186,15 @@ def test_contact_function_columns() -> None:
 def test_customer_contact_columns() -> None:
     cols = {c.name for c in inspect(CustomerContact).columns}
     assert {
-        "customer_id", "function_id", "name", "position", "phone",
-        "email", "home_address", "remark", "status",
+        "customer_id",
+        "function_id",
+        "name",
+        "position",
+        "phone",
+        "email",
+        "home_address",
+        "remark",
+        "status",
     } <= cols
 ```
 
@@ -321,7 +328,9 @@ async def test_delete_is_soft_and_hidden_from_get(session: AsyncSession) -> None
     assert exc.value.code == ErrorCode.CUSTOMER_NOT_FOUND
 
 
-async def test_restore_reactivates_and_clears_deletion_fields(session: AsyncSession) -> None:
+async def test_restore_reactivates_and_clears_deletion_fields(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     ctx = make_context(owner)
     customer = await make_customer_row(session, owner=owner)
@@ -344,7 +353,9 @@ async def test_restore_active_customer_returns_7012(session: AsyncSession) -> No
     assert exc.value.code == ErrorCode.RECORD_NOT_DELETED
 
 
-async def test_restore_conflicts_when_active_customer_reuses_code(session: AsyncSession) -> None:
+async def test_restore_conflicts_when_active_customer_reuses_code(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     ctx = make_context(owner)
     deleted = await make_customer_row(session, owner=owner, credit_code=CODE)
@@ -358,7 +369,9 @@ async def test_restore_conflicts_when_active_customer_reuses_code(session: Async
     assert exc.value.http_status == 409
 
 
-async def test_create_with_deleted_credit_code_returns_7011_without_id(session: AsyncSession) -> None:
+async def test_create_with_deleted_credit_code_returns_7011_without_id(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     ctx = make_context(owner)
     deleted = await make_customer_row(session, owner=owner, credit_code=CODE)
@@ -387,7 +400,9 @@ async def test_import_with_deleted_credit_code_does_not_call_tianyancha(
     assert fake_client.calls == []
 
 
-async def test_update_to_deleted_credit_code_returns_7011(session: AsyncSession) -> None:
+async def test_update_to_deleted_credit_code_returns_7011(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     ctx = make_context(owner)
     deleted = await make_customer_row(session, owner=owner, credit_code=CODE)
@@ -401,7 +416,9 @@ async def test_update_to_deleted_credit_code_returns_7011(session: AsyncSession)
     assert exc.value.code == ErrorCode.CUSTOMER_DELETED_CREDIT_CODE_EXISTS
 
 
-async def test_transfer_deleted_customer_needs_delete_permission(session: AsyncSession) -> None:
+async def test_transfer_deleted_customer_needs_delete_permission(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     target = await make_user(session)
     customer = await make_customer_row(session, owner=owner)
@@ -419,7 +436,9 @@ async def test_transfer_deleted_customer_needs_delete_permission(session: AsyncS
     assert exc.value.http_status == 403
 
 
-async def test_transfer_deleted_customer_keeps_deleted_status(session: AsyncSession) -> None:
+async def test_transfer_deleted_customer_keeps_deleted_status(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     target = await make_user(session)
     customer = await make_customer_row(session, owner=owner)
@@ -466,14 +485,18 @@ async def test_user_with_deleted_customer_blocked_until_transferred(
     assert remaining is None
 
 
-async def test_recycle_bin_lists_only_deleted_within_scope(session: AsyncSession) -> None:
+async def test_recycle_bin_lists_only_deleted_within_scope(
+    session: AsyncSession,
+) -> None:
     owner = await make_user(session)
     ctx = make_context(owner, permission_codes={"customer:delete"})
     active = await make_customer_row(session, owner=owner)
     deleted = await make_customer_row(session, owner=owner)
     await delete_customer(session, deleted.id, context=ctx)
 
-    items, total = await list_deleted_customers(session, context=ctx, page=1, page_size=20)
+    items, total = await list_deleted_customers(
+        session, context=ctx, page=1, page_size=20
+    )
     assert total == 1
     assert [c.id for c in items] == [deleted.id]
     assert active.id not in [c.id for c in items]
@@ -575,7 +598,9 @@ def test_email_is_stripped_and_accepted() -> None:
     assert normalize_email(" a@b.com ") == "a@b.com"
 
 
-@pytest.mark.parametrize("raw", ["no-at-sign", "a@b", "a b@c.com", "x@" + "y" * 260 + ".com"])
+@pytest.mark.parametrize(
+    "raw", ["no-at-sign", "a@b", "a b@c.com", "x@" + "y" * 260 + ".com"]
+)
 def test_invalid_email_is_rejected(raw: str) -> None:
     with pytest.raises(ValueError):
         normalize_email(raw)
@@ -597,19 +622,31 @@ Expected: PASS
 # tests/test_contact_repository.py
 from app.models.contact import ContactStatus
 from app.repositories import contact as contact_repository
-from tests.contact_helpers import add_contact, add_function  # 同 customer_helpers 风格，Task 4 内新建
+from tests.contact_helpers import (
+    add_contact,
+    add_function,
+)  # 同 customer_helpers 风格，Task 4 内新建
 
 
-async def test_list_functions_for_customer_includes_shared_and_own_only(session) -> None:
+async def test_list_functions_for_customer_includes_shared_and_own_only(
+    session,
+) -> None:
     owner = await make_user(session)
     customer_a = await make_customer_row(session, owner=owner)
     customer_b = await make_customer_row(session, owner=owner)
     await add_function(session, name="商务", customer_id=None)
     await add_function(session, name="渠道对接", customer_id=customer_a.id)
     await add_function(session, name="他客户的", customer_id=customer_b.id)
-    await add_function(session, name="已删旧", customer_id=None, status=ContactStatus.DELETED)
+    await add_function(
+        session, name="已删旧", customer_id=None, status=ContactStatus.DELETED
+    )
 
-    names = [f.name for f in await contact_repository.list_functions_for_customer(session, customer_a.id)]
+    names = [
+        f.name
+        for f in await contact_repository.list_functions_for_customer(
+            session, customer_a.id
+        )
+    ]
     assert names == ["商务", "渠道对接"]
 
 
@@ -618,7 +655,9 @@ async def test_count_contacts_includes_deleted_contacts(session) -> None:
     customer_a = await make_customer_row(session, owner=owner)
     fn = await add_function(session, name="研发", customer_id=None)
     await add_contact(session, customer_a, fn, name="张三", status=ContactStatus.ACTIVE)
-    await add_contact(session, customer_a, fn, name="李四", status=ContactStatus.DELETED)
+    await add_contact(
+        session, customer_a, fn, name="李四", status=ContactStatus.DELETED
+    )
 
     assert await contact_repository.count_contacts_referencing(session, fn.id) == 2
 
@@ -628,8 +667,12 @@ async def test_reassign_moves_all_contacts_including_deleted(session) -> None:
     customer_a = await make_customer_row(session, owner=owner)
     src = await add_function(session, name="研发", customer_id=None)
     dst = await add_function(session, name="产品", customer_id=None)
-    await add_contact(session, customer_a, src, name="张三", status=ContactStatus.ACTIVE)
-    await add_contact(session, customer_a, src, name="李四", status=ContactStatus.DELETED)
+    await add_contact(
+        session, customer_a, src, name="张三", status=ContactStatus.ACTIVE
+    )
+    await add_contact(
+        session, customer_a, src, name="李四", status=ContactStatus.DELETED
+    )
 
     moved = await contact_repository.reassign_contacts(session, src.id, dst.id)
     assert moved == 2
@@ -659,7 +702,9 @@ async def test_list_contacts_excludes_deleted(session) -> None:
     customer_a = await make_customer_row(session, owner=owner)
     fn = await add_function(session, name="商务", customer_id=None)
     await add_contact(session, customer_a, fn, name="在岗", status=ContactStatus.ACTIVE)
-    await add_contact(session, customer_a, fn, name="离岗", status=ContactStatus.DELETED)
+    await add_contact(
+        session, customer_a, fn, name="离岗", status=ContactStatus.DELETED
+    )
 
     items, total = await contact_repository.list_contacts(
         session, customer_a.id, status=ContactStatus.ACTIVE, page=1, page_size=20
@@ -751,7 +796,11 @@ SUPER = dict(is_super_admin=True)
 async def test_non_super_admin_cannot_create_shared(session) -> None:
     user = await make_user(session)
     with pytest.raises(BusinessError) as exc:
-        await create_shared_function(session, "商务", context=make_context(user, permission_codes={"customer:update"}))
+        await create_shared_function(
+            session,
+            "商务",
+            context=make_context(user, permission_codes={"customer:update"}),
+        )
     assert exc.value.http_status == 403
 
 
@@ -761,7 +810,9 @@ async def test_shared_name_clashing_with_active_custom_is_rejected(session) -> N
     await add_function(session, name="渠道对接", customer_id=owner.id)
 
     with pytest.raises(BusinessError) as exc:
-        await create_shared_function(session, "渠道对接", context=make_context(user, **SUPER))
+        await create_shared_function(
+            session, "渠道对接", context=make_context(user, **SUPER)
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
 
 
@@ -771,7 +822,12 @@ async def test_custom_name_clashing_with_shared_is_rejected(session) -> None:
     await add_function(session, name="商务", customer_id=None)
 
     with pytest.raises(BusinessError) as exc:
-        await create_custom_function(session, owner.id, "商务", context=make_context(user, permission_codes={"customer:update"}))
+        await create_custom_function(
+            session,
+            owner.id,
+            "商务",
+            context=make_context(user, permission_codes={"customer:update"}),
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
 
 
@@ -779,9 +835,16 @@ async def test_delete_without_contacts_needs_no_replacement(session) -> None:
     user = await make_user(session)
     fn = await add_function(session, name="临时", customer_id=None)
 
-    moved = await delete_shared_function(session, fn.id, replacement_function_id=None, context=make_context(user, **SUPER))
+    moved = await delete_shared_function(
+        session,
+        fn.id,
+        replacement_function_id=None,
+        context=make_context(user, **SUPER),
+    )
     assert moved == 0
-    row = await session.scalar(select(ContactFunction).where(ContactFunction.id == fn.id))
+    row = await session.scalar(
+        select(ContactFunction).where(ContactFunction.id == fn.id)
+    )
     assert row.status == ContactStatus.DELETED
 
 
@@ -792,9 +855,16 @@ async def test_delete_with_contacts_requires_replacement(session) -> None:
     await add_contact(session, owner, fn, name="张三")
 
     with pytest.raises(BusinessError) as exc:
-        await delete_shared_function(session, fn.id, replacement_function_id=None, context=make_context(user, **SUPER))
+        await delete_shared_function(
+            session,
+            fn.id,
+            replacement_function_id=None,
+            context=make_context(user, **SUPER),
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_REQUIRED
-    row = await session.scalar(select(ContactFunction).where(ContactFunction.id == fn.id))
+    row = await session.scalar(
+        select(ContactFunction).where(ContactFunction.id == fn.id)
+    )
     assert row.status == ContactStatus.ACTIVE
 
 
@@ -804,7 +874,12 @@ async def test_delete_without_contacts_rejects_replacement(session) -> None:
     other = await add_function(session, name="产品", customer_id=None)
 
     with pytest.raises(BusinessError) as exc:
-        await delete_shared_function(session, fn.id, replacement_function_id=other.id, context=make_context(user, **SUPER))
+        await delete_shared_function(
+            session,
+            fn.id,
+            replacement_function_id=other.id,
+            context=make_context(user, **SUPER),
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
 
 
@@ -816,7 +891,12 @@ async def test_shared_delete_rejects_custom_replacement(session) -> None:
     custom = await add_function(session, name="渠道", customer_id=owner.id)
 
     with pytest.raises(BusinessError) as exc:
-        await delete_shared_function(session, fn.id, replacement_function_id=custom.id, context=make_context(user, **SUPER))
+        await delete_shared_function(
+            session,
+            fn.id,
+            replacement_function_id=custom.id,
+            context=make_context(user, **SUPER),
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
 
 
@@ -825,10 +905,17 @@ async def test_shared_delete_rejects_deleted_replacement(session) -> None:
     owner = await make_customer_row(session, owner=user)
     fn = await add_function(session, name="研发", customer_id=None)
     await add_contact(session, owner, fn, name="张三")
-    gone = await add_function(session, name="旧", customer_id=None, status=ContactStatus.DELETED)
+    gone = await add_function(
+        session, name="旧", customer_id=None, status=ContactStatus.DELETED
+    )
 
     with pytest.raises(BusinessError) as exc:
-        await delete_shared_function(session, fn.id, replacement_function_id=gone.id, context=make_context(user, **SUPER))
+        await delete_shared_function(
+            session,
+            fn.id,
+            replacement_function_id=gone.id,
+            context=make_context(user, **SUPER),
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
 
 
@@ -842,7 +929,12 @@ async def test_custom_delete_allows_own_or_shared_replacement(session) -> None:
     await add_contact(session, owner, own, name="A")
     await add_contact(session, owner, own_other, name="B")
 
-    assert await delete_custom_function(session, owner.id, own.id, replacement_function_id=shared.id, context=ctx) == 1
+    assert (
+        await delete_custom_function(
+            session, owner.id, own.id, replacement_function_id=shared.id, context=ctx
+        )
+        == 1
+    )
 
 
 async def test_custom_delete_rejects_other_customer_replacement(session) -> None:
@@ -855,7 +947,9 @@ async def test_custom_delete_rejects_other_customer_replacement(session) -> None
     await add_contact(session, owner, own, name="A")
 
     with pytest.raises(BusinessError) as exc:
-        await delete_custom_function(session, owner.id, own.id, replacement_function_id=foreign.id, context=ctx)
+        await delete_custom_function(
+            session, owner.id, own.id, replacement_function_id=foreign.id, context=ctx
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
 
 
@@ -867,7 +961,9 @@ async def test_delete_rejects_self_as_replacement(session) -> None:
     await add_contact(session, owner, own, name="A")
 
     with pytest.raises(BusinessError) as exc:
-        await delete_custom_function(session, owner.id, own.id, replacement_function_id=own.id, context=ctx)
+        await delete_custom_function(
+            session, owner.id, own.id, replacement_function_id=own.id, context=ctx
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
 
 
@@ -876,9 +972,16 @@ async def test_delete_migrates_soft_deleted_contacts_too(session) -> None:
     owner = await make_customer_row(session, owner=user)
     src = await add_function(session, name="研发", customer_id=None)
     dst = await add_function(session, name="产品", customer_id=None)
-    gone = await add_contact(session, owner, src, name="离岗", status=ContactStatus.DELETED)
+    gone = await add_contact(
+        session, owner, src, name="离岗", status=ContactStatus.DELETED
+    )
 
-    await delete_shared_function(session, src.id, replacement_function_id=dst.id, context=make_context(user, **SUPER))
+    await delete_shared_function(
+        session,
+        src.id,
+        replacement_function_id=dst.id,
+        context=make_context(user, **SUPER),
+    )
     await session.refresh(gone)
     assert gone.function_id == dst.id
 
@@ -889,7 +992,12 @@ async def test_restore_does_not_move_contacts_back(session) -> None:
     src = await add_function(session, name="研发", customer_id=None)
     dst = await add_function(session, name="产品", customer_id=None)
     contact = await add_contact(session, owner, src, name="张三")
-    await delete_shared_function(session, src.id, replacement_function_id=dst.id, context=make_context(user, **SUPER))
+    await delete_shared_function(
+        session,
+        src.id,
+        replacement_function_id=dst.id,
+        context=make_context(user, **SUPER),
+    )
 
     await restore_shared_function(session, src.id, context=make_context(user, **SUPER))
     await session.refresh(contact)
@@ -898,11 +1006,15 @@ async def test_restore_does_not_move_contacts_back(session) -> None:
 
 async def test_restore_shared_name_conflict_returns_7007(session) -> None:
     user = await make_user(session)
-    gone = await add_function(session, name="研发", customer_id=None, status=ContactStatus.DELETED)
+    gone = await add_function(
+        session, name="研发", customer_id=None, status=ContactStatus.DELETED
+    )
     await add_function(session, name="研发", customer_id=None)  # 同名 ACTIVE
 
     with pytest.raises(BusinessError) as exc:
-        await restore_shared_function(session, gone.id, context=make_context(user, **SUPER))
+        await restore_shared_function(
+            session, gone.id, context=make_context(user, **SUPER)
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
 
 
@@ -911,7 +1023,9 @@ async def test_restore_active_function_returns_7012(session) -> None:
     fn = await add_function(session, name="研发", customer_id=None)
 
     with pytest.raises(BusinessError) as exc:
-        await restore_shared_function(session, fn.id, context=make_context(user, **SUPER))
+        await restore_shared_function(
+            session, fn.id, context=make_context(user, **SUPER)
+        )
     assert exc.value.code == ErrorCode.RECORD_NOT_DELETED
 
 
@@ -923,11 +1037,17 @@ async def test_functions_of_deleted_customer_are_not_visible(session) -> None:
     await session.flush()
 
     with pytest.raises(BusinessError) as exc:
-        await list_customer_functions(session, owner.id, context=make_context(user, permission_codes={"customer:read"}))
+        await list_customer_functions(
+            session,
+            owner.id,
+            context=make_context(user, permission_codes={"customer:read"}),
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_NOT_FOUND
 
 
-async def test_custom_function_belonging_to_other_customer_returns_7006(session) -> None:
+async def test_custom_function_belonging_to_other_customer_returns_7006(
+    session,
+) -> None:
     user = await make_user(session)
     a = await make_customer_row(session, owner=user)
     b = await make_customer_row(session, owner=user)
@@ -935,7 +1055,9 @@ async def test_custom_function_belonging_to_other_customer_returns_7006(session)
     ctx = make_context(user, permission_codes={"customer:delete", "customer:update"})
 
     with pytest.raises(BusinessError) as exc:
-        await delete_custom_function(session, a.id, foreign.id, replacement_function_id=None, context=ctx)
+        await delete_custom_function(
+            session, a.id, foreign.id, replacement_function_id=None, context=ctx
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NOT_FOUND
 ```
 
@@ -1016,7 +1138,10 @@ async def _setup(session):
 async def test_create_with_shared_function_succeeds(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     created = await create_contact(
-        session, customer.id, ContactCreate(name="张三", function_id=shared.id), context=ctx
+        session,
+        customer.id,
+        ContactCreate(name="张三", function_id=shared.id),
+        context=ctx,
     )
     assert created.id is not None
     assert created.function_id == shared.id
@@ -1029,44 +1154,74 @@ async def test_create_with_other_customer_function_returns_7010(session) -> None
     foreign = await add_function(session, name="外部", customer_id=other.id)
 
     with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, ContactCreate(name="张三", function_id=foreign.id), context=ctx)
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(name="张三", function_id=foreign.id),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_UNAVAILABLE
 
 
 async def test_create_with_deleted_function_returns_7010(session) -> None:
     user, ctx, customer, _ = await _setup(session)
-    gone = await add_function(session, name="旧", customer_id=None, status=ContactStatus.DELETED)
+    gone = await add_function(
+        session, name="旧", customer_id=None, status=ContactStatus.DELETED
+    )
 
     with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, ContactCreate(name="张三", function_id=gone.id), context=ctx)
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(name="张三", function_id=gone.id),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_UNAVAILABLE
 
 
 async def test_invalid_phone_returns_7003(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, ContactCreate(name="张三", function_id=shared.id, phone="12345"), context=ctx)
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(name="张三", function_id=shared.id, phone="12345"),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
 
 
 async def test_invalid_email_returns_7003(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, ContactCreate(name="张三", function_id=shared.id, email="no-at"), context=ctx)
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(name="张三", function_id=shared.id, email="no-at"),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
 
 
 async def test_blank_name_returns_7003(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     with pytest.raises(BusinessError) as exc:
-        await create_contact(session, customer.id, ContactCreate(name="   ", function_id=shared.id), context=ctx)
+        await create_contact(
+            session,
+            customer.id,
+            ContactCreate(name="   ", function_id=shared.id),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
 
 
 async def test_blank_phone_and_email_stored_as_none(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     created = await create_contact(
-        session, customer.id, ContactCreate(name="张三", function_id=shared.id, phone="  ", email=""), context=ctx
+        session,
+        customer.id,
+        ContactCreate(name="张三", function_id=shared.id, phone="  ", email=""),
+        context=ctx,
     )
     assert created.phone is None
     assert created.email is None
@@ -1077,7 +1232,13 @@ async def test_update_changes_function_to_shared(session) -> None:
     other_shared = await add_function(session, name="运营", customer_id=None)
     contact = await add_contact(session, customer, shared, name="张三")
 
-    updated = await update_contact(session, customer.id, contact.id, ContactUpdate(function_id=other_shared.id), context=ctx)
+    updated = await update_contact(
+        session,
+        customer.id,
+        contact.id,
+        ContactUpdate(function_id=other_shared.id),
+        context=ctx,
+    )
     assert updated.function_id == other_shared.id
 
 
@@ -1088,7 +1249,13 @@ async def test_update_to_foreign_function_returns_7010(session) -> None:
     contact = await add_contact(session, customer, shared, name="张三")
 
     with pytest.raises(BusinessError) as exc:
-        await update_contact(session, customer.id, contact.id, ContactUpdate(function_id=foreign.id), context=ctx)
+        await update_contact(
+            session,
+            customer.id,
+            contact.id,
+            ContactUpdate(function_id=foreign.id),
+            context=ctx,
+        )
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_UNAVAILABLE
 
 
@@ -1098,7 +1265,9 @@ async def test_contact_of_other_customer_returns_7005(session) -> None:
     contact = await add_contact(session, other, shared, name="别人的")
 
     with pytest.raises(BusinessError) as exc:
-        await update_contact(session, customer.id, contact.id, ContactUpdate(name="改"), context=ctx)
+        await update_contact(
+            session, customer.id, contact.id, ContactUpdate(name="改"), context=ctx
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_CONTACT_NOT_FOUND
 
 
@@ -1110,16 +1279,22 @@ async def test_delete_contact_is_soft_and_hidden_from_list(session) -> None:
     await session.refresh(contact)
     assert contact.status == ContactStatus.DELETED
 
-    _, total = await list_contacts(session, customer.id, context=ctx, page=1, page_size=20)
+    _, total = await list_contacts(
+        session, customer.id, context=ctx, page=1, page_size=20
+    )
     assert total == 0
 
 
 async def test_deleted_contact_update_returns_7005(session) -> None:
     user, ctx, customer, shared = await _setup(session)
-    contact = await add_contact(session, customer, shared, name="张三", status=ContactStatus.DELETED)
+    contact = await add_contact(
+        session, customer, shared, name="张三", status=ContactStatus.DELETED
+    )
 
     with pytest.raises(BusinessError) as exc:
-        await update_contact(session, customer.id, contact.id, ContactUpdate(name="改"), context=ctx)
+        await update_contact(
+            session, customer.id, contact.id, ContactUpdate(name="改"), context=ctx
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_CONTACT_NOT_FOUND
 
 
@@ -1144,10 +1319,14 @@ async def test_restore_active_contact_returns_7012(session) -> None:
 async def test_list_hidden_customer_returns_7001(session) -> None:
     user, ctx, customer, shared = await _setup(session)
     outsider = await make_user(session)
-    outsider_ctx = make_context(outsider, permission_codes=PERMS, data_scope=DataScope.SELF)  # noqa: F821
+    outsider_ctx = make_context(
+        outsider, permission_codes=PERMS, data_scope=DataScope.SELF
+    )  # noqa: F821
 
     with pytest.raises(BusinessError) as exc:
-        await list_contacts(session, customer.id, context=outsider_ctx, page=1, page_size=20)
+        await list_contacts(
+            session, customer.id, context=outsider_ctx, page=1, page_size=20
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_NOT_FOUND
 
 
@@ -1156,7 +1335,9 @@ async def test_list_is_paginated(session) -> None:
     for i in range(5):
         await add_contact(session, customer, shared, name=f"人{i}")
 
-    items, total = await list_contacts(session, customer.id, context=ctx, page=2, page_size=2)
+    items, total = await list_contacts(
+        session, customer.id, context=ctx, page=2, page_size=2
+    )
     assert total == 5
     assert len(items) == 2
 ```
@@ -1216,10 +1397,17 @@ from app.models.user import User
 from app.schemas.contact import ContactCreate
 from app.services.contact import create_contact, delete_shared_function
 from tests.contact_helpers import add_function
-from tests.customer_helpers import TEST_DATABASE_URL, make_context, make_customer_row, make_user
+from tests.customer_helpers import (
+    TEST_DATABASE_URL,
+    make_context,
+    make_customer_row,
+    make_user,
+)
 
 
-async def test_concurrent_create_and_function_delete_leave_no_dangling_reference() -> None:
+async def test_concurrent_create_and_function_delete_leave_no_dangling_reference() -> (
+    None
+):
     engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -1278,7 +1466,10 @@ async def test_concurrent_create_and_function_delete_leave_no_dangling_reference
             dangling = (
                 await check.scalars(
                     select(CustomerContact)
-                    .join(ContactFunction, CustomerContact.function_id == ContactFunction.id)
+                    .join(
+                        ContactFunction,
+                        CustomerContact.function_id == ContactFunction.id,
+                    )
                     .where(
                         ContactFunction.status == ContactStatus.DELETED,
                         ContactFunction.id == f_id,
@@ -1294,8 +1485,14 @@ async def test_concurrent_create_and_function_delete_leave_no_dangling_reference
         # 4. 清理：按外键依赖逆序删除，审计行一并清除。
         async with factory() as cleanup:
             await cleanup.execute(delete(AuditLog).where(AuditLog.user_id == user_id))
-            await cleanup.execute(delete(CustomerContact).where(CustomerContact.customer_id == customer_id))
-            await cleanup.execute(delete(ContactFunction).where(ContactFunction.id.in_([f_id, g_id])))
+            await cleanup.execute(
+                delete(CustomerContact).where(
+                    CustomerContact.customer_id == customer_id
+                )
+            )
+            await cleanup.execute(
+                delete(ContactFunction).where(ContactFunction.id.in_([f_id, g_id]))
+            )
             await cleanup.execute(delete(Customer).where(Customer.id == customer_id))
             await cleanup.execute(delete(User).where(User.id == user_id))
             await cleanup.commit()
@@ -1365,7 +1562,13 @@ git commit -m "test: cover concurrent contact create and function delete"
 import pytest
 
 from app.core.audit_meta import get_audit_route_meta
-from tests.customer_helpers import api_client, make_context, make_customer_row, make_user, session  # noqa: F401
+from tests.customer_helpers import (
+    api_client,
+    make_context,
+    make_customer_row,
+    make_user,
+    session,
+)  # noqa: F401
 from tests.contact_helpers import add_contact, add_function
 
 
@@ -1391,7 +1594,9 @@ async def test_custom_function_requires_customer_update(session) -> None:
     customer = await make_customer_row(session, owner=user)
     ctx = make_context(user, permission_codes={"customer:read"})
     async with api_client(session, ctx) as client:
-        response = await client.post(f"/api/v1/customers/{customer.id}/contact-functions", json={"name": "渠道"})
+        response = await client.post(
+            f"/api/v1/customers/{customer.id}/contact-functions", json={"name": "渠道"}
+        )
     assert response.status_code == 403
 
 
@@ -1402,7 +1607,9 @@ async def test_contact_delete_requires_customer_delete_not_update(session) -> No
     contact = await add_contact(session, customer, shared, name="张三")
     ctx = make_context(user, permission_codes={"customer:read", "customer:update"})
     async with api_client(session, ctx) as client:
-        response = await client.delete(f"/api/v1/customers/{customer.id}/contacts/{contact.id}")
+        response = await client.delete(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+        )
     assert response.status_code == 403
 
 
@@ -1411,7 +1618,9 @@ async def test_contacts_page_size_above_limit_is_rejected(session) -> None:
     customer = await make_customer_row(session, owner=user)
     ctx = make_context(user, permission_codes={"customer:read"})
     async with api_client(session, ctx) as client:
-        response = await client.get(f"/api/v1/customers/{customer.id}/contacts", params={"page_size": 101})
+        response = await client.get(
+            f"/api/v1/customers/{customer.id}/contacts", params={"page_size": 101}
+        )
     assert response.status_code == 422
 
 
@@ -1420,7 +1629,9 @@ async def test_contacts_page_beyond_range_returns_empty_not_500(session) -> None
     customer = await make_customer_row(session, owner=user)
     ctx = make_context(user, permission_codes={"customer:read"})
     async with api_client(session, ctx) as client:
-        response = await client.get(f"/api/v1/customers/{customer.id}/contacts", params={"page": 99999})
+        response = await client.get(
+            f"/api/v1/customers/{customer.id}/contacts", params={"page": 99999}
+        )
     assert response.status_code == 200
     body = response.json()["data"]
     assert body["items"] == []
@@ -1432,7 +1643,9 @@ async def test_recycle_bin_route_not_shadowed_by_contact_id(session) -> None:
     customer = await make_customer_row(session, owner=user)
     ctx = make_context(user, permission_codes={"customer:read", "customer:delete"})
     async with api_client(session, ctx) as client:
-        response = await client.get(f"/api/v1/customers/{customer.id}/contacts/recycle-bin")
+        response = await client.get(
+            f"/api/v1/customers/{customer.id}/contacts/recycle-bin"
+        )
     assert response.status_code == 200
 
 
@@ -1441,7 +1654,11 @@ async def test_error_codes_surface_over_http(session) -> None:
     customer = await make_customer_row(session, owner=user)
     shared = await add_function(session, name="商务", customer_id=None)
     await add_contact(session, customer, shared, name="张三")
-    ctx = make_context(user, is_super_admin=True, permission_codes={"customer:update", "customer:delete"})
+    ctx = make_context(
+        user,
+        is_super_admin=True,
+        permission_codes={"customer:update", "customer:delete"},
+    )
     async with api_client(session, ctx) as client:
         response = await client.delete(f"/api/v1/contact-functions/{shared.id}")
     assert response.status_code == 422
@@ -1451,18 +1668,55 @@ async def test_error_codes_surface_over_http(session) -> None:
 @pytest.mark.parametrize(
     ("method", "template", "action", "resource_type"),
     [
-        ("POST", "/customers/{customer_id}/contacts", "contact:create", "customer_contact"),
-        ("PATCH", "/customers/{customer_id}/contacts/{contact_id}", "contact:update", "customer_contact"),
-        ("DELETE", "/customers/{customer_id}/contacts/{contact_id}", "contact:delete", "customer_contact"),
-        ("POST", "/customers/{customer_id}/contacts/{contact_id}/restore", "contact:restore", "customer_contact"),
+        (
+            "POST",
+            "/customers/{customer_id}/contacts",
+            "contact:create",
+            "customer_contact",
+        ),
+        (
+            "PATCH",
+            "/customers/{customer_id}/contacts/{contact_id}",
+            "contact:update",
+            "customer_contact",
+        ),
+        (
+            "DELETE",
+            "/customers/{customer_id}/contacts/{contact_id}",
+            "contact:delete",
+            "customer_contact",
+        ),
+        (
+            "POST",
+            "/customers/{customer_id}/contacts/{contact_id}/restore",
+            "contact:restore",
+            "customer_contact",
+        ),
         ("POST", "/contact-functions", "contact_function:create", "contact_function"),
-        ("PATCH", "/contact-functions/{function_id}", "contact_function:update", "contact_function"),
-        ("DELETE", "/contact-functions/{function_id}", "contact_function:delete", "contact_function"),
-        ("POST", "/contact-functions/{function_id}/restore", "contact_function:restore", "contact_function"),
+        (
+            "PATCH",
+            "/contact-functions/{function_id}",
+            "contact_function:update",
+            "contact_function",
+        ),
+        (
+            "DELETE",
+            "/contact-functions/{function_id}",
+            "contact_function:delete",
+            "contact_function",
+        ),
+        (
+            "POST",
+            "/contact-functions/{function_id}/restore",
+            "contact_function:restore",
+            "contact_function",
+        ),
         ("POST", "/customers/{customer_id}/restore", "customer:restore", "customer"),
     ],
 )
-def test_write_routes_are_registered_for_audit(method, template, action, resource_type) -> None:
+def test_write_routes_are_registered_for_audit(
+    method, template, action, resource_type
+) -> None:
     meta = get_audit_route_meta(method, template)
     assert meta is not None
     assert meta.action == action
@@ -1522,7 +1776,9 @@ async def test_shared_functions_are_seeded_once(session) -> None:
     await _ensure_shared_contact_functions(session)
 
     rows = (
-        await session.scalars(select(ContactFunction).where(ContactFunction.customer_id.is_(None)))
+        await session.scalars(
+            select(ContactFunction).where(ContactFunction.customer_id.is_(None))
+        )
     ).all()
     assert sorted(r.name for r in rows) == ["产品", "商务", "研发", "运营"]
     assert all(r.scope_key == 0 for r in rows)

@@ -15,7 +15,11 @@ async def add_function(
     customer_id: int | None,
     status: ContactStatus = ContactStatus.ACTIVE,
 ) -> ContactFunction:
-    """写入职能。customer_id 为 None 即共用职能（scope_key=0）；否则为自定义职能（scope_key=customer_id）。"""
+    """写入职能。
+
+    customer_id 为 None 即共用职能（scope_key=0）；否则为自定义职能
+    （scope_key=customer_id）。
+    """
     function = ContactFunction(
         name=name,
         customer_id=customer_id,
