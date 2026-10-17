@@ -7,7 +7,7 @@ from typing import Literal
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
@@ -108,37 +108,46 @@ def _require_super_admin(context: AuthContext) -> None:
         raise _forbidden_error()
 
 
+def _async_engine_for(session: AsyncSession) -> AsyncEngine:
+    # AsyncSession.get_bind() exposes SQLAlchemy's synchronous engine/connection
+    # mirror, so consult the async bind to open a truly independent connection.
+    bind = session.get_bind()
+    if isinstance(bind, AsyncConnection):
+        return bind.engine
+    if isinstance(bind, AsyncEngine):
+        return bind
+
+    session_bind = session.bind
+    if isinstance(session_bind, AsyncConnection):
+        return session_bind.engine
+    if isinstance(session_bind, AsyncEngine):
+        return session_bind
+    raise TypeError("AsyncSession must be bound to an async engine or connection")
+
+
 @asynccontextmanager
 async def _serialize_name_change(session: AsyncSession) -> AsyncIterator[None]:
-    connection = await session.connection()
-    acquired = await connection.scalar(
-        text("SELECT GET_LOCK(:lock_name, :timeout)"),
-        {
-            "lock_name": _NAME_LOCK_NAME,
-            "timeout": _NAME_LOCK_TIMEOUT_SECONDS,
-        },
-    )
-    if acquired != 1:
-        raise _name_change_concurrent_error()
-
-    try:
-        yield
-    except BaseException:
-        # Rollback invalidates an externally acquired connection proxy, so the
-        # connection-scoped lock must be released first.
+    engine = _async_engine_for(session)
+    async with engine.connect() as lock_connection:
         try:
-            await connection.scalar(
+            acquired = await lock_connection.scalar(
+                text("SELECT GET_LOCK(:lock_name, :timeout)"),
+                {
+                    "lock_name": _NAME_LOCK_NAME,
+                    "timeout": _NAME_LOCK_TIMEOUT_SECONDS,
+                },
+            )
+            if acquired != 1:
+                raise _name_change_concurrent_error()
+            yield
+        except BaseException:
+            await session.rollback()
+            raise
+        finally:
+            await lock_connection.scalar(
                 text("SELECT RELEASE_LOCK(:lock_name)"),
                 {"lock_name": _NAME_LOCK_NAME},
             )
-        finally:
-            await session.rollback()
-        raise
-    else:
-        await connection.scalar(
-            text("SELECT RELEASE_LOCK(:lock_name)"),
-            {"lock_name": _NAME_LOCK_NAME},
-        )
 
 
 async def _require_visible_active_customer(

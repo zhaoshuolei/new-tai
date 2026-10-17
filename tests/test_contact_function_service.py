@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -41,6 +42,15 @@ from tests.customer_helpers import (
 )
 
 __all__ = ("session",)
+
+
+async def _assert_name_lock_is_free(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection:
+        lock_owner = await connection.scalar(
+            text("SELECT IS_USED_LOCK(:lock_name)"),
+            {"lock_name": contact_service._NAME_LOCK_NAME},
+        )
+    assert lock_owner is None
 
 
 @pytest_asyncio.fixture
@@ -198,6 +208,119 @@ async def test_custom_create_rejects_existing_shared_name_for_any_customer(
         )
 
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+
+
+async def test_engine_bound_create_commits_and_releases_name_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(audit_service, "session_factory", factory)
+    user_id: int | None = None
+    customer_id: int | None = None
+    function_id: int | None = None
+    name = f"生产职能-{uuid4().hex}"
+
+    try:
+        async with factory() as setup:
+            user = await make_user(setup)
+            customer = await make_customer_row(setup, owner=user)
+            await setup.commit()
+            user_id = user.id
+            customer_id = customer.id
+
+        async with factory() as app_session:
+            created = await create_shared_function(
+                app_session,
+                name,
+                context=make_context(user, is_super_admin=True),
+            )
+            function_id = created.id
+
+        async with factory() as verify:
+            row = await verify.scalar(
+                select(ContactFunction).where(ContactFunction.id == function_id)
+            )
+        assert row is not None
+        assert row.name == name
+        await _assert_name_lock_is_free(engine)
+    finally:
+        async with factory() as cleanup:
+            if function_id is not None:
+                await cleanup.execute(
+                    delete(ContactFunction).where(ContactFunction.id == function_id)
+                )
+            await cleanup.execute(
+                delete(ContactFunction).where(ContactFunction.name == name)
+            )
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(AuditLog).where(AuditLog.user_id == user_id)
+                )
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.id == customer_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+        await engine.dispose()
+
+
+async def test_engine_bound_conflict_does_not_leak_name_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(audit_service, "session_factory", factory)
+    user_id: int | None = None
+    customer_id: int | None = None
+    function_id: int | None = None
+    name = f"生产冲突-{uuid4().hex}"
+
+    try:
+        async with factory() as setup:
+            user = await make_user(setup)
+            customer = await make_customer_row(setup, owner=user)
+            existing = ContactFunction(
+                name=name,
+                customer_id=None,
+                scope_key=0,
+                status=ContactStatus.ACTIVE,
+            )
+            setup.add(existing)
+            await setup.commit()
+            user_id = user.id
+            customer_id = customer.id
+            function_id = existing.id
+
+        async with factory() as app_session:
+            with pytest.raises(BusinessError) as exc:
+                await create_shared_function(
+                    app_session,
+                    name,
+                    context=make_context(user, is_super_admin=True),
+                )
+        assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+        await _assert_name_lock_is_free(engine)
+    finally:
+        async with factory() as cleanup:
+            if function_id is not None:
+                await cleanup.execute(
+                    delete(ContactFunction).where(ContactFunction.id == function_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(AuditLog).where(AuditLog.user_id == user_id)
+                )
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.id == customer_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+        await engine.dispose()
 
 
 async def test_cross_scope_name_writes_are_serialized(
