@@ -2,14 +2,20 @@
 
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.models.user_profile import UserProfile
 from app.repositories import department as department_repository
 from app.repositories import user as user_repository
 from app.repositories import user_profile as user_profile_repository
-from app.schemas.profile import ProfileRead
+from app.schemas.profile import ProfileRead, ProfileUpdate
+from app.services.audit import audited
+
+_UNSET = object()
+_JSON_LIST_FIELDS = frozenset({"expertise_tags", "personal_links"})
 
 
 def profile_values(profile: UserProfile | None) -> dict[str, Any]:
@@ -105,4 +111,70 @@ async def get_my_profile(session: AsyncSession, *, user_id: int) -> ProfileRead:
     )
 
 
-__all__: tuple[str, ...] = ("get_my_profile", "profile_values")
+def _is_duplicate_profile(error: IntegrityError) -> bool:
+    args = getattr(error.orig, "args", ())
+    return bool(args and args[0] == 1062)
+
+
+@audited(
+    action="user_profile:update",
+    resource_type="user_profile",
+    resource_id_param="user_id",
+)
+async def update_my_profile(
+    session: AsyncSession,
+    payload: ProfileUpdate,
+    *,
+    user_id: int,
+    context: AuthContext,
+) -> ProfileRead:
+    provided = payload.model_dump(exclude_unset=True)
+
+    user = await user_repository.get_by_id(session, user_id)
+    if user is None:
+        raise BusinessError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found",
+            http_status=404,
+        )
+
+    nickname = provided.pop("nickname", _UNSET)
+    nickname_provided = nickname is not _UNSET
+    if nickname_provided:
+        user.nickname = nickname if isinstance(nickname, str) else None
+
+    if provided:
+        profile = await user_profile_repository.get_by_user_id(session, user_id)
+        if profile is None:
+            candidate = UserProfile(user_id=user_id)
+            try:
+                async with session.begin_nested():
+                    await user_profile_repository.add(session, candidate)
+                profile = candidate
+            except IntegrityError as error:
+                if not _is_duplicate_profile(error):
+                    raise
+                profile = await user_profile_repository.lock_by_user_id(
+                    session,
+                    user_id,
+                )
+                if profile is None:
+                    raise
+
+        for field, value in provided.items():
+            if field in _JSON_LIST_FIELDS:
+                setattr(profile, field, value if isinstance(value, list) else [])
+            else:
+                setattr(profile, field, value)
+
+    await session.commit()
+    if nickname_provided:
+        await session.refresh(user)
+    return await get_my_profile(session, user_id=user_id)
+
+
+__all__: tuple[str, ...] = (
+    "get_my_profile",
+    "profile_values",
+    "update_my_profile",
+)
