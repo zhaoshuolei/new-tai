@@ -269,6 +269,12 @@ async def import_from_tianyancha(
 
     client = await get_tianyancha_client(session)
     registration = await client.fetch_registration(code)
+    if not registration.name.strip():
+        raise BusinessError(
+            ErrorCode.TIANYANCHA_MALFORMED_RESPONSE,
+            "Tianyancha returned an empty enterprise name",
+            http_status=502,
+        )
     if registration.credit_code.strip().upper() != code:
         raise BusinessError(
             ErrorCode.TIANYANCHA_MALFORMED_RESPONSE,

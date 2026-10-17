@@ -1,6 +1,7 @@
 import pytest
 from cryptography.fernet import Fernet
 
+from app.core.config import settings
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.errors import BusinessError, ErrorCode
 
@@ -43,5 +44,16 @@ def test_ciphertext_from_different_key_raises_unreadable() -> None:
 
     with pytest.raises(BusinessError) as exc:
         decrypt_secret(foreign_ciphertext)
+    assert exc.value.code == ErrorCode.TIANYANCHA_TOKEN_UNREADABLE
+    assert exc.value.http_status == 503
+
+
+def test_valid_token_with_invalid_utf8_plaintext_raises_unreadable() -> None:
+    # Fernet 校验通过但明文不是合法 UTF-8 时，同样必须映射为 8002，而不是
+    # 把 UnicodeDecodeError 冒泡成 500。
+    token = Fernet(settings.config_encryption_key).encrypt(b"\xff\xfe").decode("utf-8")
+
+    with pytest.raises(BusinessError) as exc:
+        decrypt_secret(token)
     assert exc.value.code == ErrorCode.TIANYANCHA_TOKEN_UNREADABLE
     assert exc.value.http_status == 503

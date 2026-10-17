@@ -306,6 +306,29 @@ async def test_import_refuses_when_upstream_subject_differs(
     assert await count_customers(session) == 0
 
 
+@pytest.mark.parametrize("bad_name", ["", "   "])
+async def test_import_rejects_missing_enterprise_name(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+    bad_name: str,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    fake_client.registration = replace(fake_client.registration, name=bad_name)
+
+    with pytest.raises(BusinessError) as exc:
+        await import_from_tianyancha(
+            session,
+            REQUESTED_CREDIT_CODE,
+            None,
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.TIANYANCHA_MALFORMED_RESPONSE
+    assert exc.value.http_status == 502
+    assert await count_customers(session) == 0
+
+
 async def test_import_success_maps_fields_and_resolves_scope(
     session: AsyncSession,
     fake_client: FakeTianyanchaClient,

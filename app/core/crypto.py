@@ -20,7 +20,7 @@ def decrypt_secret(ciphertext: str) -> str:
     """
     try:
         return _FERNET.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
-    except InvalidToken:
+    except (InvalidToken, UnicodeDecodeError):
         raise BusinessError(
             ErrorCode.TIANYANCHA_TOKEN_UNREADABLE,
             "Stored credential cannot be read; please re-save it",
