@@ -460,7 +460,7 @@ def _sync_feishu_profile(
         user.nickname = info.name
     if not user.email and info.email:
         user.email = info.email
-    if info.avatar_url:
+    if not user.avatar and info.avatar_url:
         user.avatar = info.avatar_url
     user.last_login_at = login_at
 
