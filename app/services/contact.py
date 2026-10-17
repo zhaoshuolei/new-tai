@@ -5,21 +5,23 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Literal
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
-from app.models.contact import ContactFunction, ContactStatus
+from app.models.contact import (
+    ContactFunction,
+    ContactFunctionNameLock,
+    ContactStatus,
+)
 from app.models.customer import Customer
 from app.repositories import contact as contact_repository
 from app.services.audit import audited
 from app.services.data_scope import apply_customer_scope
 
 FunctionScope = Literal["SHARED", "CUSTOM"]
-_NAME_LOCK_NAME = "contact_function_name"
-_NAME_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _forbidden_error() -> BusinessError:
@@ -95,59 +97,29 @@ def _normalize_name(name: str) -> str:
     return value
 
 
-def _name_change_concurrent_error() -> BusinessError:
-    return BusinessError(
-        ErrorCode.CONTACT_FUNCTION_NAME_EXISTS,
-        "Contact function name is being changed concurrently",
-        http_status=409,
-    )
-
-
 def _require_super_admin(context: AuthContext) -> None:
     if not context.is_super_admin:
         raise _forbidden_error()
 
 
-def _async_engine_for(session: AsyncSession) -> AsyncEngine:
-    # AsyncSession.get_bind() exposes SQLAlchemy's synchronous engine/connection
-    # mirror, so consult the async bind to open a truly independent connection.
-    bind = session.get_bind()
-    if isinstance(bind, AsyncConnection):
-        return bind.engine
-    if isinstance(bind, AsyncEngine):
-        return bind
-
-    session_bind = session.bind
-    if isinstance(session_bind, AsyncConnection):
-        return session_bind.engine
-    if isinstance(session_bind, AsyncEngine):
-        return session_bind
-    raise TypeError("AsyncSession must be bound to an async engine or connection")
-
-
 @asynccontextmanager
 async def _serialize_name_change(session: AsyncSession) -> AsyncIterator[None]:
-    engine = _async_engine_for(session)
-    async with engine.connect() as lock_connection:
-        try:
-            acquired = await lock_connection.scalar(
-                text("SELECT GET_LOCK(:lock_name, :timeout)"),
-                {
-                    "lock_name": _NAME_LOCK_NAME,
-                    "timeout": _NAME_LOCK_TIMEOUT_SECONDS,
-                },
-            )
-            if acquired != 1:
-                raise _name_change_concurrent_error()
-            yield
-        except BaseException:
-            await session.rollback()
-            raise
-        finally:
-            await lock_connection.scalar(
-                text("SELECT RELEASE_LOCK(:lock_name)"),
-                {"lock_name": _NAME_LOCK_NAME},
-            )
+    lock_id = await session.scalar(
+        select(ContactFunctionNameLock.id)
+        .where(ContactFunctionNameLock.id == 1)
+        .with_for_update()
+    )
+    if lock_id is None:
+        raise RuntimeError(
+            "contact_function_name_lock singleton row id=1 is missing; "
+            "apply the database migration"
+        )
+
+    try:
+        yield
+    except BaseException:
+        await session.rollback()
+        raise
 
 
 async def _require_visible_active_customer(

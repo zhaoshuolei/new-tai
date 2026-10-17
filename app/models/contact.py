@@ -8,6 +8,7 @@ from sqlalchemy import (
     Computed,
     Enum,
     ForeignKey,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -21,6 +22,18 @@ from app.db.base import Base
 class ContactStatus(StrEnum):
     ACTIVE = "ACTIVE"
     DELETED = "DELETED"
+
+
+class ContactFunctionNameLock(Base):
+    """用于串行化职能名称校验与写入的单例行锁。"""
+
+    __tablename__ = "contact_function_name_lock"
+
+    id: Mapped[int] = mapped_column(
+        SmallInteger,
+        primary_key=True,
+        autoincrement=False,
+    )
 
 
 class ContactFunction(Base):
@@ -105,4 +118,9 @@ class CustomerContact(Base):
     deleted_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
-__all__: tuple[str, ...] = ("ContactFunction", "ContactStatus", "CustomerContact")
+__all__: tuple[str, ...] = (
+    "ContactFunction",
+    "ContactFunctionNameLock",
+    "ContactStatus",
+    "CustomerContact",
+)

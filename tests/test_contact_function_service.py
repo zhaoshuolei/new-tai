@@ -4,9 +4,8 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, event, select
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -14,11 +13,14 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.errors import BusinessError, ErrorCode
 from app.models.audit_log import AuditLog, AuditResult
-from app.models.contact import ContactFunction, ContactStatus
+from app.models.contact import (
+    ContactFunction,
+    ContactFunctionNameLock,
+    ContactStatus,
+)
 from app.models.customer import Customer
 from app.models.user import User
 from app.services import audit as audit_service
-from app.services import contact as contact_service
 from app.services.contact import (
     create_custom_function,
     create_shared_function,
@@ -44,13 +46,17 @@ from tests.customer_helpers import (
 __all__ = ("session",)
 
 
-async def _assert_name_lock_is_free(engine: AsyncEngine) -> None:
-    async with engine.connect() as connection:
-        lock_owner = await connection.scalar(
-            text("SELECT IS_USED_LOCK(:lock_name)"),
-            {"lock_name": contact_service._NAME_LOCK_NAME},
+async def _assert_name_lock_row_available(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with factory() as probe:
+        lock_id = await probe.scalar(
+            select(ContactFunctionNameLock.id)
+            .where(ContactFunctionNameLock.id == 1)
+            .with_for_update(nowait=True)
         )
-    assert lock_owner is None
+        assert lock_id == 1
+        await probe.rollback()
 
 
 @pytest_asyncio.fixture
@@ -243,7 +249,7 @@ async def test_engine_bound_create_commits_and_releases_name_lock(
             )
         assert row is not None
         assert row.name == name
-        await _assert_name_lock_is_free(engine)
+        await _assert_name_lock_row_available(factory)
     finally:
         async with factory() as cleanup:
             if function_id is not None:
@@ -302,7 +308,7 @@ async def test_engine_bound_conflict_does_not_leak_name_lock(
                     context=make_context(user, is_super_admin=True),
                 )
         assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
-        await _assert_name_lock_is_free(engine)
+        await _assert_name_lock_row_available(factory)
     finally:
         async with factory() as cleanup:
             if function_id is not None:
@@ -323,10 +329,7 @@ async def test_engine_bound_conflict_does_not_leak_name_lock(
         await engine.dispose()
 
 
-async def test_cross_scope_name_writes_are_serialized(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(contact_service, "_NAME_LOCK_TIMEOUT_SECONDS", 1.0)
+async def test_cross_scope_name_writes_are_serialized() -> None:
     engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     user_id: int | None = None
@@ -334,7 +337,23 @@ async def test_cross_scope_name_writes_are_serialized(
     function_id: int | None = None
     sessions: list[AsyncSession] = []
     attempt: asyncio.Future[ContactFunction] | None = None
+    lock_attempted = asyncio.Event()
+    loop = asyncio.get_running_loop()
     name = f"并发职能-{uuid4().hex}"
+
+    def on_before_cursor_execute(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _execution_context: object,
+        _executemany: bool,
+    ) -> None:
+        if (
+            "contact_function_name_lock" in statement
+            and "FOR UPDATE" in statement.upper()
+        ):
+            loop.call_soon_threadsafe(lock_attempted.set)
 
     try:
         async with factory() as setup:
@@ -357,17 +376,21 @@ async def test_cross_scope_name_writes_are_serialized(
             )
             == customer.id
         )
-
-        async with engine.connect() as lock_connection:
-            acquired = await lock_connection.scalar(
-                text("SELECT GET_LOCK(:lock_name, :timeout)"),
-                {
-                    "lock_name": contact_service._NAME_LOCK_NAME,
-                    "timeout": contact_service._NAME_LOCK_TIMEOUT_SECONDS,
-                },
+        assert (
+            await session_a.scalar(
+                select(ContactFunctionNameLock.id)
+                .where(ContactFunctionNameLock.id == 1)
+                .with_for_update()
             )
-            assert acquired == 1
+            == 1
+        )
 
+        event.listen(
+            engine.sync_engine,
+            "before_cursor_execute",
+            on_before_cursor_execute,
+        )
+        try:
             attempt = asyncio.ensure_future(
                 create_custom_function(
                     session_b,
@@ -376,7 +399,7 @@ async def test_cross_scope_name_writes_are_serialized(
                     context=context,
                 )
             )
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(lock_attempted.wait(), timeout=3.0)
             assert not attempt.done()
 
             shared = ContactFunction(
@@ -391,17 +414,15 @@ async def test_cross_scope_name_writes_are_serialized(
             await session_a.commit()
             function_id = shared.id
 
-            assert (
-                await lock_connection.scalar(
-                    text("SELECT RELEASE_LOCK(:lock_name)"),
-                    {"lock_name": contact_service._NAME_LOCK_NAME},
-                )
-                == 1
+            with pytest.raises(BusinessError) as exc:
+                await asyncio.wait_for(attempt, timeout=3.0)
+            assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+        finally:
+            event.remove(
+                engine.sync_engine,
+                "before_cursor_execute",
+                on_before_cursor_execute,
             )
-
-        with pytest.raises(BusinessError) as exc:
-            await asyncio.wait_for(attempt, timeout=3.0)
-        assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
 
         async with factory() as verify:
             assert (
@@ -409,7 +430,12 @@ async def test_cross_scope_name_writes_are_serialized(
                     select(ContactFunction).where(ContactFunction.id == function_id)
                 )
             ) is not None
+        await _assert_name_lock_row_available(factory)
     finally:
+        if attempt is not None and not attempt.done():
+            attempt.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await attempt
         for open_session in sessions:
             await open_session.close()
         async with factory() as cleanup:
@@ -417,6 +443,9 @@ async def test_cross_scope_name_writes_are_serialized(
                 await cleanup.execute(
                     delete(ContactFunction).where(ContactFunction.id == function_id)
                 )
+            await cleanup.execute(
+                delete(ContactFunction).where(ContactFunction.name == name)
+            )
             if customer_id is not None:
                 await cleanup.execute(
                     delete(ContactFunction).where(
@@ -477,40 +506,18 @@ async def test_rename_to_own_current_name_succeeds(
     assert renamed.name == original_name
 
 
-async def test_name_lock_timeout_returns_7007(
-    session,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(contact_service, "_NAME_LOCK_TIMEOUT_SECONDS", 0.1)
-    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    holder = factory()
+async def test_missing_name_lock_row_fails_loudly(session) -> None:
     user = await make_user(session)
+    await session.execute(
+        delete(ContactFunctionNameLock).where(ContactFunctionNameLock.id == 1)
+    )
 
-    try:
-        acquired = await holder.scalar(
-            text("SELECT GET_LOCK(:lock_name, :timeout)"),
-            {
-                "lock_name": contact_service._NAME_LOCK_NAME,
-                "timeout": 1.0,
-            },
+    with pytest.raises(RuntimeError, match="contact_function_name_lock"):
+        await create_shared_function(
+            session,
+            "缺少锁行",
+            context=make_context(user, is_super_admin=True),
         )
-        assert acquired == 1
-
-        with pytest.raises(BusinessError) as exc:
-            await create_shared_function(
-                session,
-                "锁定超时",
-                context=make_context(user, is_super_admin=True),
-            )
-
-        assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
-        assert exc.value.message == (
-            "Contact function name is being changed concurrently"
-        )
-    finally:
-        await holder.close()
-        await engine.dispose()
 
 
 async def test_shared_rename_clashing_with_custom_is_rejected(session) -> None:
