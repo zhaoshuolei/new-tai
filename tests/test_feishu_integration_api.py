@@ -16,14 +16,15 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.clients.feishu import FeishuClient
+from app.core import exception_handlers
 from app.core.audit_meta import get_audit_route_meta
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.deps import get_current_context
-from app.core.errors import ErrorCode
+from app.core.errors import BusinessError, ErrorCode
 from app.db.session import get_session
 from app.main import create_app
-from app.models.audit_log import AuditLog
+from app.models.audit_log import AuditLog, AuditResult
 from app.models.integration_config import IntegrationConfig
 from app.services import audit as audit_service
 from tests.feishu_helpers import add_feishu_config
@@ -123,6 +124,14 @@ def api_client_factory(
     return factory
 
 
+async def audit_rows(
+    factory: async_sessionmaker[AsyncSession],
+) -> list[AuditLog]:
+    async with factory() as audit_session:
+        rows = await audit_session.scalars(select(AuditLog).order_by(AuditLog.id))
+        return list(rows.all())
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
@@ -181,6 +190,7 @@ async def test_get_returns_source_without_secret(
         response = await client.get(FEISHU_PATH)
 
     assert response.status_code == 200
+    assert response.json()["message"] == "ok"
     data = response.json()["data"]
     assert data["source"] == "database"
     assert data["app_id"] == "cli-test"
@@ -299,6 +309,137 @@ def test_feishu_write_routes_have_audit_metadata(method: str) -> None:
     assert meta is not None
     assert meta.action == "integration_feishu:update"
     assert meta.resource_type == "integration"
+
+
+async def test_put_success_records_audit_without_secret(
+    api_client_factory: ApiClientFactory,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        FeishuClient,
+        "verify_app_credentials",
+        AsyncMock(return_value=None),
+    )
+
+    async with api_client_factory(permissions=("integration_feishu:update",)) as client:
+        response = await client.put(
+            FEISHU_PATH,
+            json={"app_id": "cli-audit", "app_secret": "audit-secret"},
+        )
+
+    assert response.status_code == 200
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    assert rows[0].action == "integration_feishu:update"
+    assert rows[0].resource_type == "integration"
+    assert rows[0].result is AuditResult.SUCCESS
+    assert "audit-secret" not in repr(rows[0].__dict__)
+
+
+async def test_delete_is_audited_even_when_idempotent(
+    api_client_factory: ApiClientFactory,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with api_client_factory(permissions=("integration_feishu:update",)) as client:
+        first = await client.delete(FEISHU_PATH)
+        second = await client.delete(FEISHU_PATH)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 2
+    assert all(row.result is AuditResult.SUCCESS for row in rows)
+
+
+async def test_permission_denial_is_audited_but_test_probe_is_not(
+    api_client_factory: ApiClientFactory,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await add_feishu_config(session)
+    monkeypatch.setattr(
+        FeishuClient,
+        "verify_app_credentials",
+        AsyncMock(return_value=None),
+    )
+
+    async with api_client_factory(permissions=("integration_feishu:read",)) as client:
+        denied = await client.put(
+            FEISHU_PATH,
+            json={"app_id": "cli-denied", "app_secret": "denied-secret"},
+        )
+    assert denied.status_code == 403
+
+    async with api_client_factory(permissions=("integration_feishu:update",)) as client:
+        tested = await client.post(FEISHU_TEST_PATH)
+    assert tested.status_code == 200
+
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.DENIED
+    assert rows[0].reason == "FORBIDDEN"
+    assert "denied-secret" not in repr(rows[0].__dict__)
+
+
+async def test_save_errors_and_logs_never_contain_secret(
+    api_client_factory: ApiClientFactory,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "never-log-this-app-secret"
+
+    async def reject(_self: FeishuClient) -> None:
+        raise BusinessError(
+            ErrorCode.FEISHU_CREDENTIALS_REJECTED,
+            "Feishu credentials rejected",
+            http_status=422,
+        )
+
+    monkeypatch.setattr(FeishuClient, "verify_app_credentials", reject)
+    with caplog.at_level("DEBUG"):
+        async with api_client_factory(
+            permissions=("integration_feishu:update",)
+        ) as client:
+            response = await client.put(
+                FEISHU_PATH,
+                json={"app_id": "cli-bad", "app_secret": secret},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.FEISHU_CREDENTIALS_REJECTED
+    assert secret not in response.text
+    assert secret not in caplog.text
+
+
+async def test_put_maps_upstream_failure_to_1011(
+    api_client_factory: ApiClientFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "upstream-secret"
+
+    async def fail(_self: FeishuClient) -> None:
+        raise BusinessError(
+            ErrorCode.FEISHU_UPSTREAM_ERROR,
+            "Feishu upstream request failed",
+            http_status=502,
+        )
+
+    record_exception = AsyncMock(return_value=None)
+    monkeypatch.setattr(FeishuClient, "verify_app_credentials", fail)
+    monkeypatch.setattr(exception_handlers, "record_exception", record_exception)
+
+    async with api_client_factory(permissions=("integration_feishu:update",)) as client:
+        response = await client.put(
+            FEISHU_PATH,
+            json={"app_id": "cli-upstream", "app_secret": secret},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert secret not in response.text
+    record_exception.assert_awaited_once()
 
 
 async def test_test_probe_is_not_audited(
