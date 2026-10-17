@@ -1,6 +1,6 @@
 """第三方集成配置数据访问。"""
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,3 +60,13 @@ async def upsert(
     # 刷新以加载数据库生成的 created_at/updated_at，避免惰性读取触发 MissingGreenlet。
     await session.refresh(config)
     return config
+
+
+async def delete_by_provider(
+    session: AsyncSession,
+    provider: str,
+) -> bool:
+    result = await session.execute(
+        delete(IntegrationConfig).where(IntegrationConfig.provider == provider)
+    )
+    return bool(getattr(result, "rowcount", 0) or 0)
