@@ -4,13 +4,18 @@ from contextlib import asynccontextmanager
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.router import api_v1_router
-from app.core.config import settings
+from app.core.config import (
+    normalize_media_url_path,
+    resolve_media_root,
+    settings,
+)
 from app.core.exception_handlers import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware, configure_security
@@ -26,6 +31,7 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {"name": "部门", "description": "部门管理"},
     {"name": "客户", "description": "客户档案与负责人管理"},
     {"name": "集成", "description": "第三方集成配置"},
+    {"name": "系统设置", "description": "网站基础信息与品牌资源"},
     {"name": "健康", "description": "服务健康检查"},
 ]
 
@@ -135,6 +141,14 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(auth_router)
     application.include_router(api_v1_router)
+    media_url_path = normalize_media_url_path(settings.media_url_path)
+    media_root = resolve_media_root(settings.media_root)
+    media_root.mkdir(parents=True, exist_ok=True)
+    application.mount(
+        media_url_path,
+        StaticFiles(directory=str(media_root), check_dir=False),
+        name="media",
+    )
     return application
 
 
