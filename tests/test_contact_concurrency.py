@@ -99,10 +99,16 @@ async def test_concurrent_create_and_function_delete_leave_no_dangling_reference
                     return f"err:{error.code}"
                 return "ok"
 
+        create_task = asyncio.create_task(create())
+        delete_task = asyncio.create_task(delete_function())
         create_result, delete_result = await asyncio.gather(
-            create(),
-            delete_function(),
+            create_task,
+            delete_task,
+            return_exceptions=True,
         )
+        for result in (create_result, delete_result):
+            if isinstance(result, BaseException):
+                raise result
 
         async with factory() as check:
             dangling_ids = (
