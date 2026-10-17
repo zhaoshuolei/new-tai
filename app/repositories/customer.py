@@ -1,9 +1,12 @@
 """客户数据访问。"""
 
+from datetime import UTC, datetime
+
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.models.contact import ContactStatus
 from app.models.customer import Customer, CustomerSource
 
 
@@ -12,6 +15,17 @@ async def get_by_id(session: AsyncSession, customer_id: int) -> Customer | None:
 
 
 async def get_by_credit_code(
+    session: AsyncSession,
+    credit_code: str,
+) -> Customer | None:
+    statement = select(Customer).where(
+        Customer.credit_code == credit_code,
+        Customer.status == ContactStatus.ACTIVE,
+    )
+    return await session.scalar(statement)
+
+
+async def get_by_credit_code_any_status(
     session: AsyncSession,
     credit_code: str,
 ) -> Customer | None:
@@ -28,8 +42,21 @@ async def add(session: AsyncSession, customer: Customer) -> Customer:
     return customer
 
 
-async def delete(session: AsyncSession, customer: Customer) -> None:
-    await session.delete(customer)
+async def soft_delete(
+    session: AsyncSession,
+    customer: Customer,
+    *,
+    deleted_by: int,
+) -> None:
+    customer.status = ContactStatus.DELETED
+    customer.deleted_at = datetime.now(UTC).replace(tzinfo=None)
+    customer.deleted_by = deleted_by
+
+
+async def restore(session: AsyncSession, customer: Customer) -> None:
+    customer.status = ContactStatus.ACTIVE
+    customer.deleted_at = None
+    customer.deleted_by = None
 
 
 async def has_customers(session: AsyncSession, user_id: int) -> bool:
@@ -45,9 +72,7 @@ async def has_customers_for_update(session: AsyncSession, user_id: int) -> bool:
     外键冲突时用它复核归属，避免漏判导致裸 IntegrityError 冒泡成 500。
     """
     statement = (
-        select(Customer.id)
-        .where(Customer.owner_user_id == user_id)
-        .with_for_update()
+        select(Customer.id).where(Customer.owner_user_id == user_id).with_for_update()
     )
     return (await session.scalars(statement)).first() is not None
 
@@ -60,8 +85,12 @@ async def list_customers(
     scope_filter: ColumnElement[bool],
     keyword: str | None,
     source: CustomerSource | None,
+    status: ContactStatus = ContactStatus.ACTIVE,
 ) -> tuple[list[Customer], int]:
-    conditions: list[ColumnElement[bool]] = [scope_filter]
+    conditions: list[ColumnElement[bool]] = [
+        scope_filter,
+        Customer.status == status,
+    ]
     if keyword:
         pattern = f"%{keyword}%"
         conditions.append(
@@ -94,7 +123,10 @@ async def credit_codes_existing(
 ) -> dict[str, Customer]:
     if not codes:
         return {}
-    statement = select(Customer).where(Customer.credit_code.in_(codes))
+    statement = select(Customer).where(
+        Customer.credit_code.in_(codes),
+        Customer.status == ContactStatus.ACTIVE,
+    )
     result = await session.scalars(statement)
     return {
         customer.credit_code: customer
@@ -106,10 +138,12 @@ async def credit_codes_existing(
 __all__: tuple[str, ...] = (
     "add",
     "credit_codes_existing",
-    "delete",
     "get_by_credit_code",
+    "get_by_credit_code_any_status",
     "get_by_id",
     "has_customers",
     "has_customers_for_update",
     "list_customers",
+    "restore",
+    "soft_delete",
 )

@@ -13,10 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.tianyancha import parse_change_scope_records
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
+from app.models.contact import ContactStatus
 from app.models.customer import Customer, CustomerSource
 from app.models.user import User, UserStatus
 from app.repositories import customer as customer_repository
-from app.repositories.customer import get_by_credit_code
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services.audit import audited
 from app.services.customer_scope_text import (
@@ -63,6 +63,30 @@ def _owner_unavailable_error() -> BusinessError:
         ErrorCode.CUSTOMER_OWNER_UNAVAILABLE,
         "Owner is unavailable",
         http_status=422,
+    )
+
+
+def _record_not_deleted_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.RECORD_NOT_DELETED,
+        "Customer is not deleted",
+        http_status=409,
+    )
+
+
+def _forbidden_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.FORBIDDEN,
+        "Permission denied",
+        http_status=403,
+    )
+
+
+def _deleted_credit_code_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CUSTOMER_DELETED_CREDIT_CODE_EXISTS,
+        "Unified social credit code belongs to a deleted customer",
+        http_status=409,
     )
 
 
@@ -146,13 +170,28 @@ async def _duplicate_error(
     )
 
 
+async def _credit_code_conflict_error(
+    session: AsyncSession,
+    existing: Customer,
+    context: AuthContext,
+) -> BusinessError:
+    if existing.status == ContactStatus.DELETED:
+        return _deleted_credit_code_error()
+    return await _duplicate_error(session, existing, context)
+
+
 async def _get_scoped_customer(
     session: AsyncSession,
     customer_id: int,
     context: AuthContext,
+    *,
+    status: ContactStatus = ContactStatus.ACTIVE,
 ) -> Customer | None:
     statement = apply_customer_scope(
-        select(Customer).where(Customer.id == customer_id),
+        select(Customer).where(
+            Customer.id == customer_id,
+            Customer.status == status,
+        ),
         context,
     )
     result = await session.scalar(statement)
@@ -163,8 +202,15 @@ async def _require_scoped_customer(
     session: AsyncSession,
     customer_id: int,
     context: AuthContext,
+    *,
+    status: ContactStatus = ContactStatus.ACTIVE,
 ) -> Customer:
-    customer = await _get_scoped_customer(session, customer_id, context)
+    customer = await _get_scoped_customer(
+        session,
+        customer_id,
+        context,
+        status=status,
+    )
     if customer is None:
         raise _not_found_error()
     return customer
@@ -262,9 +308,9 @@ async def import_from_tianyancha(
 ) -> Customer:
     code = _normalize_credit_code(credit_code)
 
-    existing = await customer_repository.get_by_credit_code(session, code)
+    existing = await customer_repository.get_by_credit_code_any_status(session, code)
     if existing is not None:
-        duplicate = await _duplicate_error(session, existing, context)
+        duplicate = await _credit_code_conflict_error(session, existing, context)
         raise duplicate
 
     client = await get_tianyancha_client(session)
@@ -336,9 +382,11 @@ async def create_customer(
 
     code = _normalize_optional_credit_code(payload.credit_code)
     if code is not None:
-        existing = await customer_repository.get_by_credit_code(session, code)
+        existing = await customer_repository.get_by_credit_code_any_status(
+            session, code
+        )
         if existing is not None:
-            duplicate = await _duplicate_error(session, existing, context)
+            duplicate = await _credit_code_conflict_error(session, existing, context)
             raise duplicate
 
     customer = Customer(
@@ -402,9 +450,13 @@ async def update_customer(
         code = _normalize_optional_credit_code(changes["credit_code"])
         changes["credit_code"] = code
         if code is not None and code != customer.credit_code:
-            existing = await get_by_credit_code(session, code)
+            existing = await customer_repository.get_by_credit_code_any_status(
+                session, code
+            )
             if existing is not None and existing.id != customer.id:
-                duplicate = await _duplicate_error(session, existing, context)
+                duplicate = await _credit_code_conflict_error(
+                    session, existing, context
+                )
                 raise duplicate
         updated_credit_code = code
 
@@ -453,9 +505,52 @@ async def delete_customer(
     context: AuthContext,
 ) -> None:
     customer = await _require_scoped_customer(session, customer_id, context)
-    await customer_repository.delete(session, customer)
+    await customer_repository.soft_delete(
+        session,
+        customer,
+        deleted_by=context.user_id,
+    )
     await session.flush()
     await session.commit()
+
+
+@audited(
+    action="customer:restore",
+    resource_type="customer",
+    resource_id_param="customer_id",
+)
+async def restore_customer(
+    session: AsyncSession,
+    customer_id: int,
+    *,
+    context: AuthContext,
+) -> Customer:
+    active = await _get_scoped_customer(session, customer_id, context)
+    if active is not None:
+        raise _record_not_deleted_error()
+
+    customer = await _get_scoped_customer(
+        session,
+        customer_id,
+        context,
+        status=ContactStatus.DELETED,
+    )
+    if customer is None:
+        raise _not_found_error()
+
+    if customer.credit_code is not None:
+        existing = await customer_repository.get_by_credit_code(
+            session, customer.credit_code
+        )
+        if existing is not None and existing.id != customer.id:
+            duplicate = await _duplicate_error(session, existing, context)
+            raise duplicate
+
+    await customer_repository.restore(session, customer)
+    await session.flush()
+    await session.refresh(customer)
+    await session.commit()
+    return customer
 
 
 @audited(
@@ -470,7 +565,30 @@ async def transfer_owner(
     *,
     context: AuthContext,
 ) -> Customer:
-    customer = await _require_scoped_customer(session, customer_id, context)
+    customer = await _get_scoped_customer(
+        session,
+        customer_id,
+        context,
+        status=ContactStatus.ACTIVE,
+    )
+    required_permission = "customer:update"
+
+    if customer is None:
+        customer = await _get_scoped_customer(
+            session,
+            customer_id,
+            context,
+            status=ContactStatus.DELETED,
+        )
+        required_permission = "customer:delete"
+    if customer is None:
+        raise _not_found_error()
+
+    if (
+        not context.is_super_admin
+        and required_permission not in context.permission_codes
+    ):
+        raise _forbidden_error()
 
     target = await session.get(User, owner_user_id)
     if target is None or target.status != UserStatus.ACTIVE:
@@ -508,6 +626,25 @@ async def list_customers(
         scope_filter=build_customer_scope_filter(context),
         keyword=keyword,
         source=source,
+        status=ContactStatus.ACTIVE,
+    )
+
+
+async def list_deleted_customers(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+    page: int,
+    page_size: int,
+) -> tuple[list[Customer], int]:
+    return await customer_repository.list_customers(
+        session,
+        page=page,
+        page_size=page_size,
+        scope_filter=build_customer_scope_filter(context),
+        keyword=None,
+        source=None,
+        status=ContactStatus.DELETED,
     )
 
 
@@ -517,6 +654,8 @@ __all__: tuple[str, ...] = (
     "get_customer",
     "import_from_tianyancha",
     "list_customers",
+    "list_deleted_customers",
+    "restore_customer",
     "search_candidates",
     "transfer_owner",
     "update_customer",

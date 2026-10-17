@@ -10,16 +10,17 @@ from sqlalchemy import select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.models.contact import ContactStatus
 from app.models.customer import Customer, CustomerSource
 from app.models.department import Department, DepartmentStatus
 from app.models.user import User, UserStatus
 from app.repositories.customer import (
     add,
     credit_codes_existing,
-    delete,
     get_by_credit_code,
     get_by_id,
     list_customers,
+    soft_delete,
 )
 
 TEST_DATABASE_URL = os.environ.get(
@@ -121,7 +122,7 @@ async def test_get_by_credit_code_returns_none_for_missing_code(
     assert await get_by_credit_code(session, "91110000MA00000099") is None
 
 
-async def test_get_by_id_and_delete_roundtrip(session: AsyncSession) -> None:
+async def test_get_by_id_and_soft_delete_roundtrip(session: AsyncSession) -> None:
     owner = await make_user(session)
     customer = await add(
         session,
@@ -132,13 +133,14 @@ async def test_get_by_id_and_delete_roundtrip(session: AsyncSession) -> None:
     assert loaded is not None
     assert loaded.id == customer.id
 
-    await delete(session, loaded)
+    await soft_delete(session, loaded, deleted_by=owner.id)
     await session.flush()
 
-    remaining = await session.scalar(
-        select(Customer).where(Customer.id == customer.id)
-    )
-    assert remaining is None
+    remaining = await session.scalar(select(Customer).where(Customer.id == customer.id))
+    assert remaining is not None
+    assert remaining.status == ContactStatus.DELETED
+    assert remaining.deleted_at is not None
+    assert remaining.deleted_by == owner.id
 
 
 async def test_business_scope_truncated_defaults_to_false(

@@ -145,6 +145,33 @@ async def import_customer(
 
 
 @router.get(
+    "/recycle-bin",
+    response_model=SuccessEnvelope[Page[CustomerRead]],
+    dependencies=[Depends(require_permission("customer:delete"))],
+)
+async def list_deleted_customers(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 20,
+) -> dict[str, Any]:
+    customers, total = await customer_service.list_deleted_customers(
+        session,
+        context=context,
+        page=page,
+        page_size=page_size,
+    )
+    return success(
+        Page[CustomerRead](
+            items=[CustomerRead.model_validate(customer) for customer in customers],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+    )
+
+
+@router.get(
     "/{customer_id}",
     response_model=SuccessEnvelope[CustomerRead],
     dependencies=[Depends(require_permission("customer:read"))],
@@ -200,10 +227,27 @@ async def delete_customer(
     return success(message="deleted")
 
 
+@router.post(
+    "/{customer_id}/restore",
+    response_model=SuccessEnvelope[CustomerRead],
+    dependencies=[Depends(require_permission("customer:delete"))],
+)
+async def restore_customer(
+    customer_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    customer = await customer_service.restore_customer(
+        session,
+        customer_id,
+        context=context,
+    )
+    return success(CustomerRead.model_validate(customer))
+
+
 @router.patch(
     "/{customer_id}/owner",
     response_model=SuccessEnvelope[CustomerRead],
-    dependencies=[Depends(require_permission("customer:update"))],
 )
 async def transfer_customer_owner(
     customer_id: int,
@@ -245,6 +289,12 @@ register_audit_route(
     resource_type="customer",
 )
 register_audit_route(
+    "POST",
+    "/customers/{customer_id}/restore",
+    action="customer:restore",
+    resource_type="customer",
+)
+register_audit_route(
     "PATCH",
     "/customers/{customer_id}/owner",
     action="customer:transfer",
@@ -258,6 +308,8 @@ __all__: tuple[str, ...] = (
     "get_customer",
     "import_customer",
     "list_customers",
+    "list_deleted_customers",
+    "restore_customer",
     "router",
     "search_candidates",
     "transfer_customer_owner",

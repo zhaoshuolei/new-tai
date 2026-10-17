@@ -3,14 +3,11 @@
 全部离线：天眼查客户端以替身注入，绝不发起真实网络调用（无真实 token）。
 """
 
-import os
-from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import date, datetime
 from uuid import uuid4
 
 import pytest
-import pytest_asyncio
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -18,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.clients.tianyancha import Candidate, RegistrationInfo
+from app.clients.tianyancha import Candidate
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.models.audit_log import AuditLog
@@ -40,13 +37,18 @@ from app.services.customer import (
     update_customer,
 )
 from app.services.integration import save_tianyancha_token
-
-TEST_DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
+from tests.customer_helpers import (
+    REQUESTED_CREDIT_CODE,
+    TEST_DATABASE_URL,
+    FakeTianyanchaClient,
+    make_context,
+    make_customer_row,
+    make_department,
+    make_user,
+    session,
 )
 
-REQUESTED_CREDIT_CODE = "911100007693890511"
+__all__ = ("session",)
 TRUNCATED_SCOPE = "互联网信息服务..."
 FULL_SCOPE = "互联网信息服务（含各类增值电信业务）完整经营范围全文。"
 
@@ -65,61 +67,6 @@ HISTORICAL_WITHOUT_MATCH = """
 """
 
 
-@pytest_asyncio.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
-    async with engine.connect() as connection:
-        transaction = await connection.begin()
-        test_session = AsyncSession(
-            bind=connection,
-            expire_on_commit=False,
-            join_transaction_mode="create_savepoint",
-        )
-        try:
-            yield test_session
-        finally:
-            await test_session.close()
-            await transaction.rollback()
-    await engine.dispose()
-
-
-class FakeTianyanchaClient:
-    """天眼查客户端替身，实现 Task 7 的三个方法，记录调用。"""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.search_calls: list[tuple[int, int]] = []
-        self.pages: dict[int, list[Candidate]] = {}
-        self.total = 0
-        self.registration = RegistrationInfo(
-            name="乐视网信息技术（北京）股份有限公司",
-            credit_code=REQUESTED_CREDIT_CODE,
-            legal_person="刘延峰",
-            registered_capital="398944.0192万人民币",
-            established_date="2004-11-30",
-            business_scope=TRUNCATED_SCOPE,
-            reg_status="存续",
-        )
-        self.registration_credit_code: str | None = None
-        self.historical_text = HISTORICAL_WITH_MATCH
-
-    async def search_candidates(
-        self, keyword: str, *, page: int, page_size: int
-    ) -> tuple[list[Candidate], int]:
-        self.calls.append(f"search:{page}:{page_size}")
-        self.search_calls.append((page, page_size))
-        return self.pages.get(page, []), self.total
-
-    async def fetch_registration(self, credit_code: str) -> RegistrationInfo:
-        self.calls.append("registration")
-        code = self.registration_credit_code or self.registration.credit_code
-        return replace(self.registration, credit_code=code)
-
-    async def fetch_historical_registration_text(self, credit_code: str) -> str:
-        self.calls.append("historical")
-        return self.historical_text
-
-
 @pytest.fixture
 def fake_client() -> FakeTianyanchaClient:
     return FakeTianyanchaClient()
@@ -133,84 +80,6 @@ def _inject_client(
         return fake_client
 
     monkeypatch.setattr(customer_service, "get_tianyancha_client", _get_client)
-
-
-async def make_department(
-    session: AsyncSession,
-    *,
-    name: str | None = None,
-    is_system: bool = False,
-) -> Department:
-    department = Department(
-        parent_id=None,
-        name=name or f"部门-{uuid4().hex[:8]}",
-        path="",
-        sort_order=0,
-        status=DepartmentStatus.ACTIVE,
-        is_system=is_system,
-    )
-    session.add(department)
-    await session.flush()
-    department.path = f"/{department.id}/"
-    await session.flush()
-    return department
-
-
-async def make_user(
-    session: AsyncSession,
-    *,
-    department: Department | None = None,
-    status: UserStatus = UserStatus.ACTIVE,
-) -> User:
-    user = User(
-        username=f"user-{uuid4().hex[:12]}",
-        password_hash=None,
-        status=status,
-        token_version=0,
-        department_id=department.id if department is not None else None,
-    )
-    session.add(user)
-    await session.flush()
-    return user
-
-
-def make_context(
-    user: User,
-    *,
-    data_scope: DataScope = DataScope.ALL,
-    is_super_admin: bool = False,
-    role_id: int | None = 1,
-) -> AuthContext:
-    return AuthContext(
-        user_id=user.id,
-        role_id=role_id,
-        department_id=user.department_id,
-        data_scope=data_scope,
-        custom_department_ids=frozenset(),
-        include_children=False,
-        permission_codes=frozenset(),
-        is_super_admin=is_super_admin,
-    )
-
-
-async def make_customer_row(
-    session: AsyncSession,
-    *,
-    owner: User,
-    credit_code: str | None = None,
-    name: str | None = None,
-    source: CustomerSource = CustomerSource.MANUAL,
-) -> Customer:
-    customer = Customer(
-        name=name or f"客户-{uuid4().hex[:8]}",
-        credit_code=credit_code,
-        source=source,
-        owner_user_id=owner.id,
-        owner_department_id=owner.department_id,
-    )
-    session.add(customer)
-    await session.flush()
-    return customer
 
 
 async def count_customers(session: AsyncSession) -> int:
@@ -609,7 +478,7 @@ async def test_invisible_customer_returns_not_found(
 
 async def test_transfer_to_missing_user_is_rejected(session: AsyncSession) -> None:
     caller = await make_user(session)
-    context = make_context(caller)
+    context = make_context(caller, permission_codes={"customer:update"})
     customer = await make_customer_row(session, owner=caller)
 
     with pytest.raises(BusinessError) as exc:
@@ -621,7 +490,7 @@ async def test_transfer_to_missing_user_is_rejected(session: AsyncSession) -> No
 
 async def test_transfer_to_disabled_user_is_rejected(session: AsyncSession) -> None:
     caller = await make_user(session)
-    context = make_context(caller)
+    context = make_context(caller, permission_codes={"customer:update"})
     customer = await make_customer_row(session, owner=caller)
     disabled = await make_user(session, status=UserStatus.DISABLED)
 
@@ -635,7 +504,11 @@ async def test_transfer_to_user_outside_scope_is_rejected(
     session: AsyncSession,
 ) -> None:
     caller = await make_user(session)
-    context = make_context(caller, data_scope=DataScope.SELF)
+    context = make_context(
+        caller,
+        permission_codes={"customer:update"},
+        data_scope=DataScope.SELF,
+    )
     customer = await make_customer_row(session, owner=caller)
     other = await make_user(session)
 
@@ -670,7 +543,7 @@ async def test_transfer_owner_invisible_customer_returns_not_found(
 
 async def test_transfer_resnapshots_owner_department(session: AsyncSession) -> None:
     caller = await make_user(session)
-    context = make_context(caller)
+    context = make_context(caller, permission_codes={"customer:update"})
     customer = await make_customer_row(session, owner=caller)
     target_department = await make_department(session)
     target = await make_user(session, department=target_department)
@@ -960,7 +833,9 @@ async def test_update_translates_concurrent_credit_code_conflict(
         return None
 
     monkeypatch.setattr(
-        customer_service, "get_by_credit_code", _proactive_lookup_none
+        customer_service.customer_repository,
+        "get_by_credit_code_any_status",
+        _proactive_lookup_none,
     )
 
     with pytest.raises(BusinessError) as exc:

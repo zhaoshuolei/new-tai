@@ -194,7 +194,10 @@ async def test_transfer_writes_audit_row(
 ) -> None:
     caller = await make_user(session)
     target = await make_user(session)
-    context = make_context(caller)
+    context = make_context(
+        caller,
+        permission_codes=frozenset({"customer:update"}),
+    )
     customer = await create_customer(
         session,
         CustomerCreate(name="转移客户"),
@@ -298,7 +301,10 @@ async def test_failed_operation_records_no_success_row(
 ) -> None:
     caller = await make_user(session)
     disabled = await make_user(session, status=UserStatus.DISABLED)
-    context = make_context(caller)
+    context = make_context(
+        caller,
+        permission_codes=frozenset({"customer:update"}),
+    )
     customer = await create_customer(
         session,
         CustomerCreate(name="失败转移客户"),
