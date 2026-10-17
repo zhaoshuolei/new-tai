@@ -15,10 +15,14 @@ from app.models.contact import (
     ContactFunction,
     ContactFunctionNameLock,
     ContactStatus,
+    CustomerContact,
 )
 from app.models.customer import Customer
 from app.repositories import contact as contact_repository
+from app.schemas.contact import ContactCreate, ContactUpdate
+from app.services import customer as customer_service
 from app.services.audit import audited
+from app.services.contact_validation import normalize_email, normalize_phone
 from app.services.data_scope import apply_customer_scope
 
 FunctionScope = Literal["SHARED", "CUSTOM"]
@@ -88,6 +92,38 @@ def _invalid_name_error(message: str) -> BusinessError:
     )
 
 
+def _contact_not_found_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CUSTOMER_CONTACT_NOT_FOUND,
+        "Customer contact not found",
+        http_status=404,
+    )
+
+
+def _contact_function_unavailable_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CONTACT_FUNCTION_UNAVAILABLE,
+        "Contact function is unavailable for this customer",
+        http_status=422,
+    )
+
+
+def _contact_not_deleted_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.RECORD_NOT_DELETED,
+        "Customer contact is not deleted",
+        http_status=409,
+    )
+
+
+def _invalid_contact_field_error(message: str) -> BusinessError:
+    return BusinessError(
+        ErrorCode.CUSTOMER_INVALID_FIELD,
+        message,
+        http_status=422,
+    )
+
+
 def _normalize_name(name: str) -> str:
     value = name.strip()
     if not value:
@@ -136,6 +172,111 @@ async def _require_visible_active_customer(
     )
     if await session.scalar(statement) is None:
         raise _customer_not_found_error()
+
+
+def _normalize_optional_contact_text(
+    value: object,
+    *,
+    field_name: str,
+    max_length: int | None = None,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _invalid_contact_field_error(f"Contact {field_name} is invalid")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if max_length is not None and len(normalized) > max_length:
+        raise _invalid_contact_field_error(
+            f"Contact {field_name} must not exceed {max_length} characters"
+        )
+    return normalized
+
+
+def _validate_contact_fields(changes: dict[str, object]) -> dict[str, object]:
+    if "name" in changes:
+        value = changes["name"]
+        if not isinstance(value, str):
+            raise _invalid_contact_field_error("Contact name is required")
+        name = value.strip()
+        if not name:
+            raise _invalid_contact_field_error("Contact name is required")
+        if len(name) > 255:
+            raise _invalid_contact_field_error(
+                "Contact name must not exceed 255 characters"
+            )
+        changes["name"] = name
+
+    for field_name, max_length in (
+        ("position", 128),
+        ("home_address", 512),
+        ("remark", None),
+    ):
+        if field_name in changes:
+            changes[field_name] = _normalize_optional_contact_text(
+                changes[field_name],
+                field_name=field_name,
+                max_length=max_length,
+            )
+
+    if "phone" in changes:
+        phone = _normalize_optional_contact_text(
+            changes["phone"],
+            field_name="phone",
+        )
+        try:
+            changes["phone"] = normalize_phone(phone)
+        except ValueError as error:
+            raise _invalid_contact_field_error("Contact phone is invalid") from error
+
+    if "email" in changes:
+        email = _normalize_optional_contact_text(
+            changes["email"],
+            field_name="email",
+        )
+        try:
+            changes["email"] = normalize_email(email)
+        except ValueError as error:
+            raise _invalid_contact_field_error("Contact email is invalid") from error
+
+    return changes
+
+
+async def _assert_contact_function_usable(
+    session: AsyncSession,
+    customer_id: int,
+    function_id: int | None,
+) -> None:
+    if function_id is None:
+        raise _contact_function_unavailable_error()
+
+    function = await contact_repository.get_function(session, function_id)
+    if (
+        function is None
+        or function.status != ContactStatus.ACTIVE
+        or (function.customer_id is not None and function.customer_id != customer_id)
+    ):
+        raise _contact_function_unavailable_error()
+
+    locked = await contact_repository.lock_function_shared(session, function_id)
+    if (
+        locked is None
+        or locked.status != ContactStatus.ACTIVE
+        or (locked.customer_id is not None and locked.customer_id != customer_id)
+    ):
+        raise _contact_function_unavailable_error()
+
+
+async def _require_active_contact(
+    session: AsyncSession,
+    customer_id: int,
+    contact_id: int,
+) -> CustomerContact:
+    contact = await contact_repository.get_contact(session, customer_id, contact_id)
+    if contact is None or contact.status != ContactStatus.ACTIVE:
+        raise _contact_not_found_error()
+    return contact
 
 
 async def _assert_name_available(
@@ -590,16 +731,160 @@ async def list_customer_recycle_functions(
     return list(result.all())
 
 
+async def list_contacts(
+    session: AsyncSession,
+    customer_id: int,
+    *,
+    context: AuthContext,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[CustomerContact, ContactFunction]], int]:
+    await customer_service._require_scoped_customer(session, customer_id, context)
+    return await contact_repository.list_contacts(
+        session,
+        customer_id,
+        status=ContactStatus.ACTIVE,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@audited(
+    action="contact:create",
+    resource_type="customer_contact",
+    resource_id_attr="id",
+)
+async def create_contact(
+    session: AsyncSession,
+    customer_id: int,
+    payload: ContactCreate,
+    *,
+    context: AuthContext,
+) -> CustomerContact:
+    await customer_service._require_scoped_customer(session, customer_id, context)
+
+    changes: dict[str, object] = payload.model_dump()
+    function_id = changes.pop("function_id")
+    await _assert_contact_function_usable(
+        session,
+        customer_id,
+        function_id if isinstance(function_id, int) else None,
+    )
+    changes = _validate_contact_fields(changes)
+
+    contact = CustomerContact(
+        customer_id=customer_id,
+        function_id=function_id,
+        status=ContactStatus.ACTIVE,
+        **changes,
+    )
+    session.add(contact)
+    await session.flush()
+    await session.refresh(contact)
+    await session.commit()
+    return contact
+
+
+@audited(
+    action="contact:update",
+    resource_type="customer_contact",
+    resource_id_param="contact_id",
+)
+async def update_contact(
+    session: AsyncSession,
+    customer_id: int,
+    contact_id: int,
+    payload: ContactUpdate,
+    *,
+    context: AuthContext,
+) -> CustomerContact:
+    await customer_service._require_scoped_customer(session, customer_id, context)
+    contact = await _require_active_contact(session, customer_id, contact_id)
+    changes: dict[str, object] = payload.model_dump(exclude_unset=True)
+
+    if "function_id" in changes:
+        function_id = changes["function_id"]
+        await _assert_contact_function_usable(
+            session,
+            customer_id,
+            function_id if isinstance(function_id, int) else None,
+        )
+
+    changes = _validate_contact_fields(changes)
+    for field_name, value in changes.items():
+        setattr(contact, field_name, value)
+
+    await session.flush()
+    await session.refresh(contact)
+    await session.commit()
+    return contact
+
+
+@audited(
+    action="contact:delete",
+    resource_type="customer_contact",
+    resource_id_param="contact_id",
+)
+async def delete_contact(
+    session: AsyncSession,
+    customer_id: int,
+    contact_id: int,
+    *,
+    context: AuthContext,
+) -> None:
+    await customer_service._require_scoped_customer(session, customer_id, context)
+    contact = await _require_active_contact(session, customer_id, contact_id)
+
+    contact.status = ContactStatus.DELETED
+    contact.deleted_at = datetime.now(UTC).replace(tzinfo=None)
+    contact.deleted_by = context.user_id
+    await session.flush()
+    await session.commit()
+
+
+@audited(
+    action="contact:restore",
+    resource_type="customer_contact",
+    resource_id_param="contact_id",
+)
+async def restore_contact(
+    session: AsyncSession,
+    customer_id: int,
+    contact_id: int,
+    *,
+    context: AuthContext,
+) -> CustomerContact:
+    await customer_service._require_scoped_customer(session, customer_id, context)
+    contact = await contact_repository.get_contact(session, customer_id, contact_id)
+    if contact is None:
+        raise _contact_not_found_error()
+    if contact.status != ContactStatus.DELETED:
+        raise _contact_not_deleted_error()
+
+    contact.status = ContactStatus.ACTIVE
+    contact.deleted_at = None
+    contact.deleted_by = None
+    await session.flush()
+    await session.refresh(contact)
+    await session.commit()
+    return contact
+
+
 __all__: tuple[str, ...] = (
+    "create_contact",
     "create_custom_function",
     "create_shared_function",
+    "delete_contact",
     "delete_custom_function",
     "delete_shared_function",
+    "list_contacts",
     "list_customer_functions",
     "list_customer_recycle_functions",
     "list_shared_functions",
+    "restore_contact",
     "restore_custom_function",
     "restore_shared_function",
+    "update_contact",
     "update_custom_function",
     "update_shared_function",
 )
