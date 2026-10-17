@@ -169,6 +169,18 @@ async def test_business_scope_truncated_defaults_to_false(
     assert customer.business_scope_truncated is False
 
 
+async def test_business_scope_persists_beyond_mysql_text_limit(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    customer = make_customer(owner)
+    customer.business_scope = "经营范围" * 12_000
+    await add(session, customer)
+    await session.refresh(customer, ["business_scope"])
+
+    assert customer.business_scope == "经营范围" * 12_000
+
+
 async def test_owner_department_id_may_be_null(session: AsyncSession) -> None:
     owner = await make_user(session)
     customer = await add(session, make_customer(owner))

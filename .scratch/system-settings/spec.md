@@ -110,7 +110,7 @@ resource limit in this release.
 Seed one menu and one button under `系统管理`:
 
 - `系统设置`, path `/system/settings`, permission `system_setting:read`,
-  sort order 90.
+  sort order 100.
 - `保存系统设置`, permission `system_setting:update`, child of the menu.
 
 The super administrator receives these permissions through its existing

@@ -19,7 +19,6 @@ from app.core.auth_context import AuthContext
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.errors import BusinessError, ErrorCode
 from app.models.integration_config import IntegrationConfig
-from app.repositories import integration_config as integration_config_repository
 from app.repositories.integration_config import get_by_provider
 from app.services.integration import (
     get_tianyancha_client,
@@ -180,12 +179,11 @@ async def test_connection_propagates_failure(
     assert exc_info.value.code == ErrorCode.TIANYANCHA_AUTH_FAILED
 
 
-async def test_save_token_recovers_from_concurrent_insert(
+async def test_save_token_atomically_updates_existing_row(
     session: AsyncSession,
     context: AuthContext,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 预置一行，模拟另一个并发 PUT 已经插入，而本次请求的预查看不到它。
+    # 预置一行模拟并发请求已先提交，原子 upsert 必须更新该行而非陈旧 ORM 写入。
     existing = IntegrationConfig(
         provider="tianyancha",
         secret_ciphertext=encrypt_secret("stale-value"),
@@ -194,30 +192,13 @@ async def test_save_token_recovers_from_concurrent_insert(
     session.add(existing)
     await session.flush()
 
-    lookups = {"count": 0}
-
-    async def lookup_sees_no_row(
-        _target: AsyncSession, _provider: str
-    ) -> IntegrationConfig | None:
-        lookups["count"] += 1
-        return None
-
-    monkeypatch.setattr(
-        integration_config_repository,
-        "get_by_provider",
-        lookup_sees_no_row,
-    )
-
     await save_tianyancha_token(session, "mcpk2_newest_value", context=context)
 
     rows = (
         await session.scalars(
-            select(IntegrationConfig).where(
-                IntegrationConfig.provider == "tianyancha"
-            )
+            select(IntegrationConfig).where(IntegrationConfig.provider == "tianyancha")
         )
     ).all()
-    assert lookups["count"] >= 1
     assert len(rows) == 1
     assert rows[0].id == existing.id
     assert decrypt_secret(rows[0].secret_ciphertext) == "mcpk2_newest_value"

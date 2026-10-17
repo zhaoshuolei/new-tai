@@ -8,7 +8,7 @@ from datetime import date, datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -32,6 +32,7 @@ from app.services.customer import (
     delete_customer,
     get_customer,
     import_from_tianyancha,
+    refresh_business_scope_from_tianyancha,
     search_candidates,
     transfer_owner,
     update_customer,
@@ -591,6 +592,22 @@ async def test_create_blank_credit_code_becomes_none(session: AsyncSession) -> N
     assert customer.credit_code is None
 
 
+async def test_create_truncated_business_scope_sets_truncated_flag(
+    session: AsyncSession,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+
+    customer = await create_customer(
+        session,
+        CustomerCreate(name="手工客户", business_scope=TRUNCATED_SCOPE),
+        context=context,
+    )
+
+    assert customer.business_scope == TRUNCATED_SCOPE
+    assert customer.business_scope_truncated is True
+
+
 async def test_created_customer_persists_after_service_returns() -> None:
     """真实 session：服务层自行 commit，session1 关闭后新 session 仍能读到客户。"""
     engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
@@ -651,6 +668,94 @@ async def test_created_customer_persists_after_service_returns() -> None:
                 await cleanup.execute(
                     delete(Department).where(Department.id == department_id)
                 )
+            await cleanup.commit()
+        await engine.dispose()
+
+
+async def test_refresh_does_not_overwrite_concurrent_manual_scope_edit(
+    fake_client: FakeTianyanchaClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    credit_code = f"91{uuid4().hex[:16].upper()}"
+    user_id: int | None = None
+    customer_id: int | None = None
+    manual_scope = "并发手工保存的完整经营范围。"
+
+    async def fetch_after_concurrent_edit(_credit_code: str) -> str:
+        nonlocal customer_id
+        async with factory() as concurrent:
+            await concurrent.execute(
+                update(Customer)
+                .where(Customer.id == customer_id)
+                .values(
+                    business_scope=manual_scope,
+                    business_scope_truncated=False,
+                )
+            )
+            await concurrent.commit()
+        return fake_client.historical_text
+
+    try:
+        async with factory() as setup:
+            user = User(
+                username=f"refresh-race-{uuid4().hex[:12]}",
+                password_hash=None,
+                status=UserStatus.ACTIVE,
+                token_version=0,
+            )
+            setup.add(user)
+            await setup.flush()
+            customer = Customer(
+                name=f"并发补全客户-{uuid4().hex[:8]}",
+                credit_code=credit_code,
+                business_scope=TRUNCATED_SCOPE,
+                business_scope_truncated=True,
+                source=CustomerSource.TIANYANCHA,
+                owner_user_id=user.id,
+            )
+            setup.add(customer)
+            await setup.commit()
+            user_id = user.id
+            customer_id = customer.id
+
+        assert user_id is not None
+        assert customer_id is not None
+        monkeypatch.setattr(
+            fake_client,
+            "fetch_historical_registration_text",
+            fetch_after_concurrent_edit,
+        )
+        async with factory() as refresh_session:
+            refreshed = await refresh_business_scope_from_tianyancha(
+                refresh_session,
+                customer_id,
+                context=AuthContext(
+                    user_id=user_id,
+                    role_id=None,
+                    department_id=None,
+                    data_scope=None,
+                    custom_department_ids=frozenset(),
+                    include_children=False,
+                    permission_codes=frozenset(),
+                    is_super_admin=False,
+                ),
+            )
+
+        assert refreshed.business_scope == manual_scope
+        assert refreshed.business_scope_truncated is False
+    finally:
+        async with factory() as cleanup:
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.id == customer_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(AuditLog).where(AuditLog.user_id == user_id)
+                )
+                await cleanup.execute(delete(User).where(User.id == user_id))
             await cleanup.commit()
         await engine.dispose()
 
@@ -757,6 +862,85 @@ async def test_update_visible_customer_changes_fields(session: AsyncSession) -> 
 
     assert updated.name == "新名称"
     assert updated.remark == "备注"
+
+
+async def test_update_complete_business_scope_clears_truncated_flag(
+    session: AsyncSession,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    customer = await make_customer_row(session, owner=caller)
+    customer.business_scope = TRUNCATED_SCOPE
+    customer.business_scope_truncated = True
+    await session.flush()
+
+    updated = await update_customer(
+        session,
+        customer.id,
+        CustomerUpdate(business_scope=FULL_SCOPE),
+        context=context,
+    )
+
+    assert updated.business_scope == FULL_SCOPE
+    assert updated.business_scope_truncated is False
+
+
+async def test_refresh_business_scope_uses_history_without_overwriting_other_fields(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    customer = await make_customer_row(
+        session,
+        owner=caller,
+        credit_code=REQUESTED_CREDIT_CODE,
+        name="保留名称",
+        source=CustomerSource.TIANYANCHA,
+    )
+    customer.business_scope = TRUNCATED_SCOPE
+    customer.business_scope_truncated = True
+    customer.remark = "保留备注"
+    await session.flush()
+
+    updated = await refresh_business_scope_from_tianyancha(
+        session,
+        customer.id,
+        context=context,
+    )
+
+    assert updated.business_scope == FULL_SCOPE
+    assert updated.business_scope_truncated is False
+    assert updated.name == "保留名称"
+    assert updated.remark == "保留备注"
+    assert fake_client.calls == ["historical"]
+
+
+async def test_refresh_complete_business_scope_does_not_consume_upstream_quota(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    customer = await make_customer_row(
+        session,
+        owner=caller,
+        credit_code=REQUESTED_CREDIT_CODE,
+        source=CustomerSource.TIANYANCHA,
+    )
+    customer.business_scope = FULL_SCOPE
+    customer.business_scope_truncated = False
+    await session.flush()
+
+    updated = await refresh_business_scope_from_tianyancha(
+        session,
+        customer.id,
+        context=context,
+    )
+
+    assert updated.business_scope == FULL_SCOPE
+    assert updated.business_scope_truncated is False
+    assert fake_client.calls == []
 
 
 async def test_update_duplicate_credit_code_is_rejected(

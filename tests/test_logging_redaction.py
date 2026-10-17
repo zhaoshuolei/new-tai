@@ -1,3 +1,4 @@
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -7,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.logging import configure_logging, mask_sensitive_text
+from app.core.logging import JsonFormatter, configure_logging, mask_sensitive_text
 from app.db.session import engine
 
 
@@ -92,6 +93,77 @@ def test_api_key_is_masked() -> None:
 
 def test_api_key_is_masked_in_json_style() -> None:
     assert mask_sensitive_text('"api_key": "mcpk2_secret"') == '"api_key": "***"'
+
+
+def test_app_secret_is_masked_in_structured_log_extra() -> None:
+    output = _capture_with_existing_handler(
+        "tests.redaction.app-secret-structured",
+        {"app_secret": "secret-value"},
+    )
+
+    assert "secret-value" not in output
+    assert "***" in output
+
+
+def test_app_secret_is_masked_in_json_formatter() -> None:
+    logger = logging.getLogger("tests.redaction.app-secret-json")
+    handler = _CapturingHandler()
+    handler.setFormatter(JsonFormatter())
+    logger.handlers = [handler]
+    logger.propagate = False
+
+    configure_logging("test")
+    logger.info(
+        "payload",
+        extra={"extra_fields": {"app_secret": "secret-value"}},
+    )
+
+    payload = json.loads(handler.output)
+    assert "secret-value" not in handler.output
+    assert payload["app_secret"] == "***"
+
+
+def test_app_secret_is_masked_in_formatted_exception() -> None:
+    logger = logging.getLogger("tests.redaction.app-secret-exception")
+    handler = _CapturingHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.handlers = [handler]
+    logger.propagate = False
+
+    configure_logging("test")
+    try:
+        raise RuntimeError("request failed: app_secret=secret-value")
+    except RuntimeError:
+        logger.exception("request failed")
+
+    assert "secret-value" not in handler.output
+    assert "app_secret=***" in handler.output
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "app_secret=secret-value",
+        '{"app_secret":"secret-value"}',
+        'app_secret="secret-value"',
+    ],
+)
+def test_app_secret_is_masked_in_message_text(text: str) -> None:
+    output = mask_sensitive_text(text)
+
+    assert "secret-value" not in output
+    assert "***" in output
+
+
+def test_formatted_app_secret_argument_is_redacted_before_handler() -> None:
+    output = _capture_message_with_existing_handler(
+        "tests.redaction.app-secret-formatted",
+        "app_secret=%s",
+        "secret-value",
+    )
+
+    assert "secret-value" not in output
+    assert "app_secret=***" in output
 
 
 @pytest.mark.parametrize(

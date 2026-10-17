@@ -1,7 +1,7 @@
 """create system setting
 
 Revision ID: 619b22fb0301
-Revises: d7c1e4a9b2f6
+Revises: e91f4c2a7b6d
 Create Date: 2026-10-17 20:42:05.797687
 """
 
@@ -12,7 +12,7 @@ from alembic import op
 from sqlalchemy.dialects import mysql
 
 revision: str = "619b22fb0301"
-down_revision: str | Sequence[str] | None = "d7c1e4a9b2f6"
+down_revision: str | Sequence[str] | None = "e91f4c2a7b6d"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

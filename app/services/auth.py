@@ -28,6 +28,11 @@ from app.models.role import DataScope, Role, RoleDepartment, RoleStatus
 from app.models.user import User, UserStatus
 from app.repositories import role as role_repository
 from app.repositories import user as user_repository
+from app.services.feishu_integration import (
+    build_feishu_client,
+    require_configured_feishu_config,
+    resolve_feishu_config,
+)
 from app.services.login_log import record_login_log
 
 REFRESH_TOKEN_TTL_SECONDS = settings.refresh_token_expire_days * 24 * 60 * 60
@@ -536,7 +541,10 @@ async def _login_with_feishu(
     client: FeishuClient | None = None,
 ) -> LoginResult:
     await enforce_login_ip_rate_limit(redis, client_ip=client_ip)
-    feishu_client = client or FeishuClient()
+    config = await resolve_feishu_config(session)
+    await session.commit()
+    config = require_configured_feishu_config(config)
+    feishu_client = client or build_feishu_client(config)
     user_access_token = await feishu_client.exchange_code(code)
     info = await feishu_client.get_user_info(user_access_token)
 

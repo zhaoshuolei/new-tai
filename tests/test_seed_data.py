@@ -53,6 +53,8 @@ EXPECTED_PERMISSION_CODES = {
     "customer:delete",
     "integration:read",
     "integration:update",
+    "integration_feishu:read",
+    "integration_feishu:update",
     "system_setting:read",
     "system_setting:update",
 }
@@ -301,7 +303,7 @@ async def test_system_setting_menu_and_button_are_seeded(
     assert read_menu.path == "/system/settings"
     assert read_menu.type == MenuType.MENU
     assert read_menu.parent_id == system_root.id
-    assert read_menu.sort_order == 90
+    assert read_menu.sort_order == 100
     assert update_button is not None
     assert update_button.name == "保存系统设置"
     assert update_button.type == MenuType.BUTTON
@@ -334,6 +336,30 @@ async def test_init_creates_one_global_system_setting_from_app_name(
     assert setting.copyright is None
     assert setting.icp_number is None
     assert setting.updated_by is None
+
+
+async def test_feishu_integration_menu_and_button_are_seeded(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    menu = await session.scalar(
+        select(Menu).where(Menu.permission_code == "integration_feishu:read")
+    )
+    button = await session.scalar(
+        select(Menu).where(Menu.permission_code == "integration_feishu:update")
+    )
+
+    assert menu is not None
+    assert menu.type == MenuType.MENU
+    assert menu.path == "/system/integrations/feishu"
+    assert button is not None
+    assert button.type == MenuType.BUTTON
+    assert button.parent_id == menu.id
 
 
 async def test_customer_buttons_are_under_customer_list(
@@ -389,6 +415,8 @@ async def test_default_role_has_no_customer_permissions(
             "customer:delete",
             "integration:read",
             "integration:update",
+            "integration_feishu:read",
+            "integration_feishu:update",
             "system_setting:read",
             "system_setting:update",
         }
@@ -446,7 +474,7 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 35
+    assert await _count(session, Menu) == 37
     assert await _count(session, User) == 1
     assert await _count(session, RoleMenu) == 1
     assert await _count(session, SystemSetting) == 1

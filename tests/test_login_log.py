@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.clients.feishu import FeishuClient, FeishuUserInfo
+from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
 from app.core.request_context import (
     RequestMeta,
@@ -22,11 +23,13 @@ from app.core.request_context import (
     set_request_meta,
 )
 from app.core.security import hash_password
+from app.models.integration_config import IntegrationConfig
 from app.models.login_log import LoginLog, LoginResultEnum, LoginType
 from app.models.user import User, UserStatus
 from app.repositories import login_log as login_log_repository
 from app.services import auth as auth_service
 from app.services import login_log as login_log_service
+from tests.feishu_helpers import add_feishu_config
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -337,6 +340,7 @@ async def test_feishu_login_success_records_user_without_username(
     fake_redis: Any,
     login_log_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    await add_feishu_config(session)
     open_id = f"ou-login-log-{uuid4().hex}"
     user = User(feishu_open_id=open_id, status=UserStatus.ACTIVE)
     session.add(user)
@@ -371,6 +375,7 @@ async def test_feishu_upstream_failure_records_failure(
     fake_redis: Any,
     login_log_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    await add_feishu_config(session)
     request_id = unique_request_id()
     upstream_error = BusinessError(
         ErrorCode.FEISHU_UPSTREAM_ERROR,
@@ -399,11 +404,72 @@ async def test_feishu_upstream_failure_records_failure(
     assert row.reason == ErrorCode.FEISHU_UPSTREAM_ERROR.name
 
 
+async def test_feishu_missing_config_records_failure(
+    session: AsyncSession,
+    fake_redis: Any,
+    login_log_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "")
+    monkeypatch.setattr(settings, "feishu_app_secret", "")
+    request_id = unique_request_id()
+
+    with request_context(request_id), pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client_ip="203.0.113.35",
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_NOT_CONFIGURED
+    rows = await login_rows(login_log_factory, request_id=request_id)
+    assert len(rows) == 1
+    assert rows[0].login_type is LoginType.FEISHU
+    assert rows[0].result is LoginResultEnum.FAILURE
+    assert rows[0].reason == ErrorCode.FEISHU_NOT_CONFIGURED.name
+
+
+async def test_feishu_damaged_config_records_failure(
+    session: AsyncSession,
+    fake_redis: Any,
+    login_log_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    session.add(
+        IntegrationConfig(
+            provider="feishu",
+            secret_ciphertext="not-a-fernet-token",
+            updated_by=1,
+        )
+    )
+    await session.flush()
+    request_id = unique_request_id()
+
+    with request_context(request_id), pytest.raises(BusinessError) as error:
+        await auth_service.login_with_feishu(
+            session,
+            fake_redis,
+            "valid-code",
+            client_ip="203.0.113.36",
+        )
+
+    assert error.value.code == ErrorCode.FEISHU_CONFIG_UNREADABLE
+    rows = await login_rows(login_log_factory, request_id=request_id)
+    assert len(rows) == 1
+    assert rows[0].login_type is LoginType.FEISHU
+    assert rows[0].result is LoginResultEnum.FAILURE
+    assert rows[0].reason == ErrorCode.FEISHU_CONFIG_UNREADABLE.name
+
+
 async def test_unexpected_login_exception_records_internal_error(
     session: AsyncSession,
     fake_redis: Any,
     login_log_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    await add_feishu_config(session)
     request_id = unique_request_id()
     client = FakeFeishuClient(
         open_id="ou-unexpected",
