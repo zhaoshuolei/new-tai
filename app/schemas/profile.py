@@ -212,6 +212,10 @@ class PrivacyUpdate(BaseModel):
     hidden_fields: list[str]
 
 
+class AvatarUploadRead(BaseModel):
+    url: str | None
+
+
 class PersonalLink(BaseModel):
     label: str
     url: str
@@ -250,6 +254,7 @@ class ProfileRead(BaseModel):
 
 
 __all__: tuple[str, ...] = (
+    "AvatarUploadRead",
     "PersonalLink",
     "PersonalLinkInput",
     "PrivacyUpdate",

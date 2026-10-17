@@ -48,6 +48,8 @@ _ALLOWED_DECLARED_CONTENT_TYPES = {
     "image/x-icon": frozenset({"image/x-icon", "image/vnd.microsoft.icon"}),
 }
 
+_ASSET_DIRECTORIES = ("system/logo", "system/favicon", "user/avatar")
+
 _INVALID_IMAGE_MESSAGE = "Image must be a valid PNG, JPEG, WebP, or ICO file"
 
 
@@ -143,9 +145,11 @@ def _store_atomic(directory: Path, filename: str, content: bytes) -> None:
     _write_atomic(directory, filename, content)
 
 
-def _asset_url(asset_type: SystemAssetType, filename: str) -> str:
+def _asset_url(directory: str, filename: str) -> str:
+    if directory not in _ASSET_DIRECTORIES:
+        raise ValueError(f"Unsupported asset directory: {directory}")
     base_path = normalize_media_url_path(settings.media_url_path)
-    return f"{base_path}/system/{asset_type.value}/{filename}"
+    return f"{base_path}/{directory}/{filename}"
 
 
 def _managed_asset_path(url: str | None) -> Path | None:
@@ -156,31 +160,35 @@ def _managed_asset_path(url: str | None) -> Path | None:
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
         return None
 
-    prefix = f"{normalize_media_url_path(settings.media_url_path)}/system/"
-    if not parsed.path.startswith(prefix):
+    media_prefix = f"{normalize_media_url_path(settings.media_url_path)}/"
+    if not parsed.path.startswith(media_prefix):
         return None
+    relative_path = parsed.path.removeprefix(media_prefix)
 
-    segments = parsed.path.removeprefix(prefix).split("/")
-    if len(segments) != 2:
-        return None
-    asset_type_value, filename = segments
-    try:
-        asset_type = SystemAssetType(asset_type_value)
-        UUID(Path(filename).stem)
-    except ValueError:
-        return None
-    if Path(filename).name != filename:
-        return None
-    if Path(filename).suffix not in {".png", ".jpg", ".webp", ".ico"}:
-        return None
+    for asset_directory in _ASSET_DIRECTORIES:
+        directory_prefix = f"{asset_directory}/"
+        if not relative_path.startswith(directory_prefix):
+            continue
+        filename = relative_path.removeprefix(directory_prefix)
+        if "/" in filename:
+            return None
+        try:
+            UUID(Path(filename).stem)
+        except ValueError:
+            return None
+        if Path(filename).name != filename:
+            return None
+        if Path(filename).suffix not in {".png", ".jpg", ".webp", ".ico"}:
+            return None
 
-    directory = (
-        resolve_media_root(settings.media_root) / "system" / asset_type.value
-    ).resolve()
-    candidate = (directory / filename).resolve()
-    if candidate.parent != directory:
-        return None
-    return candidate
+        directory = (
+            resolve_media_root(settings.media_root) / asset_directory
+        ).resolve()
+        candidate = (directory / filename).resolve()
+        if candidate.parent != directory:
+            return None
+        return candidate
+    return None
 
 
 def _unlink(path: Path) -> None:
@@ -189,6 +197,15 @@ def _unlink(path: Path) -> None:
 
 async def remove_system_asset(url: str | None) -> bool:
     """删除由系统生成且路径安全的本地资源文件。"""
+    path = _managed_asset_path(url)
+    if path is None:
+        return False
+    await asyncio.to_thread(_unlink, path)
+    return True
+
+
+async def remove_user_avatar(url: str | None) -> bool:
+    """删除由用户头像上传生成且路径安全的本地资源文件。"""
     path = _managed_asset_path(url)
     if path is None:
         return False
@@ -213,14 +230,35 @@ async def upload_system_asset(
         raise _invalid_image(_INVALID_IMAGE_MESSAGE)
     _validate_declared_content_type(content_type, detected)
 
-    directory = resolve_media_root(settings.media_root) / "system" / asset_type.value
+    asset_directory = f"system/{asset_type.value}"
+    directory = resolve_media_root(settings.media_root) / asset_directory
     filename = f"{uuid4()}{detected.extension}"
     await asyncio.to_thread(_store_atomic, directory, filename, content)
-    return _asset_url(asset_type, filename)
+    return _asset_url(asset_directory, filename)
+
+
+async def upload_user_avatar(
+    *,
+    content_type: str | None,
+    chunks: AsyncIterator[bytes],
+) -> str:
+    content = await _read_bounded(chunks, settings.system_asset_max_bytes)
+    detected = _detect_image_format(content)
+    if detected is None:
+        raise _invalid_image(_INVALID_IMAGE_MESSAGE)
+    _validate_declared_content_type(content_type, detected)
+
+    asset_directory = "user/avatar"
+    directory = resolve_media_root(settings.media_root) / asset_directory
+    filename = f"{uuid4()}{detected.extension}"
+    await asyncio.to_thread(_store_atomic, directory, filename, content)
+    return _asset_url(asset_directory, filename)
 
 
 __all__: tuple[str, ...] = (
     "SystemAssetType",
     "remove_system_asset",
+    "remove_user_avatar",
     "upload_system_asset",
+    "upload_user_avatar",
 )
