@@ -1,9 +1,11 @@
 """联系人职能业务逻辑：共用/自定义维护、删除迁移与恢复。"""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Literal
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +18,8 @@ from app.services.audit import audited
 from app.services.data_scope import apply_customer_scope
 
 FunctionScope = Literal["SHARED", "CUSTOM"]
+_NAME_LOCK_NAME = "contact_function_name"
+_NAME_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _forbidden_error() -> BusinessError:
@@ -91,9 +95,50 @@ def _normalize_name(name: str) -> str:
     return value
 
 
+def _name_change_concurrent_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CONTACT_FUNCTION_NAME_EXISTS,
+        "Contact function name is being changed concurrently",
+        http_status=409,
+    )
+
+
 def _require_super_admin(context: AuthContext) -> None:
     if not context.is_super_admin:
         raise _forbidden_error()
+
+
+@asynccontextmanager
+async def _serialize_name_change(session: AsyncSession) -> AsyncIterator[None]:
+    connection = await session.connection()
+    acquired = await connection.scalar(
+        text("SELECT GET_LOCK(:lock_name, :timeout)"),
+        {
+            "lock_name": _NAME_LOCK_NAME,
+            "timeout": _NAME_LOCK_TIMEOUT_SECONDS,
+        },
+    )
+    if acquired != 1:
+        raise _name_change_concurrent_error()
+
+    try:
+        yield
+    except BaseException:
+        # Rollback invalidates an externally acquired connection proxy, so the
+        # connection-scoped lock must be released first.
+        try:
+            await connection.scalar(
+                text("SELECT RELEASE_LOCK(:lock_name)"),
+                {"lock_name": _NAME_LOCK_NAME},
+            )
+        finally:
+            await session.rollback()
+        raise
+    else:
+        await connection.scalar(
+            text("SELECT RELEASE_LOCK(:lock_name)"),
+            {"lock_name": _NAME_LOCK_NAME},
+        )
 
 
 async def _require_visible_active_customer(
@@ -133,7 +178,12 @@ async def _assert_name_available(
     if exclude_function_id is not None:
         conditions.append(ContactFunction.id != exclude_function_id)
 
-    statement = select(ContactFunction.id).where(*conditions).limit(1)
+    statement = (
+        select(ContactFunction.id)
+        .where(*conditions)
+        .limit(1)
+        .with_for_update(read=True)
+    )
     if await session.scalar(statement) is not None:
         raise _name_exists_error()
 
@@ -156,15 +206,20 @@ async def _validate_replacement(
     target: ContactFunction,
     replacement: ContactFunction | None,
     contact_count: int,
+    *,
+    replacement_requested: bool,
 ) -> ContactFunction | None:
-    if replacement is None:
+    if not replacement_requested:
         if contact_count > 0:
             raise _replacement_required_error()
         return None
 
-    if contact_count == 0:
-        raise _replacement_invalid_error()
-    if replacement.status != ContactStatus.ACTIVE or replacement.id == target.id:
+    if (
+        replacement is None
+        or contact_count == 0
+        or replacement.status != ContactStatus.ACTIVE
+        or replacement.id == target.id
+    ):
         raise _replacement_invalid_error()
     if target.customer_id is None:
         if replacement.customer_id is not None:
@@ -188,8 +243,9 @@ async def _delete_function(
     if customer_id is not None and target.customer_id != customer_id:
         raise _function_not_found_error()
 
+    replacement_requested = replacement_function_id is not None
     replacement = None
-    if replacement_function_id is not None:
+    if replacement_requested:
         replacement = await contact_repository.lock_function_shared(
             session,
             replacement_function_id,
@@ -203,6 +259,7 @@ async def _delete_function(
         target,
         replacement,
         contact_count,
+        replacement_requested=replacement_requested,
     )
     if replacement is not None:
         await contact_repository.reassign_contacts(
@@ -256,20 +313,21 @@ async def create_shared_function(
 ) -> ContactFunction:
     _require_super_admin(context)
     normalized = _normalize_name(name)
-    await _assert_name_available(
-        session,
-        normalized,
-        customer_id=None,
-    )
-    function = ContactFunction(
-        name=normalized,
-        customer_id=None,
-        scope_key=0,
-        status=ContactStatus.ACTIVE,
-        created_by=context.user_id,
-        updated_by=context.user_id,
-    )
-    await _commit_create(session, function)
+    async with _serialize_name_change(session):
+        await _assert_name_available(
+            session,
+            normalized,
+            customer_id=None,
+        )
+        function = ContactFunction(
+            name=normalized,
+            customer_id=None,
+            scope_key=0,
+            status=ContactStatus.ACTIVE,
+            created_by=context.user_id,
+            updated_by=context.user_id,
+        )
+        await _commit_create(session, function)
     return function
 
 
@@ -286,30 +344,31 @@ async def update_shared_function(
     context: AuthContext,
 ) -> ContactFunction:
     _require_super_admin(context)
-    function = await contact_repository.get_function(session, function_id)
-    if (
-        function is None
-        or function.customer_id is not None
-        or function.status != ContactStatus.ACTIVE
-    ):
-        raise _function_not_found_error()
-
     normalized = _normalize_name(name)
-    await _assert_name_available(
-        session,
-        normalized,
-        customer_id=None,
-        exclude_function_id=function.id,
-    )
-    try:
-        async with session.begin_nested():
-            function.name = normalized
-            function.updated_by = context.user_id
-            await session.flush()
-    except IntegrityError as error:
-        raise _name_exists_error() from error
-    await session.refresh(function)
-    await session.commit()
+    async with _serialize_name_change(session):
+        function = await contact_repository.get_function(session, function_id)
+        if (
+            function is None
+            or function.customer_id is not None
+            or function.status != ContactStatus.ACTIVE
+        ):
+            raise _function_not_found_error()
+
+        await _assert_name_available(
+            session,
+            normalized,
+            customer_id=None,
+            exclude_function_id=function.id,
+        )
+        try:
+            async with session.begin_nested():
+                function.name = normalized
+                function.updated_by = context.user_id
+                await session.flush()
+        except IntegrityError as error:
+            raise _name_exists_error() from error
+        await session.refresh(function)
+        await session.commit()
     return function
 
 
@@ -347,29 +406,30 @@ async def restore_shared_function(
     context: AuthContext,
 ) -> ContactFunction:
     _require_super_admin(context)
-    function = await contact_repository.get_function(session, function_id)
-    if function is None or function.customer_id is not None:
-        raise _function_not_found_error()
-    if function.status != ContactStatus.DELETED:
-        raise _record_not_deleted_error()
+    async with _serialize_name_change(session):
+        function = await contact_repository.get_function(session, function_id)
+        if function is None or function.customer_id is not None:
+            raise _function_not_found_error()
+        if function.status != ContactStatus.DELETED:
+            raise _record_not_deleted_error()
 
-    await _assert_name_available(
-        session,
-        function.name,
-        customer_id=None,
-        exclude_function_id=function.id,
-    )
-    function.status = ContactStatus.ACTIVE
-    function.deleted_at = None
-    function.deleted_by = None
-    function.updated_by = context.user_id
-    try:
-        async with session.begin_nested():
-            await session.flush()
-    except IntegrityError as error:
-        raise _name_exists_error() from error
-    await session.refresh(function)
-    await session.commit()
+        await _assert_name_available(
+            session,
+            function.name,
+            customer_id=None,
+            exclude_function_id=function.id,
+        )
+        function.status = ContactStatus.ACTIVE
+        function.deleted_at = None
+        function.deleted_by = None
+        function.updated_by = context.user_id
+        try:
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError as error:
+            raise _name_exists_error() from error
+        await session.refresh(function)
+        await session.commit()
     return function
 
 
@@ -405,22 +465,23 @@ async def create_custom_function(
     *,
     context: AuthContext,
 ) -> ContactFunction:
-    await _require_visible_active_customer(session, customer_id, context)
     normalized = _normalize_name(name)
-    await _assert_name_available(
-        session,
-        normalized,
-        customer_id=customer_id,
-    )
-    function = ContactFunction(
-        name=normalized,
-        customer_id=customer_id,
-        scope_key=customer_id,
-        status=ContactStatus.ACTIVE,
-        created_by=context.user_id,
-        updated_by=context.user_id,
-    )
-    await _commit_create(session, function)
+    async with _serialize_name_change(session):
+        await _require_visible_active_customer(session, customer_id, context)
+        await _assert_name_available(
+            session,
+            normalized,
+            customer_id=customer_id,
+        )
+        function = ContactFunction(
+            name=normalized,
+            customer_id=customer_id,
+            scope_key=customer_id,
+            status=ContactStatus.ACTIVE,
+            created_by=context.user_id,
+            updated_by=context.user_id,
+        )
+        await _commit_create(session, function)
     return function
 
 
@@ -437,31 +498,32 @@ async def update_custom_function(
     *,
     context: AuthContext,
 ) -> ContactFunction:
-    await _require_visible_active_customer(session, customer_id, context)
-    function = await contact_repository.get_function(session, function_id)
-    if (
-        function is None
-        or function.customer_id != customer_id
-        or function.status != ContactStatus.ACTIVE
-    ):
-        raise _function_not_found_error()
-
     normalized = _normalize_name(name)
-    await _assert_name_available(
-        session,
-        normalized,
-        customer_id=customer_id,
-        exclude_function_id=function.id,
-    )
-    try:
-        async with session.begin_nested():
-            function.name = normalized
-            function.updated_by = context.user_id
-            await session.flush()
-    except IntegrityError as error:
-        raise _name_exists_error() from error
-    await session.refresh(function)
-    await session.commit()
+    async with _serialize_name_change(session):
+        await _require_visible_active_customer(session, customer_id, context)
+        function = await contact_repository.get_function(session, function_id)
+        if (
+            function is None
+            or function.customer_id != customer_id
+            or function.status != ContactStatus.ACTIVE
+        ):
+            raise _function_not_found_error()
+
+        await _assert_name_available(
+            session,
+            normalized,
+            customer_id=customer_id,
+            exclude_function_id=function.id,
+        )
+        try:
+            async with session.begin_nested():
+                function.name = normalized
+                function.updated_by = context.user_id
+                await session.flush()
+        except IntegrityError as error:
+            raise _name_exists_error() from error
+        await session.refresh(function)
+        await session.commit()
     return function
 
 
@@ -500,30 +562,31 @@ async def restore_custom_function(
     *,
     context: AuthContext,
 ) -> ContactFunction:
-    await _require_visible_active_customer(session, customer_id, context)
-    function = await contact_repository.get_function(session, function_id)
-    if function is None or function.customer_id != customer_id:
-        raise _function_not_found_error()
-    if function.status != ContactStatus.DELETED:
-        raise _record_not_deleted_error()
+    async with _serialize_name_change(session):
+        await _require_visible_active_customer(session, customer_id, context)
+        function = await contact_repository.get_function(session, function_id)
+        if function is None or function.customer_id != customer_id:
+            raise _function_not_found_error()
+        if function.status != ContactStatus.DELETED:
+            raise _record_not_deleted_error()
 
-    await _assert_name_available(
-        session,
-        function.name,
-        customer_id=customer_id,
-        exclude_function_id=function.id,
-    )
-    function.status = ContactStatus.ACTIVE
-    function.deleted_at = None
-    function.deleted_by = None
-    function.updated_by = context.user_id
-    try:
-        async with session.begin_nested():
-            await session.flush()
-    except IntegrityError as error:
-        raise _name_exists_error() from error
-    await session.refresh(function)
-    await session.commit()
+        await _assert_name_available(
+            session,
+            function.name,
+            customer_id=customer_id,
+            exclude_function_id=function.id,
+        )
+        function.status = ContactStatus.ACTIVE
+        function.deleted_at = None
+        function.deleted_by = None
+        function.updated_by = context.user_id
+        try:
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError as error:
+            raise _name_exists_error() from error
+        await session.refresh(function)
+        await session.commit()
     return function
 
 

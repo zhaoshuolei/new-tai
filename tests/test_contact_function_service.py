@@ -1,8 +1,10 @@
+import asyncio
 from collections.abc import AsyncIterator
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -12,7 +14,10 @@ from sqlalchemy.ext.asyncio import (
 from app.core.errors import BusinessError, ErrorCode
 from app.models.audit_log import AuditLog, AuditResult
 from app.models.contact import ContactFunction, ContactStatus
+from app.models.customer import Customer
+from app.models.user import User
 from app.services import audit as audit_service
+from app.services import contact as contact_service
 from app.services.contact import (
     create_custom_function,
     create_shared_function,
@@ -158,6 +163,231 @@ async def test_custom_name_clashing_with_shared_is_rejected(session) -> None:
         )
 
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+
+
+async def test_shared_create_rejects_custom_name_from_another_customer(
+    session,
+) -> None:
+    user = await make_user(session)
+    other_owner = await make_customer_row(session, owner=user)
+    await add_function(session, name="渠道", customer_id=other_owner.id)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_shared_function(
+            session,
+            "渠道",
+            context=make_context(user, is_super_admin=True),
+        )
+
+    assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+
+
+async def test_custom_create_rejects_existing_shared_name_for_any_customer(
+    session,
+) -> None:
+    user = await make_user(session)
+    owner = await make_customer_row(session, owner=user)
+    await add_function(session, name="商务", customer_id=None)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_custom_function(
+            session,
+            owner.id,
+            "商务",
+            context=make_context(user, permission_codes={"customer:update"}),
+        )
+
+    assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+
+
+async def test_cross_scope_name_writes_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(contact_service, "_NAME_LOCK_TIMEOUT_SECONDS", 1.0)
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    customer_id: int | None = None
+    function_id: int | None = None
+    sessions: list[AsyncSession] = []
+    attempt: asyncio.Future[ContactFunction] | None = None
+    name = f"并发职能-{uuid4().hex}"
+
+    try:
+        async with factory() as setup:
+            user = await make_user(setup)
+            customer = await make_customer_row(setup, owner=user)
+            await setup.commit()
+            user_id = user.id
+            customer_id = customer.id
+
+        context = make_context(
+            user,
+            permission_codes={"customer:update"},
+        )
+        session_a = factory()
+        session_b = factory()
+        sessions.extend((session_a, session_b))
+        assert (
+            await session_b.scalar(
+                select(Customer.id).where(Customer.id == customer.id)
+            )
+            == customer.id
+        )
+
+        async with engine.connect() as lock_connection:
+            acquired = await lock_connection.scalar(
+                text("SELECT GET_LOCK(:lock_name, :timeout)"),
+                {
+                    "lock_name": contact_service._NAME_LOCK_NAME,
+                    "timeout": contact_service._NAME_LOCK_TIMEOUT_SECONDS,
+                },
+            )
+            assert acquired == 1
+
+            attempt = asyncio.ensure_future(
+                create_custom_function(
+                    session_b,
+                    customer.id,
+                    name,
+                    context=context,
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert not attempt.done()
+
+            shared = ContactFunction(
+                name=name,
+                customer_id=None,
+                scope_key=0,
+                status=ContactStatus.ACTIVE,
+                created_by=user.id,
+                updated_by=user.id,
+            )
+            session_a.add(shared)
+            await session_a.commit()
+            function_id = shared.id
+
+            assert (
+                await lock_connection.scalar(
+                    text("SELECT RELEASE_LOCK(:lock_name)"),
+                    {"lock_name": contact_service._NAME_LOCK_NAME},
+                )
+                == 1
+            )
+
+        with pytest.raises(BusinessError) as exc:
+            await asyncio.wait_for(attempt, timeout=3.0)
+        assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+
+        async with factory() as verify:
+            assert (
+                await verify.scalar(
+                    select(ContactFunction).where(ContactFunction.id == function_id)
+                )
+            ) is not None
+    finally:
+        for open_session in sessions:
+            await open_session.close()
+        async with factory() as cleanup:
+            if function_id is not None:
+                await cleanup.execute(
+                    delete(ContactFunction).where(ContactFunction.id == function_id)
+                )
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(ContactFunction).where(
+                        ContactFunction.customer_id == customer_id
+                    )
+                )
+            if user_id is not None:
+                await cleanup.execute(
+                    delete(AuditLog).where(AuditLog.user_id == user_id)
+                )
+            if customer_id is not None:
+                await cleanup.execute(
+                    delete(Customer).where(Customer.id == customer_id)
+                )
+            if user_id is not None:
+                await cleanup.execute(delete(User).where(User.id == user_id))
+            await cleanup.commit()
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("creator", ["shared", "custom"])
+async def test_rename_to_own_current_name_succeeds(
+    session,
+    creator: str,
+) -> None:
+    user = await make_user(session)
+    owner = await make_customer_row(session, owner=user)
+    if creator == "shared":
+        function = await add_function(session, name="商务", customer_id=None)
+    else:
+        function = await add_function(
+            session,
+            name="渠道",
+            customer_id=owner.id,
+        )
+    original_name = function.name
+
+    if creator == "shared":
+        renamed = await update_shared_function(
+            session,
+            function.id,
+            original_name,
+            context=make_context(user, is_super_admin=True),
+        )
+    else:
+        renamed = await update_custom_function(
+            session,
+            owner.id,
+            function.id,
+            original_name,
+            context=make_context(
+                user,
+                permission_codes={"customer:update"},
+            ),
+        )
+
+    assert renamed.id == function.id
+    assert renamed.name == original_name
+
+
+async def test_name_lock_timeout_returns_7007(
+    session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(contact_service, "_NAME_LOCK_TIMEOUT_SECONDS", 0.1)
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    holder = factory()
+    user = await make_user(session)
+
+    try:
+        acquired = await holder.scalar(
+            text("SELECT GET_LOCK(:lock_name, :timeout)"),
+            {
+                "lock_name": contact_service._NAME_LOCK_NAME,
+                "timeout": 1.0,
+            },
+        )
+        assert acquired == 1
+
+        with pytest.raises(BusinessError) as exc:
+            await create_shared_function(
+                session,
+                "锁定超时",
+                context=make_context(user, is_super_admin=True),
+            )
+
+        assert exc.value.code == ErrorCode.CONTACT_FUNCTION_NAME_EXISTS
+        assert exc.value.message == (
+            "Contact function name is being changed concurrently"
+        )
+    finally:
+        await holder.close()
+        await engine.dispose()
 
 
 async def test_shared_rename_clashing_with_custom_is_rejected(session) -> None:
@@ -380,6 +610,48 @@ async def test_delete_without_contacts_rejects_replacement(session) -> None:
         )
 
     assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
+
+
+async def test_missing_replacement_without_contacts_returns_7009(
+    session,
+) -> None:
+    user = await make_user(session)
+    function = await add_function(session, name="研发", customer_id=None)
+
+    with pytest.raises(BusinessError) as exc:
+        await delete_shared_function(
+            session,
+            function.id,
+            replacement_function_id=-1,
+            context=make_context(user, is_super_admin=True),
+        )
+
+    await session.refresh(function)
+    assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
+    assert function.status == ContactStatus.ACTIVE
+
+
+async def test_missing_replacement_with_contacts_returns_7009_and_keeps_contact(
+    session,
+) -> None:
+    user = await make_user(session)
+    owner = await make_customer_row(session, owner=user)
+    function = await add_function(session, name="研发", customer_id=None)
+    contact = await add_contact(session, owner, function, name="张三")
+
+    with pytest.raises(BusinessError) as exc:
+        await delete_shared_function(
+            session,
+            function.id,
+            replacement_function_id=-1,
+            context=make_context(user, is_super_admin=True),
+        )
+
+    await session.refresh(function)
+    await session.refresh(contact)
+    assert exc.value.code == ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID
+    assert function.status == ContactStatus.ACTIVE
+    assert contact.function_id == function.id
 
 
 async def test_shared_delete_rejects_custom_replacement(session) -> None:
@@ -695,3 +967,48 @@ async def test_delete_shared_function_writes_audit_row(
     assert row.result is AuditResult.SUCCESS
     assert row.resource_type == "contact_function"
     assert row.user_id == user.id
+
+
+async def test_create_update_restore_write_audit_metadata(
+    session,
+    isolated_audit_writes: async_sessionmaker[AsyncSession],
+) -> None:
+    user = await make_user(session)
+    context = make_context(user, is_super_admin=True)
+    function = await create_shared_function(session, "审计创建", context=context)
+    await update_shared_function(
+        session,
+        function.id,
+        "审计更新",
+        context=context,
+    )
+    await delete_shared_function(
+        session,
+        function.id,
+        replacement_function_id=None,
+        context=context,
+    )
+    await restore_shared_function(session, function.id, context=context)
+
+    async with isolated_audit_writes() as audit_session:
+        rows = (
+            await audit_session.scalars(
+                select(AuditLog)
+                .where(
+                    AuditLog.resource_type == "contact_function",
+                    AuditLog.resource_id == function.id,
+                )
+                .order_by(AuditLog.id)
+            )
+        ).all()
+
+    actions = [row.action for row in rows]
+    assert actions == [
+        "contact_function:create",
+        "contact_function:update",
+        "contact_function:delete",
+        "contact_function:restore",
+    ]
+    assert all(row.resource_type == "contact_function" for row in rows)
+    assert all(row.resource_id == function.id for row in rows)
+    assert all(row.result is AuditResult.SUCCESS for row in rows)
