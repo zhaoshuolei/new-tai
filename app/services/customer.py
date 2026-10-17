@@ -546,8 +546,21 @@ async def restore_customer(
             duplicate = await _duplicate_error(session, existing, context)
             raise duplicate
 
-    await customer_repository.restore(session, customer)
-    await session.flush()
+    credit_code = customer.credit_code
+    try:
+        async with session.begin_nested():
+            await customer_repository.restore(session, customer)
+            await session.flush()
+    except IntegrityError as error:
+        if credit_code is not None:
+            conflicting = await customer_repository.get_by_credit_code(
+                session,
+                credit_code,
+            )
+            if conflicting is not None:
+                duplicate = await _duplicate_error(session, conflicting, context)
+                raise duplicate from error
+        raise
     await session.refresh(customer)
     await session.commit()
     return customer

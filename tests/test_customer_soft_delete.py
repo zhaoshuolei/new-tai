@@ -9,6 +9,7 @@ from app.models.contact import ContactStatus
 from app.models.customer import Customer
 from app.models.role import DataScope
 from app.models.user import User
+from app.repositories import customer as customer_repository
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services import customer as customer_service
 from app.services.customer import (
@@ -105,6 +106,43 @@ async def test_restore_conflicts_when_active_customer_reuses_code(
 
     with pytest.raises(BusinessError) as exc:
         await restore_customer(session, deleted.id, context=ctx)
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": active.id}
+
+
+async def test_restore_race_translates_integrity_error_to_7002(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    deleted = await make_customer_row(session, owner=owner, credit_code=CODE)
+    await delete_customer(session, deleted.id, context=ctx)
+    active = await make_customer_row(session, owner=owner, credit_code=CODE)
+
+    original_lookup = customer_repository.get_by_credit_code
+    lookup_count = 0
+
+    async def stale_then_current(
+        current_session: AsyncSession,
+        credit_code: str,
+    ) -> Customer | None:
+        nonlocal lookup_count
+        if credit_code == CODE and lookup_count == 0:
+            lookup_count += 1
+            return None
+        return await original_lookup(current_session, credit_code)
+
+    monkeypatch.setattr(
+        customer_repository,
+        "get_by_credit_code",
+        stale_then_current,
+    )
+
+    with pytest.raises(BusinessError) as exc:
+        await restore_customer(session, deleted.id, context=ctx)
+
     assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
     assert exc.value.http_status == 409
     assert exc.value.extra == {"existing_customer_id": active.id}

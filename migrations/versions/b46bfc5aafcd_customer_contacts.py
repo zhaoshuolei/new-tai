@@ -10,6 +10,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
+from sqlalchemy.engine import Connection
 
 revision: str = "b46bfc5aafcd"
 down_revision: str | Sequence[str] | None = "cf349e47acee"
@@ -144,9 +145,46 @@ def upgrade() -> None:
     )
 
 
+def _deduplicate_credit_codes(
+    connection: Connection,
+    *,
+    table_name: str = "customer",
+) -> None:
+    test_suffix = table_name.removeprefix("customer_downgrade_")
+    if table_name != "customer" and (
+        not table_name.startswith("customer_downgrade_") or not test_suffix.isalnum()
+    ):
+        raise ValueError("Unexpected table name for credit-code deduplication")
+
+    quoted_table = connection.dialect.identifier_preparer.quote(table_name)
+    connection.execute(
+        sa.text(
+            f"""
+            UPDATE {quoted_table}
+            JOIN (
+                SELECT credit_code,
+                       COALESCE(
+                           MAX(CASE WHEN status = 'ACTIVE' THEN id END),
+                           MIN(id)
+                       ) AS keep_id
+                FROM {quoted_table}
+                WHERE credit_code IS NOT NULL
+                GROUP BY credit_code
+                HAVING COUNT(*) > 1
+            ) AS duplicates
+              ON duplicates.credit_code = {quoted_table}.credit_code
+            SET {quoted_table}.credit_code = NULL
+            WHERE {quoted_table}.id <> duplicates.keep_id
+              AND {quoted_table}.status = 'DELETED'
+            """
+        )
+    )
+
+
 def downgrade() -> None:
     op.drop_table("customer_contact")
     op.drop_table("contact_function")
+    _deduplicate_credit_codes(op.get_bind())
     op.drop_index(op.f("ix_customer_active_credit_code"), table_name="customer")
     op.drop_column("customer", "active_credit_code")
     op.create_index(

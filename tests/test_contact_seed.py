@@ -1,8 +1,10 @@
+import logging
+
 from sqlalchemy import select
 
 from app.models.contact import ContactFunction, ContactStatus
 from scripts.init_data import _ensure_shared_contact_functions
-from tests.customer_helpers import session  # noqa: F401
+from tests.customer_helpers import make_customer_row, make_user, session  # noqa: F401
 
 
 async def test_shared_functions_are_seeded_once(session) -> None:  # noqa: F811
@@ -46,6 +48,38 @@ async def test_existing_active_shared_function_is_not_duplicated(
     assert len(business_rows) == 1
     assert len(rows) == 4
     assert business_rows[0].status == ContactStatus.ACTIVE
+
+
+async def test_active_custom_function_blocks_shared_seed(
+    session,  # noqa: F811
+    caplog,
+) -> None:
+    user = await make_user(session)
+    customer = await make_customer_row(session, owner=user)
+    session.add(
+        ContactFunction(
+            name="商务",
+            customer_id=customer.id,
+            scope_key=customer.id,
+            status=ContactStatus.ACTIVE,
+        )
+    )
+    await session.flush()
+
+    with caplog.at_level(logging.WARNING):
+        await _ensure_shared_contact_functions(session)
+
+    active_business = (
+        await session.scalars(
+            select(ContactFunction).where(
+                ContactFunction.name == "商务",
+                ContactFunction.status == ContactStatus.ACTIVE,
+            )
+        )
+    ).all()
+    assert [row.customer_id for row in active_business] == [customer.id]
+    assert "商务" in caplog.text
+    assert "custom" in caplog.text
 
 
 async def test_deleted_shared_function_does_not_block_active_seed(

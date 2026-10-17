@@ -1,6 +1,9 @@
 """联系人职能与客户联系人数据访问。"""
 
+from typing import Any, cast
+
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.contact import ContactFunction, ContactStatus, CustomerContact
@@ -74,6 +77,23 @@ async def lock_function_shared(
     return await session.scalar(statement)
 
 
+async def lock_functions_for_update(
+    session: AsyncSession,
+    function_ids: set[int],
+) -> list[ContactFunction]:
+    if not function_ids:
+        return []
+    statement = (
+        select(ContactFunction)
+        .where(ContactFunction.id.in_(sorted(function_ids)))
+        .order_by(ContactFunction.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
 async def count_contacts_referencing(
     session: AsyncSession,
     function_id: int,
@@ -98,7 +118,7 @@ async def reassign_contacts(
         .values(function_id=to_function_id)
         .execution_options(synchronize_session=False)
     )
-    result = await session.execute(statement)
+    result = cast(CursorResult[Any], await session.execute(statement))
     return int(result.rowcount or 0)
 
 
@@ -160,5 +180,6 @@ __all__: tuple[str, ...] = (
     "list_shared_functions",
     "lock_function_for_update",
     "lock_function_shared",
+    "lock_functions_for_update",
     "reassign_contacts",
 )

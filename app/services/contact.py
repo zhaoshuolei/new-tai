@@ -138,7 +138,9 @@ def _require_super_admin(context: AuthContext) -> None:
 
 
 @asynccontextmanager
-async def _serialize_name_change(session: AsyncSession) -> AsyncIterator[None]:
+async def serialize_contact_function_name_change(
+    session: AsyncSession,
+) -> AsyncIterator[None]:
     lock_id = await session.scalar(
         select(ContactFunctionNameLock.id)
         .where(ContactFunctionNameLock.id == 1)
@@ -358,19 +360,27 @@ async def _delete_function(
     customer_id: int | None,
     context: AuthContext,
 ) -> int:
-    target = await contact_repository.lock_function_for_update(session, function_id)
+    function_ids = {function_id}
+    if replacement_function_id is not None:
+        function_ids.add(replacement_function_id)
+    locked_functions = await contact_repository.lock_functions_for_update(
+        session,
+        function_ids,
+    )
+    locked_by_id = {function.id: function for function in locked_functions}
+
+    target = locked_by_id.get(function_id)
     if target is None or target.status != ContactStatus.ACTIVE:
         raise _function_not_found_error()
     if customer_id is not None and target.customer_id != customer_id:
         raise _function_not_found_error()
 
     replacement_requested = replacement_function_id is not None
-    replacement = None
-    if replacement_requested:
-        replacement = await contact_repository.lock_function_shared(
-            session,
-            replacement_function_id,
-        )
+    replacement = (
+        locked_by_id.get(replacement_function_id)
+        if replacement_function_id is not None
+        else None
+    )
 
     contact_count = await contact_repository.count_contacts_referencing(
         session,
@@ -446,7 +456,7 @@ async def create_shared_function(
 ) -> ContactFunction:
     _require_super_admin(context)
     normalized = _normalize_name(name)
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         await _assert_name_available(
             session,
             normalized,
@@ -478,7 +488,7 @@ async def update_shared_function(
 ) -> ContactFunction:
     _require_super_admin(context)
     normalized = _normalize_name(name)
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         function = await contact_repository.get_function(session, function_id)
         if (
             function is None
@@ -539,7 +549,7 @@ async def restore_shared_function(
     context: AuthContext,
 ) -> ContactFunction:
     _require_super_admin(context)
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         function = await contact_repository.get_function(session, function_id)
         if function is None or function.customer_id is not None:
             raise _function_not_found_error()
@@ -599,7 +609,7 @@ async def create_custom_function(
     context: AuthContext,
 ) -> ContactFunction:
     normalized = _normalize_name(name)
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         await _require_visible_active_customer(session, customer_id, context)
         await _assert_name_available(
             session,
@@ -632,7 +642,7 @@ async def update_custom_function(
     context: AuthContext,
 ) -> ContactFunction:
     normalized = _normalize_name(name)
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         await _require_visible_active_customer(session, customer_id, context)
         function = await contact_repository.get_function(session, function_id)
         if (
@@ -695,7 +705,7 @@ async def restore_custom_function(
     *,
     context: AuthContext,
 ) -> ContactFunction:
-    async with _serialize_name_change(session):
+    async with serialize_contact_function_name_change(session):
         await _require_visible_active_customer(session, customer_id, context)
         function = await contact_repository.get_function(session, function_id)
         if function is None or function.customer_id != customer_id:
@@ -911,6 +921,7 @@ __all__: tuple[str, ...] = (
     "restore_contact",
     "restore_custom_function",
     "restore_shared_function",
+    "serialize_contact_function_name_change",
     "update_contact",
     "update_custom_function",
     "update_shared_function",

@@ -452,18 +452,21 @@ register_audit_route(
     "/contact-functions/{function_id}",
     action="contact_function:update",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "DELETE",
     "/contact-functions/{function_id}",
     action="contact_function:delete",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "POST",
     "/contact-functions/{function_id}/restore",
     action="contact_function:restore",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "POST",
@@ -476,18 +479,21 @@ register_audit_route(
     "/customers/{customer_id}/contact-functions/{function_id}",
     action="contact_function:update",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "DELETE",
     "/customers/{customer_id}/contact-functions/{function_id}",
     action="contact_function:delete",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "POST",
     "/customers/{customer_id}/contact-functions/{function_id}/restore",
     action="contact_function:restore",
     resource_type="contact_function",
+    resource_id_param="function_id",
 )
 register_audit_route(
     "POST",
@@ -500,18 +506,21 @@ register_audit_route(
     "/customers/{customer_id}/contacts/{contact_id}",
     action="contact:update",
     resource_type="customer_contact",
+    resource_id_param="contact_id",
 )
 register_audit_route(
     "DELETE",
     "/customers/{customer_id}/contacts/{contact_id}",
     action="contact:delete",
     resource_type="customer_contact",
+    resource_id_param="contact_id",
 )
 register_audit_route(
     "POST",
     "/customers/{customer_id}/contacts/{contact_id}/restore",
     action="contact:restore",
     resource_type="customer_contact",
+    resource_id_param="contact_id",
 )
 
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class RouteAuditMeta:
     action: str
     resource_type: str
+    resource_id_param: str | None = None
 
 
 @dataclass(frozen=True)
@@ -25,11 +26,13 @@ def register_audit_route(
     *,
     action: str,
     resource_type: str,
+    resource_id_param: str | None = None,
 ) -> None:
     """Register the audit action of a write route by method and path template."""
     _registry[(method.upper(), path)] = RouteAuditMeta(
         action=action,
         resource_type=resource_type,
+        resource_id_param=resource_id_param,
     )
 
 

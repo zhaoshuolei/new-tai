@@ -21,6 +21,146 @@ from tests.customer_helpers import (
 )
 
 
+async def test_reciprocal_function_deletes_use_ordered_locks() -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    customer_id: int | None = None
+    function_ids: list[int] = []
+
+    try:
+        async with factory() as setup:
+            user = await make_user(setup)
+            customer = await make_customer_row(setup, owner=user)
+            x = await add_function(
+                setup,
+                name=f"reciprocal-x-{user.id}",
+                customer_id=None,
+            )
+            y = await add_function(
+                setup,
+                name=f"reciprocal-y-{user.id}",
+                customer_id=None,
+            )
+            await add_contact(setup, customer, x, name="x-contact")
+            await add_contact(setup, customer, y, name="y-contact")
+            await setup.commit()
+            user_id = user.id
+            customer_id = customer.id
+            x_id = x.id
+            y_id = y.id
+            function_ids = [x_id, y_id]
+
+        context = AuthContext(
+            user_id=user_id,
+            role_id=1,
+            department_id=None,
+            data_scope=DataScope.ALL,
+            custom_department_ids=frozenset(),
+            include_children=False,
+            permission_codes=frozenset({"customer:delete"}),
+            is_super_admin=True,
+        )
+        ready = 0
+        both_ready = asyncio.Event()
+        ready_lock = asyncio.Lock()
+
+        async def delete_pair(target_id: int, replacement_id: int) -> str:
+            nonlocal ready
+            async with factory() as session:
+                async with ready_lock:
+                    ready += 1
+                    if ready == 2:
+                        both_ready.set()
+                await both_ready.wait()
+                try:
+                    await delete_shared_function(
+                        session,
+                        target_id,
+                        replacement_function_id=replacement_id,
+                        context=context,
+                    )
+                except BusinessError as error:
+                    return f"err:{error.code}"
+                return "ok"
+
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                delete_pair(x_id, y_id),
+                delete_pair(y_id, x_id),
+                return_exceptions=True,
+            ),
+            timeout=10,
+        )
+
+        assert all(isinstance(result, str) for result in results), results
+        assert results.count("ok") == 1
+        errors = [result for result in results if result != "ok"]
+        assert errors in (
+            [f"err:{ErrorCode.CONTACT_FUNCTION_NOT_FOUND.value}"],
+            [f"err:{ErrorCode.CONTACT_FUNCTION_REPLACEMENT_REQUIRED.value}"],
+            [f"err:{ErrorCode.CONTACT_FUNCTION_REPLACEMENT_INVALID.value}"],
+        )
+
+        async with factory() as check:
+            dangling_ids = (
+                await check.scalars(
+                    select(CustomerContact.id)
+                    .join(
+                        ContactFunction,
+                        CustomerContact.function_id == ContactFunction.id,
+                    )
+                    .where(
+                        ContactFunction.id.in_(function_ids),
+                        ContactFunction.status == ContactStatus.DELETED,
+                    )
+                )
+            ).all()
+            assert dangling_ids == []
+            functions = (
+                await check.scalars(
+                    select(ContactFunction)
+                    .where(ContactFunction.id.in_(function_ids))
+                    .order_by(ContactFunction.id)
+                )
+            ).all()
+            assert [function.status for function in functions] == [
+                ContactStatus.DELETED,
+                ContactStatus.ACTIVE,
+            ] or [function.status for function in functions] == [
+                ContactStatus.ACTIVE,
+                ContactStatus.DELETED,
+            ]
+    finally:
+        try:
+            async with factory() as cleanup:
+                if user_id is not None:
+                    await cleanup.execute(
+                        delete(AuditLog).where(AuditLog.user_id == user_id)
+                    )
+                if customer_id is not None:
+                    await cleanup.execute(
+                        delete(CustomerContact).where(
+                            CustomerContact.customer_id == customer_id
+                        )
+                    )
+                if function_ids:
+                    await cleanup.execute(
+                        delete(ContactFunction).where(
+                            ContactFunction.id.in_(function_ids)
+                        )
+                    )
+                if customer_id is not None:
+                    await cleanup.execute(
+                        delete(Customer).where(Customer.id == customer_id)
+                    )
+                if user_id is not None:
+                    await cleanup.execute(delete(User).where(User.id == user_id))
+                await cleanup.commit()
+        finally:
+            await engine.dispose()
+
+
 async def test_concurrent_create_and_function_delete_leave_no_dangling_reference() -> (
     None
 ):

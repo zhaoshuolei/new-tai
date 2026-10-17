@@ -304,76 +304,99 @@ async def test_name_conflict_error_surfaces_over_http(session) -> None:
 
 
 @pytest.mark.parametrize(
-    ("method", "template", "action", "resource_type"),
+    ("method", "template", "action", "resource_type", "resource_id_param"),
     [
-        ("POST", "/contact-functions", "contact_function:create", "contact_function"),
+        (
+            "POST",
+            "/contact-functions",
+            "contact_function:create",
+            "contact_function",
+            None,
+        ),
         (
             "PATCH",
             "/contact-functions/{function_id}",
             "contact_function:update",
             "contact_function",
+            "function_id",
         ),
         (
             "DELETE",
             "/contact-functions/{function_id}",
             "contact_function:delete",
             "contact_function",
+            "function_id",
         ),
         (
             "POST",
             "/contact-functions/{function_id}/restore",
             "contact_function:restore",
             "contact_function",
+            "function_id",
         ),
         (
             "POST",
             "/customers/{customer_id}/contact-functions",
             "contact_function:create",
             "contact_function",
+            None,
         ),
         (
             "PATCH",
             "/customers/{customer_id}/contact-functions/{function_id}",
             "contact_function:update",
             "contact_function",
+            "function_id",
         ),
         (
             "DELETE",
             "/customers/{customer_id}/contact-functions/{function_id}",
             "contact_function:delete",
             "contact_function",
+            "function_id",
         ),
         (
             "POST",
             "/customers/{customer_id}/contact-functions/{function_id}/restore",
             "contact_function:restore",
             "contact_function",
+            "function_id",
         ),
         (
             "POST",
             "/customers/{customer_id}/contacts",
             "contact:create",
             "customer_contact",
+            None,
         ),
         (
             "PATCH",
             "/customers/{customer_id}/contacts/{contact_id}",
             "contact:update",
             "customer_contact",
+            "contact_id",
         ),
         (
             "DELETE",
             "/customers/{customer_id}/contacts/{contact_id}",
             "contact:delete",
             "customer_contact",
+            "contact_id",
         ),
         (
             "POST",
             "/customers/{customer_id}/contacts/{contact_id}/restore",
             "contact:restore",
             "customer_contact",
+            "contact_id",
         ),
-        ("POST", "/customers/{customer_id}/restore", "customer:restore", "customer"),
+        (
+            "POST",
+            "/customers/{customer_id}/restore",
+            "customer:restore",
+            "customer",
+            None,
+        ),
     ],
 )
 def test_write_routes_are_registered_for_audit(
@@ -381,8 +404,75 @@ def test_write_routes_are_registered_for_audit(
     template: str,
     action: str,
     resource_type: str,
+    resource_id_param: str | None,
 ) -> None:
     meta = get_audit_route_meta(method, template)
     assert meta is not None
     assert meta.action == action
     assert meta.resource_type == resource_type
+    assert meta.resource_id_param == resource_id_param
+
+
+async def test_all_contact_routes_require_permission(session) -> None:
+    user = await make_user(session)
+    customer = await make_customer_row(session, owner=user)
+    function = await add_function(session, name="商务", customer_id=None)
+    contact = await add_contact(session, customer, function, name="张三")
+    ctx = make_context(user)
+    function_payload = {"name": "无权限"}
+    contact_payload = {"name": "无权限", "function_id": function.id}
+    routes = (
+        ("GET", "/contact-functions", None),
+        ("GET", "/contact-functions/recycle-bin", None),
+        ("POST", "/contact-functions", function_payload),
+        ("PATCH", f"/contact-functions/{function.id}", function_payload),
+        ("DELETE", f"/contact-functions/{function.id}", None),
+        ("POST", f"/contact-functions/{function.id}/restore", None),
+        ("GET", f"/customers/{customer.id}/contact-functions", None),
+        (
+            "POST",
+            f"/customers/{customer.id}/contact-functions",
+            function_payload,
+        ),
+        ("GET", f"/customers/{customer.id}/contact-functions/recycle-bin", None),
+        (
+            "PATCH",
+            f"/customers/{customer.id}/contact-functions/{function.id}",
+            {"name": "无权限"},
+        ),
+        (
+            "DELETE",
+            f"/customers/{customer.id}/contact-functions/{function.id}",
+            None,
+        ),
+        (
+            "POST",
+            f"/customers/{customer.id}/contact-functions/{function.id}/restore",
+            None,
+        ),
+        ("GET", f"/customers/{customer.id}/contacts", None),
+        ("POST", f"/customers/{customer.id}/contacts", contact_payload),
+        ("GET", f"/customers/{customer.id}/contacts/recycle-bin", None),
+        (
+            "PATCH",
+            f"/customers/{customer.id}/contacts/{contact.id}",
+            {"position": "采购"},
+        ),
+        ("DELETE", f"/customers/{customer.id}/contacts/{contact.id}", None),
+        (
+            "POST",
+            f"/customers/{customer.id}/contacts/{contact.id}/restore",
+            None,
+        ),
+    )
+    assert len(routes) == 18
+
+    async with api_client(session, ctx) as client:
+        for method, path, body in routes:
+            kwargs = {"json": body} if body is not None else {}
+            response = await client.request(
+                method,
+                f"/api/v1{path}",
+                **kwargs,
+            )
+            assert response.status_code == 403, (method, path, response.text)
