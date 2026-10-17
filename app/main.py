@@ -29,6 +29,7 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     {"name": "角色", "description": "角色管理"},
     {"name": "菜单", "description": "菜单与权限管理"},
     {"name": "部门", "description": "部门管理"},
+    {"name": "通讯录", "description": "在职员工目录"},
     {"name": "客户", "description": "客户档案与负责人管理"},
     {"name": "集成", "description": "第三方集成配置"},
     {"name": "系统设置", "description": "网站基础信息与品牌资源"},

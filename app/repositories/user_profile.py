@@ -1,9 +1,23 @@
 """用户档案数据访问。"""
 
-from sqlalchemy import select
+from typing import NamedTuple
+
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.department import Department
+from app.models.user import User, UserStatus
 from app.models.user_profile import UserProfile
+
+
+class DirectoryRow(NamedTuple):
+    id: int
+    nickname: str | None
+    username: str | None
+    avatar: str | None
+    signature: str | None
+    hidden_public_fields: list[str] | None
+    department_name: str | None
 
 
 async def get_by_user_id(
@@ -34,4 +48,70 @@ async def add(session: AsyncSession, profile: UserProfile) -> UserProfile:
     return profile
 
 
-__all__: tuple[str, ...] = ("add", "get_by_user_id", "lock_by_user_id")
+async def list_directory_entries(
+    session: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    keyword: str | None,
+    department_id: int | None,
+) -> tuple[list[DirectoryRow], int]:
+    conditions = [
+        User.deleted_at.is_(None),
+        User.status == UserStatus.ACTIVE,
+    ]
+    if department_id is not None:
+        conditions.append(User.department_id == department_id)
+    if keyword:
+        pattern = f"%{keyword}%"
+        conditions.append(
+            or_(
+                User.nickname.like(pattern),
+                User.username.like(pattern),
+            )
+        )
+
+    total_statement = (
+        select(func.count())
+        .select_from(User)
+        .outerjoin(UserProfile, UserProfile.user_id == User.id)
+        .outerjoin(Department, Department.id == User.department_id)
+        .where(*conditions)
+    )
+    total = await session.scalar(total_statement)
+
+    statement = (
+        select(
+            User.id,
+            User.nickname,
+            User.username,
+            User.avatar,
+            UserProfile.signature,
+            UserProfile.hidden_public_fields,
+            Department.name,
+        )
+        .select_from(User)
+        .outerjoin(UserProfile, UserProfile.user_id == User.id)
+        .outerjoin(Department, Department.id == User.department_id)
+        .where(*conditions)
+        .order_by(
+            case((Department.sort_order.is_(None), 1), else_=0),
+            Department.sort_order,
+            func.coalesce(User.nickname, User.username),
+            User.id,
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    result = await session.execute(statement)
+    rows = [DirectoryRow(*row) for row in result.all()]
+    return rows, int(total or 0)
+
+
+__all__: tuple[str, ...] = (
+    "DirectoryRow",
+    "add",
+    "get_by_user_id",
+    "list_directory_entries",
+    "lock_by_user_id",
+)
