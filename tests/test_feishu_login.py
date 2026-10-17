@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.clients.feishu import (
+    FEISHU_APP_ACCESS_TOKEN_URL,
     FEISHU_TOKEN_URL,
     FEISHU_USER_INFO_URL,
     FeishuClient,
@@ -574,6 +576,70 @@ async def test_exchange_code_uses_v3_endpoint_and_form_body() -> None:
         "code": "authorization-code",
         "redirect_uri": "https://example.com/callback",
     }
+
+
+async def test_verify_app_credentials_posts_json_and_discards_tokens() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "app_access_token": "must-not-be-returned",
+                "tenant_access_token": "must-not-be-returned",
+                "expire": 7200,
+            },
+        )
+
+    client = FeishuClient(
+        transport=httpx.MockTransport(handler),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    assert await client.verify_app_credentials() is None
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == FEISHU_APP_ACCESS_TOKEN_URL
+    assert requests[0].headers["content-type"].startswith("application/json")
+    assert json.loads(requests[0].content) == {
+        "app_id": "cli-test",
+        "app_secret": "secret-value",
+    }
+
+
+async def test_verify_app_credentials_maps_rejection_to_8011() -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"code": 10003, "msg": "no"})
+        ),
+        app_id="cli-bad",
+        app_secret="bad-secret",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_CREDENTIALS_REJECTED
+    assert error.value.http_status == 422
+
+
+async def test_verify_app_credentials_maps_bad_response_to_1011() -> None:
+    client = FeishuClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"msg": "missing-code"})
+        ),
+        app_id="cli-test",
+        app_secret="secret-value",
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await client.verify_app_credentials()
+
+    assert error.value.code == ErrorCode.FEISHU_UPSTREAM_ERROR
+    assert error.value.http_status == 502
 
 
 async def test_get_user_info_uses_bearer_token_and_maps_fields() -> None:
