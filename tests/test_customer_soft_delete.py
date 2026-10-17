@@ -179,6 +179,89 @@ async def test_update_to_deleted_credit_code_returns_7011(
     assert exc.value.extra is None
 
 
+async def _make_deleted_then_active_with_same_code(
+    session: AsyncSession,
+    owner: User,
+) -> Customer:
+    context = make_context(owner)
+    deleted = await make_customer_row(session, owner=owner, credit_code=CODE)
+    await delete_customer(session, deleted.id, context=context)
+    return await make_customer_row(session, owner=owner, credit_code=CODE)
+
+
+async def test_create_prefers_active_when_deleted_has_same_credit_code(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    active = await _make_deleted_then_active_with_same_code(session, owner)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_customer(
+            session,
+            CustomerCreate(name="Conflicting customer", credit_code=CODE),
+            context=ctx,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": active.id}
+
+
+async def test_import_prefers_active_when_deleted_has_same_credit_code(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    active = await _make_deleted_then_active_with_same_code(session, owner)
+
+    with pytest.raises(BusinessError) as exc:
+        await import_from_tianyancha(session, CODE, None, context=ctx)
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": active.id}
+    assert fake_client.calls == []
+
+
+async def test_update_prefers_active_when_deleted_has_same_credit_code(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    active = await _make_deleted_then_active_with_same_code(session, owner)
+    target = await make_customer_row(session, owner=owner)
+
+    with pytest.raises(BusinessError) as exc:
+        await update_customer(
+            session,
+            target.id,
+            CustomerUpdate(credit_code=CODE),
+            context=ctx,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
+    assert exc.value.http_status == 409
+    assert exc.value.extra == {"existing_customer_id": active.id}
+
+
+async def test_update_to_own_credit_code_succeeds(session: AsyncSession) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    customer = await make_customer_row(session, owner=owner, credit_code=CODE)
+
+    updated = await update_customer(
+        session,
+        customer.id,
+        CustomerUpdate(credit_code=CODE),
+        context=ctx,
+    )
+
+    assert updated.id == customer.id
+    assert updated.credit_code == CODE
+
+
 async def test_transfer_active_customer_needs_update_permission(
     session: AsyncSession,
 ) -> None:

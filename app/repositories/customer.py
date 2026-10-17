@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -29,7 +29,15 @@ async def get_by_credit_code_any_status(
     session: AsyncSession,
     credit_code: str,
 ) -> Customer | None:
-    statement = select(Customer).where(Customer.credit_code == credit_code)
+    statement = (
+        select(Customer)
+        .where(Customer.credit_code == credit_code)
+        .order_by(
+            case((Customer.status == ContactStatus.ACTIVE, 0), else_=1),
+            Customer.id,
+        )
+        .limit(1)
+    )
     return await session.scalar(statement)
 
 
