@@ -125,7 +125,7 @@ async def test_init_creates_super_admin_and_default_roles(
     assert default is not None
     assert default.is_system is True
     assert default.status == RoleStatus.ACTIVE
-    assert await _count(session, RoleMenu) == 1
+    assert await _count(session, RoleMenu) == 2
     assert (
         await session.scalar(
             select(RoleMenu.c.menu_id).where(RoleMenu.c.role_id == super_admin.id)
@@ -142,19 +142,67 @@ async def test_default_role_is_scoped_to_self(session: AsyncSession) -> None:
     )
 
     default = await session.scalar(select(Role).where(Role.code == "default"))
-    profile = await session.scalar(
-        select(Menu).where(Menu.name == "个人资料", Menu.parent_id.is_(None))
+    menu_names = set(
+        list(
+            (
+                await session.scalars(
+                    select(Menu.name)
+                    .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                    .where(RoleMenu.c.role_id == default.id)
+                )
+            ).all()
+        )
     )
 
     assert default is not None
     assert default.data_scope == DataScope.SELF
-    assert profile is not None
-    assert (
-        await session.scalar(
-            select(RoleMenu.c.menu_id).where(RoleMenu.c.role_id == default.id)
-        )
-        == profile.id
+    assert menu_names == {"个人资料", "通讯录"}
+
+
+async def test_directory_menu_is_seeded_once_and_granted_to_existing_roles(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
     )
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    menus = list(
+        (
+            await session.scalars(
+                select(Menu).where(
+                    Menu.name == "通讯录",
+                    Menu.parent_id.is_(None),
+                )
+            )
+        ).all()
+    )
+    default = await session.scalar(select(Role).where(Role.code == "default"))
+    menu_names = set(
+        list(
+            (
+                await session.scalars(
+                    select(Menu.name)
+                    .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                    .where(RoleMenu.c.role_id == default.id)
+                )
+            ).all()
+        )
+    )
+
+    assert len(menus) == 1
+    directory = menus[0]
+    assert directory.type == MenuType.MENU
+    assert directory.path == "/directory"
+    assert directory.permission_code is None
+    assert directory.sort_order == 5
+    assert menu_names == {"个人资料", "通讯录"}
 
 
 async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
@@ -474,9 +522,9 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 37
+    assert await _count(session, Menu) == 38
     assert await _count(session, User) == 1
-    assert await _count(session, RoleMenu) == 1
+    assert await _count(session, RoleMenu) == 2
     assert await _count(session, SystemSetting) == 1
     assert (
         await session.scalar(select(Department.id).where(Department.name == "待分配"))

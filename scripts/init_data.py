@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 _SUPER_ADMIN_ROLE_CODE = "super_admin"
 _DEFAULT_ROLE_CODE = "default"
+_DIRECTORY_MENU_NAME = "通讯录"
 _PROFILE_MENU_NAME = "个人资料"
 _SHARED_CONTACT_FUNCTION_NAMES = ("商务", "运营", "研发", "产品")
 
@@ -42,6 +43,14 @@ class _MenuSeed:
 
 
 _MENU_SEEDS = (
+    _MenuSeed(
+        key="directory",
+        parent_key=None,
+        menu_type=MenuType.MENU,
+        name=_DIRECTORY_MENU_NAME,
+        path="/directory",
+        sort_order=5,
+    ),
     _MenuSeed(
         key="profile",
         parent_key=None,
@@ -450,14 +459,18 @@ async def _find_menu(
     return await session.scalar(statement)
 
 
-async def _get_or_create_menus(session: AsyncSession) -> dict[str, Menu]:
+async def _get_or_create_menus(
+    session: AsyncSession,
+) -> tuple[dict[str, Menu], set[str]]:
     menus_by_key: dict[str, Menu] = {}
+    created_keys: set[str] = set()
     for seed in _MENU_SEEDS:
         parent_id = (
             menus_by_key[seed.parent_key].id if seed.parent_key is not None else None
         )
         menu = await _find_menu(session, seed, parent_id=parent_id)
         if menu is None:
+            created_keys.add(seed.key)
             payload = MenuCreate(
                 parent_id=parent_id,
                 type=seed.menu_type,
@@ -482,28 +495,46 @@ async def _get_or_create_menus(session: AsyncSession) -> dict[str, Menu]:
             session.add(menu)
             await session.flush()
         menus_by_key[seed.key] = menu
-    return menus_by_key
+    return menus_by_key, created_keys
 
 
-async def _ensure_default_role_menu(
+async def _grant_baseline_menus(
     session: AsyncSession,
     *,
-    default_role: Role,
-    profile_menu: Menu,
+    menus_by_key: dict[str, Menu],
+    created_keys: set[str],
 ) -> None:
-    assigned = await session.scalar(
-        select(RoleMenu.c.menu_id).where(
-            RoleMenu.c.role_id == default_role.id,
-            RoleMenu.c.menu_id == profile_menu.id,
-        )
-    )
-    if assigned is None:
-        await session.execute(
-            insert(RoleMenu).values(
-                role_id=default_role.id,
-                menu_id=profile_menu.id,
+    targets = [
+        menus_by_key[key] for key in ("profile", "directory") if key in created_keys
+    ]
+    if not targets:
+        return
+
+    role_ids = list(
+        (
+            await session.scalars(
+                select(Role.id).where(
+                    Role.deleted_at.is_(None),
+                    Role.code != _SUPER_ADMIN_ROLE_CODE,
+                )
             )
-        )
+        ).all()
+    )
+    for role_id in role_ids:
+        for menu in targets:
+            assigned = await session.scalar(
+                select(RoleMenu.c.menu_id).where(
+                    RoleMenu.c.role_id == role_id,
+                    RoleMenu.c.menu_id == menu.id,
+                )
+            )
+            if assigned is None:
+                await session.execute(
+                    insert(RoleMenu).values(
+                        role_id=role_id,
+                        menu_id=menu.id,
+                    )
+                )
 
 
 async def _get_or_create_superadmin(
@@ -623,18 +654,18 @@ async def init_data(
         data_scope=DataScope.ALL,
         description="系统内置超级管理员角色，拥有全部启用菜单权限",
     )
-    default_role = await _get_or_create_role(
+    await _get_or_create_role(
         session,
         code=_DEFAULT_ROLE_CODE,
         name="默认角色",
         data_scope=DataScope.SELF,
         description="新用户默认角色，仅可查看个人资料",
     )
-    menus_by_key = await _get_or_create_menus(session)
-    await _ensure_default_role_menu(
+    menus_by_key, created_keys = await _get_or_create_menus(session)
+    await _grant_baseline_menus(
         session,
-        default_role=default_role,
-        profile_menu=menus_by_key["profile"],
+        menus_by_key=menus_by_key,
+        created_keys=created_keys,
     )
     await _get_or_create_superadmin(
         session,
