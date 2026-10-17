@@ -187,6 +187,7 @@ async def _get_scoped_customer(
     context: AuthContext,
     *,
     status: ContactStatus = ContactStatus.ACTIVE,
+    for_update: bool = False,
 ) -> Customer | None:
     statement = apply_customer_scope(
         select(Customer).where(
@@ -195,6 +196,10 @@ async def _get_scoped_customer(
         ),
         context,
     )
+    if for_update:
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
     result = await session.scalar(statement)
     return result if isinstance(result, Customer) else None
 
@@ -205,12 +210,14 @@ async def _require_scoped_customer(
     context: AuthContext,
     *,
     status: ContactStatus = ContactStatus.ACTIVE,
+    for_update: bool = False,
 ) -> Customer:
     customer = await _get_scoped_customer(
         session,
         customer_id,
         context,
         status=status,
+        for_update=for_update,
     )
     if customer is None:
         raise _not_found_error()
@@ -392,6 +399,7 @@ async def create_customer(
             duplicate = await _credit_code_conflict_error(session, existing, context)
             raise duplicate
 
+    business_scope = _clean_optional(payload.business_scope)
     customer = Customer(
         name=name,
         short_name=_clean_optional(payload.short_name),
@@ -399,8 +407,8 @@ async def create_customer(
         legal_person=_clean_optional(payload.legal_person),
         registered_capital=_clean_optional(payload.registered_capital),
         established_date=payload.established_date,
-        business_scope=_clean_optional(payload.business_scope),
-        business_scope_truncated=False,
+        business_scope=business_scope,
+        business_scope_truncated=_needs_history(business_scope),
         reg_status=_clean_optional(payload.reg_status),
         source=CustomerSource.MANUAL,
         tyc_imported_at=None,
@@ -466,6 +474,11 @@ async def update_customer(
     for field_name in _STRING_UPDATE_FIELDS:
         if field_name in changes:
             changes[field_name] = _clean_optional(changes[field_name])
+
+    if "business_scope" in changes:
+        changes["business_scope_truncated"] = _needs_history(
+            changes["business_scope"]
+        )
 
     if updated_credit_code is not None:
         # 主动查重与写入之间可能有并发提交；用 SAVEPOINT 把唯一约束冲突
@@ -635,6 +648,58 @@ async def transfer_owner(
     return customer
 
 
+@audited(
+    action="customer:update",
+    resource_type="customer",
+    resource_id_param="customer_id",
+)
+async def refresh_business_scope_from_tianyancha(
+    session: AsyncSession,
+    customer_id: int,
+    *,
+    context: AuthContext,
+) -> Customer:
+    customer = await _require_scoped_customer(session, customer_id, context)
+    if not customer.business_scope_truncated:
+        return customer
+    if customer.credit_code is None:
+        raise _invalid_field_error(
+            "Unified social credit code is required to refresh business scope"
+        )
+
+    credit_code = customer.credit_code
+    displayed_scope = customer.business_scope
+    client = await get_tianyancha_client(session)
+    historical_text = await client.fetch_historical_registration_text(credit_code)
+
+    # 上游调用期间可能有人手工补全经营范围。Flush 后以当前读重新锁定客户，
+    # 仅在经营范围仍是发起请求时的那份截断文本时才应用结果，避免覆盖用户编辑。
+    current = await _require_scoped_customer(
+        session,
+        customer_id,
+        context,
+        for_update=True,
+    )
+    if (
+        not current.business_scope_truncated
+        or current.business_scope != displayed_scope
+        or current.credit_code != credit_code
+    ):
+        await session.commit()
+        return current
+
+    business_scope, truncated = resolve_full_business_scope(
+        current.business_scope,
+        parse_change_scope_records(historical_text),
+    )
+    current.business_scope = business_scope
+    current.business_scope_truncated = truncated
+    await session.flush()
+    await session.refresh(current)
+    await session.commit()
+    return current
+
+
 async def list_customers(
     session: AsyncSession,
     *,
@@ -680,6 +745,7 @@ __all__: tuple[str, ...] = (
     "import_from_tianyancha",
     "list_customers",
     "list_deleted_customers",
+    "refresh_business_scope_from_tianyancha",
     "restore_customer",
     "search_candidates",
     "transfer_owner",

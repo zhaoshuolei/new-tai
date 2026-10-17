@@ -209,6 +209,32 @@ async def update_customer(
     return success(CustomerRead.model_validate(customer))
 
 
+@router.post(
+    "/{customer_id}/business-scope/refresh",
+    response_model=SuccessEnvelope[CustomerRead],
+    dependencies=[Depends(require_permission("customer:update"))],
+)
+async def refresh_customer_business_scope(
+    customer_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> dict[str, Any]:
+    await enforce_rate_limit(
+        redis,
+        (tianyancha_rate_limit_key("import", str(context.user_id)),),
+        window_seconds=IMPORT_WINDOW_SECONDS,
+        max_requests=IMPORT_MAX_REQUESTS,
+        message="Too many Tianyancha requests; wait before retrying",
+    )
+    customer = await customer_service.refresh_business_scope_from_tianyancha(
+        session,
+        customer_id,
+        context=context,
+    )
+    return success(CustomerRead.model_validate(customer), message="updated")
+
+
 @router.delete(
     "/{customer_id}",
     response_model=SuccessEnvelope[None],
@@ -283,6 +309,12 @@ register_audit_route(
     resource_type="customer",
 )
 register_audit_route(
+    "POST",
+    "/customers/{customer_id}/business-scope/refresh",
+    action="customer:update",
+    resource_type="customer",
+)
+register_audit_route(
     "DELETE",
     "/customers/{customer_id}",
     action="customer:delete",
@@ -309,6 +341,7 @@ __all__: tuple[str, ...] = (
     "import_customer",
     "list_customers",
     "list_deleted_customers",
+    "refresh_customer_business_scope",
     "restore_customer",
     "router",
     "search_candidates",

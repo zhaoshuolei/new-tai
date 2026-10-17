@@ -14,7 +14,7 @@ from sqlalchemy import (
     Text,
     false,
 )
-from sqlalchemy.dialects.mysql import DATETIME
+from sqlalchemy.dialects.mysql import DATETIME, LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -67,7 +67,7 @@ class Customer(Base):
         nullable=True,
     )
     established_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    business_scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    business_scope: Mapped[str | None] = mapped_column(LONGTEXT, nullable=True)
     business_scope_truncated: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

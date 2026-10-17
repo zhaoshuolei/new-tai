@@ -59,6 +59,7 @@ class FakeTianyanchaClient:
             reg_status="存续",
         )
         self.registration_error: Exception | None = None
+        self.historical_text = ""
 
     async def search_candidates(
         self, keyword: str, *, page: int, page_size: int
@@ -73,7 +74,7 @@ class FakeTianyanchaClient:
         return self.registration
 
     async def fetch_historical_registration_text(self, credit_code: str) -> str:
-        return ""
+        return self.historical_text
 
 
 @pytest_asyncio.fixture
@@ -212,6 +213,7 @@ PROTECTED_ROUTES = [
     ),
     ("get", "/api/v1/customers/1", {}),
     ("patch", "/api/v1/customers/1", {"json": {"remark": "x"}}),
+    ("post", "/api/v1/customers/1/business-scope/refresh", {}),
     ("delete", "/api/v1/customers/1", {}),
     ("get", "/api/v1/customers/recycle-bin", {}),
     ("post", "/api/v1/customers/1/restore", {}),
@@ -439,6 +441,40 @@ async def test_update_customer_returns_timestamps(
     assert data["remark"] == "更新备注"
     assert data["created_at"] is not None
     assert data["updated_at"] is not None
+
+
+async def test_refresh_business_scope_returns_complete_text(
+    session: AsyncSession,
+    caller: User,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    customer = Customer(
+        name="待补全客户",
+        credit_code=REQUESTED_CREDIT_CODE,
+        business_scope="互联网信息服务...",
+        business_scope_truncated=True,
+        source=CustomerSource.TIANYANCHA,
+        owner_user_id=caller.id,
+        owner_department_id=caller.department_id,
+    )
+    session.add(customer)
+    await session.flush()
+    fake_client.historical_text = (
+        "##### 经营范围 2022-03-11\n"
+        "###### 变更后原文\n"
+        "互联网信息服务完整经营范围。\n"
+    )
+
+    context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)
+    async with api_client(session, context) as client:
+        response = await client.post(
+            f"/api/v1/customers/{customer.id}/business-scope/refresh"
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["business_scope"] == "互联网信息服务完整经营范围。"
+    assert data["business_scope_truncated"] is False
 
 
 async def test_transfer_owner_returns_timestamps(
