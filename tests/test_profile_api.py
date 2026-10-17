@@ -725,3 +725,169 @@ async def test_first_patch_recovers_from_injected_duplicate_key_race(
                 await cleanup_session.execute(delete(User).where(User.id == user_id))
                 await cleanup_session.commit()
         await engine.dispose()
+
+
+async def test_put_privacy_updates_hidden_fields_and_edit_view_still_returns_values(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+    profile = UserProfile(
+        user_id=user.id,
+        signature="visible to profile owner",
+        bio="also visible to profile owner",
+        hidden_public_fields=["bio"],
+    )
+    session.add(profile)
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": ["avatar", "signature"]},
+        )
+        read_response = await client.get("/api/v1/me/profile")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["hidden_public_fields"] == [
+        "signature",
+        "avatar",
+    ]
+    assert read_response.status_code == 200, read_response.text
+    read_data = read_response.json()["data"]
+    assert read_data["hidden_public_fields"] == ["signature", "avatar"]
+    assert read_data["signature"] == "visible to profile owner"
+    assert read_data["bio"] == "also visible to profile owner"
+
+    await session.refresh(profile)
+    assert profile.hidden_public_fields == ["signature", "avatar"]
+
+
+async def test_put_privacy_dedupes_and_uses_whitelist_order(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+    profile = UserProfile(user_id=user.id)
+    session.add(profile)
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": ["avatar", "bio", "avatar"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["hidden_public_fields"] == ["bio", "avatar"]
+
+    await session.refresh(profile)
+    assert profile.hidden_public_fields == ["bio", "avatar"]
+
+
+async def test_put_privacy_empty_list_clears_without_persisting_sql_null(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+    profile = UserProfile(
+        user_id=user.id,
+        hidden_public_fields=["signature", "bio"],
+    )
+    session.add(profile)
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": []},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["hidden_public_fields"] == []
+
+    await session.refresh(profile)
+    assert profile.hidden_public_fields == []
+    stored_value = await session.scalar(
+        select(UserProfile.hidden_public_fields).where(
+            UserProfile.user_id == user.id
+        )
+    )
+    assert stored_value == []
+
+
+@pytest.mark.parametrize(
+    "hidden_field",
+    ["not_a_profile_field", "nickname", "department_name"],
+)
+async def test_put_privacy_rejects_unknown_fields_before_writing(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+    hidden_field: str,
+) -> None:
+    user = await _make_user(session)
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": [hidden_field]},
+        )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["code"] == 1006
+    assert payload["message"] == "Unknown profile field"
+    assert await _profile_for(session, user.id) is None
+    assert await _audit_rows(audit_session_factory) == []
+
+
+async def test_first_privacy_update_creates_missing_profile_row(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": ["work_phone"]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["id"] == user.id
+    assert response.json()["data"]["hidden_public_fields"] == ["work_phone"]
+
+    profile = await _profile_for(session, user.id)
+    assert profile is not None
+    assert profile.hidden_public_fields == ["work_phone"]
+    assert profile.expertise_tags == []
+    assert profile.personal_links == []
+
+
+async def test_privacy_update_creates_one_audit_without_field_values(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = await _make_user(session)
+    session.add(UserProfile(user_id=user.id))
+    await session.flush()
+    field_marker = "work_email"
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.put(
+            "/api/v1/me/profile/privacy",
+            json={"hidden_fields": [field_marker]},
+        )
+
+    assert response.status_code == 200, response.text
+    rows = await _audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.resource_id == user.id
+    assert row.action == "user_profile:privacy"
+    assert row.resource_type == "user_profile"
+    assert row.result == AuditResult.SUCCESS
+
+    serialized = repr(
+        {
+            column.name: getattr(row, column.name)
+            for column in AuditLog.__table__.columns
+        }
+    )
+    assert field_marker not in serialized

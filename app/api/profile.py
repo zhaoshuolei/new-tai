@@ -10,7 +10,7 @@ from app.core.auth_context import AuthContext
 from app.core.deps import get_current_context
 from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
-from app.schemas.profile import ProfileRead, ProfileUpdate
+from app.schemas.profile import PrivacyUpdate, ProfileRead, ProfileUpdate
 from app.services import user_profile as user_profile_service
 
 router = APIRouter(prefix="/me/profile", tags=["个人资料"])
@@ -58,12 +58,41 @@ async def update_my_profile(
     return success(profile, message="updated")
 
 
+@router.put(
+    "/privacy",
+    response_model=SuccessEnvelope[ProfileRead],
+)
+async def update_my_privacy(
+    payload: PrivacyUpdate,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    profile = await user_profile_service.update_my_privacy(
+        session,
+        payload,
+        user_id=context.user_id,
+        context=context,
+    )
+    return success(profile, message="updated")
+
+
 register_audit_route(
     "PATCH",
     "/me/profile",
     action="user_profile:update",
     resource_type="user_profile",
 )
+register_audit_route(
+    "PUT",
+    "/me/profile/privacy",
+    action="user_profile:privacy",
+    resource_type="user_profile",
+)
 
 
-__all__: tuple[str, ...] = ("get_my_profile", "router", "update_my_profile")
+__all__: tuple[str, ...] = (
+    "get_my_profile",
+    "router",
+    "update_my_privacy",
+    "update_my_profile",
+)

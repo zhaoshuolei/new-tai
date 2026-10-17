@@ -7,11 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
-from app.models.user_profile import UserProfile
+from app.models.user_profile import PUBLIC_PROFILE_FIELD_KEYS, UserProfile
 from app.repositories import department as department_repository
 from app.repositories import user as user_repository
 from app.repositories import user_profile as user_profile_repository
-from app.schemas.profile import ProfileRead, ProfileUpdate
+from app.schemas.profile import PrivacyUpdate, ProfileRead, ProfileUpdate
 from app.services.audit import audited
 
 _UNSET = object()
@@ -116,6 +116,28 @@ def _is_duplicate_profile(error: IntegrityError) -> bool:
     return bool(args and args[0] == 1062)
 
 
+async def _get_or_create_profile(
+    session: AsyncSession,
+    user_id: int,
+) -> UserProfile:
+    profile = await user_profile_repository.get_by_user_id(session, user_id)
+    if profile is not None:
+        return profile
+
+    candidate = UserProfile(user_id=user_id)
+    try:
+        async with session.begin_nested():
+            await user_profile_repository.add(session, candidate)
+        return candidate
+    except IntegrityError as error:
+        if not _is_duplicate_profile(error):
+            raise
+        profile = await user_profile_repository.lock_by_user_id(session, user_id)
+        if profile is None:
+            raise
+        return profile
+
+
 @audited(
     action="user_profile:update",
     resource_type="user_profile",
@@ -144,23 +166,7 @@ async def update_my_profile(
         user.nickname = nickname if isinstance(nickname, str) else None
 
     if provided:
-        profile = await user_profile_repository.get_by_user_id(session, user_id)
-        if profile is None:
-            candidate = UserProfile(user_id=user_id)
-            try:
-                async with session.begin_nested():
-                    await user_profile_repository.add(session, candidate)
-                profile = candidate
-            except IntegrityError as error:
-                if not _is_duplicate_profile(error):
-                    raise
-                profile = await user_profile_repository.lock_by_user_id(
-                    session,
-                    user_id,
-                )
-                if profile is None:
-                    raise
-
+        profile = await _get_or_create_profile(session, user_id)
         for field, value in provided.items():
             if field in _JSON_LIST_FIELDS:
                 setattr(profile, field, value if isinstance(value, list) else [])
@@ -173,8 +179,50 @@ async def update_my_profile(
     return await get_my_profile(session, user_id=user_id)
 
 
+@audited(
+    action="user_profile:privacy",
+    resource_type="user_profile",
+    resource_id_param="user_id",
+)
+async def update_my_privacy(
+    session: AsyncSession,
+    payload: PrivacyUpdate,
+    *,
+    user_id: int,
+    context: AuthContext,
+) -> ProfileRead:
+    requested_fields = set(payload.hidden_fields)
+    unknown_fields = requested_fields - set(PUBLIC_PROFILE_FIELD_KEYS)
+    if unknown_fields:
+        raise BusinessError(
+            ErrorCode.INVALID_PARAMETER,
+            "Unknown profile field",
+            http_status=422,
+        )
+
+    user = await user_repository.get_by_id(session, user_id)
+    if user is None:
+        raise BusinessError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found",
+            http_status=404,
+        )
+
+    profile = await _get_or_create_profile(session, user_id)
+    profile.hidden_public_fields = [
+        key for key in PUBLIC_PROFILE_FIELD_KEYS if key in requested_fields
+    ]
+    await session.commit()
+    return await get_my_profile(session, user_id=user_id)
+
+
+replace_privacy = update_my_privacy
+
+
 __all__: tuple[str, ...] = (
     "get_my_profile",
     "profile_values",
+    "replace_privacy",
+    "update_my_privacy",
     "update_my_profile",
 )
