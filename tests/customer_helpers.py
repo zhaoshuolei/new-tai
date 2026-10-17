@@ -29,10 +29,8 @@ from app.models.department import Department, DepartmentStatus
 from app.models.role import DataScope
 from app.models.user import User, UserStatus
 
-TEST_DATABASE_URL: str = os.environ.get(
-    "DATABASE_URL",
-    "mysql+asyncmy://tianxiadmin:tianxiadmin@127.0.0.1:3306/tianxiadmin_test",
-)
+# 不内嵌带凭据的兜底地址：必须由测试配置显式提供，避免误连非测试库。
+TEST_DATABASE_URL: str = os.environ["DATABASE_URL"]
 REQUESTED_CREDIT_CODE = "911100007693890511"
 
 

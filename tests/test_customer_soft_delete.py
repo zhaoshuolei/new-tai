@@ -123,16 +123,24 @@ async def test_restore_race_translates_integrity_error_to_7002(
 
     original_lookup = customer_repository.get_by_credit_code
     lookup_count = 0
+    lock_flags: list[bool] = []
 
     async def stale_then_current(
         current_session: AsyncSession,
         credit_code: str,
+        *,
+        for_update: bool = False,
     ) -> Customer | None:
         nonlocal lookup_count
+        lock_flags.append(for_update)
         if credit_code == CODE and lookup_count == 0:
             lookup_count += 1
             return None
-        return await original_lookup(current_session, credit_code)
+        return await original_lookup(
+            current_session,
+            credit_code,
+            for_update=for_update,
+        )
 
     monkeypatch.setattr(
         customer_repository,
@@ -146,6 +154,8 @@ async def test_restore_race_translates_integrity_error_to_7002(
     assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
     assert exc.value.http_status == 409
     assert exc.value.extra == {"existing_customer_id": active.id}
+    # 冲突后的恢复复核必须是当前读，否则 REPEATABLE READ 快照看不到并发提交。
+    assert lock_flags == [False, True]
 
 
 async def test_restore_invisible_or_missing_customer_returns_7001(

@@ -122,6 +122,24 @@ async def test_get_by_credit_code_returns_none_for_missing_code(
     assert await get_by_credit_code(session, "91110000MA00000099") is None
 
 
+async def test_get_by_credit_code_for_update_returns_active_row(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    customer = await add(
+        session,
+        make_customer(owner, credit_code="91110000MA00000077"),
+    )
+
+    loaded = await get_by_credit_code(
+        session,
+        "91110000MA00000077",
+        for_update=True,
+    )
+    assert loaded is not None
+    assert loaded.id == customer.id
+
+
 async def test_get_by_id_and_soft_delete_roundtrip(session: AsyncSession) -> None:
     owner = await make_user(session)
     customer = await add(

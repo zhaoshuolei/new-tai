@@ -229,7 +229,9 @@ async def _insert_customer(
     except IntegrityError as error:
         if credit_code is not None:
             existing = await customer_repository.get_by_credit_code(
-                session, credit_code
+                session,
+                credit_code,
+                for_update=True,
             )
             if existing is not None:
                 duplicate = await _duplicate_error(session, existing, context)
@@ -476,7 +478,9 @@ async def update_customer(
                 await session.flush()
         except IntegrityError as error:
             conflicting = await customer_repository.get_by_credit_code(
-                session, updated_credit_code
+                session,
+                updated_credit_code,
+                for_update=True,
             )
             if conflicting is not None:
                 duplicate = await _duplicate_error(session, conflicting, context)
@@ -556,6 +560,7 @@ async def restore_customer(
             conflicting = await customer_repository.get_by_credit_code(
                 session,
                 credit_code,
+                for_update=True,
             )
             if conflicting is not None:
                 duplicate = await _duplicate_error(session, conflicting, context)

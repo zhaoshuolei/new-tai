@@ -17,11 +17,20 @@ async def get_by_id(session: AsyncSession, customer_id: int) -> Customer | None:
 async def get_by_credit_code(
     session: AsyncSession,
     credit_code: str,
+    *,
+    for_update: bool = False,
 ) -> Customer | None:
+    """按信用代码查未删除客户。
+
+    ``for_update=True`` 用于唯一键冲突后的复核：MySQL REPEATABLE READ 下普通
+    SELECT 会固定事务快照，并发事务刚提交的冲突行不可见；当前读才能看到它。
+    """
     statement = select(Customer).where(
         Customer.credit_code == credit_code,
         Customer.status == ContactStatus.ACTIVE,
     )
+    if for_update:
+        statement = statement.with_for_update()
     return await session.scalar(statement)
 
 
