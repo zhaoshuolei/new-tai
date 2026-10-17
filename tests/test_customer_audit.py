@@ -31,6 +31,7 @@ from app.services.customer import (
     create_customer,
     delete_customer,
     import_from_tianyancha,
+    restore_customer,
     transfer_owner,
 )
 from app.services.integration import save_tianyancha_token
@@ -194,7 +195,10 @@ async def test_transfer_writes_audit_row(
 ) -> None:
     caller = await make_user(session)
     target = await make_user(session)
-    context = make_context(caller)
+    context = make_context(
+        caller,
+        permission_codes=frozenset({"customer:update"}),
+    )
     customer = await create_customer(
         session,
         CustomerCreate(name="转移客户"),
@@ -273,6 +277,27 @@ async def test_delete_writes_audit_row(
     assert row.resource_id == customer.id
 
 
+async def test_restore_writes_audit_row(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    customer = await create_customer(
+        session,
+        CustomerCreate(name="恢复客户"),
+        context=context,
+    )
+    await delete_customer(session, customer.id, context=context)
+
+    await restore_customer(session, customer.id, context=context)
+
+    row = await latest_row(audit_session_factory, "customer:restore")
+    assert row.result is AuditResult.SUCCESS
+    assert row.resource_type == "customer"
+    assert row.resource_id == customer.id
+
+
 async def test_create_writes_audit_row(
     session: AsyncSession,
     audit_session_factory: async_sessionmaker[AsyncSession],
@@ -298,7 +323,10 @@ async def test_failed_operation_records_no_success_row(
 ) -> None:
     caller = await make_user(session)
     disabled = await make_user(session, status=UserStatus.DISABLED)
-    context = make_context(caller)
+    context = make_context(
+        caller,
+        permission_codes=frozenset({"customer:update"}),
+    )
     customer = await create_customer(
         session,
         CustomerCreate(name="失败转移客户"),

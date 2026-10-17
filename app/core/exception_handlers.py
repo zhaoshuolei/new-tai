@@ -107,15 +107,22 @@ def _error_reason(error: BusinessError) -> str:
         return str(error.code)
 
 
-def _path_resource_id(request: Request) -> int | None:
+def _path_resource_id(
+    request: Request,
+    resource_id_param: str | None = None,
+) -> int | None:
     path_params = request.path_params
-    candidate: object | None = None
-    for name, value in path_params.items():
-        if name == "resource_id" or name.endswith("_id"):
-            candidate = value
-            break
-    if candidate is None and len(path_params) == 1:
-        candidate = next(iter(path_params.values()))
+    candidate: object | None
+    if resource_id_param is not None:
+        candidate = path_params.get(resource_id_param)
+    else:
+        candidate = None
+        for name, value in path_params.items():
+            if name == "resource_id" or name.endswith("_id"):
+                candidate = value
+                break
+        if candidate is None and len(path_params) == 1:
+            candidate = next(iter(path_params.values()))
     if candidate is None:
         return None
 
@@ -146,7 +153,7 @@ async def _record_dependency_denial(
     await record_audit_entry(
         action=meta.action,
         resource_type=meta.resource_type,
-        resource_id=_path_resource_id(request),
+        resource_id=_path_resource_id(request, meta.resource_id_param),
         result=AuditResult.DENIED,
         reason=_error_reason(exc),
         actor=actor,

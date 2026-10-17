@@ -28,6 +28,8 @@ from app.models.audit_log import AuditLog, AuditResult
 from app.models.role import DataScope
 from app.models.user import User
 from app.services import audit as audit_service
+from tests.contact_helpers import add_contact, add_function
+from tests.customer_helpers import make_customer_row, make_user
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -204,6 +206,69 @@ async def test_dependency_denial_recorded(
     assert rows[0].user_id is None
     assert rows[0].actor_username is None
     assert rows[0].actor_nickname is None
+
+
+async def test_nested_contact_denial_audits_contact_id(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = await make_user(session)
+    customer = await make_customer_row(session, owner=user)
+    function = await add_function(session, name="商务", customer_id=None)
+    contact = await add_contact(session, customer, function)
+    app = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    context = context_with_permissions()
+
+    async with make_client(app, context=context) as client:
+        response = await client.patch(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}",
+            json={"position": "采购"},
+        )
+
+    assert response.status_code == 403
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.DENIED
+    assert rows[0].action == "contact:update"
+    assert rows[0].resource_type == "customer_contact"
+    assert rows[0].resource_id == contact.id
+    assert rows[0].resource_id != customer.id
+
+
+async def test_nested_function_denial_audits_function_id(
+    session: AsyncSession,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = await make_user(session)
+    customer = await make_customer_row(session, owner=user)
+    function = await add_function(session, name="渠道", customer_id=customer.id)
+    app = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    context = context_with_permissions()
+
+    async with make_client(app, context=context) as client:
+        response = await client.patch(
+            f"/api/v1/customers/{customer.id}/contact-functions/{function.id}",
+            json={"name": "合作伙伴"},
+        )
+
+    assert response.status_code == 403
+    rows = await audit_rows(audit_session_factory)
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.DENIED
+    assert rows[0].action == "contact_function:update"
+    assert rows[0].resource_type == "contact_function"
+    assert rows[0].resource_id == function.id
+    assert rows[0].resource_id != customer.id
 
 
 async def test_authenticated_dependency_denial_records_actor(

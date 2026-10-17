@@ -1,6 +1,7 @@
 """幂等的初始化数据脚本。"""
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import insert, select
@@ -10,17 +11,22 @@ from app.core.config import settings
 from app.core.password_policy import validate_password_policy
 from app.core.security import hash_password
 from app.db.session import session_factory
+from app.models.contact import ContactFunction, ContactStatus
 from app.models.department import Department, DepartmentStatus
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
 from app.models.user import User, UserStatus
 from app.schemas.menu import MenuCreate
 from app.services.auth import normalize_username
+from app.services.contact import serialize_contact_function_name_change
+
+logger = logging.getLogger(__name__)
 
 _PENDING_ASSIGNMENT_DEPARTMENT_NAME = "待分配"
 _SUPER_ADMIN_ROLE_CODE = "super_admin"
 _DEFAULT_ROLE_CODE = "default"
 _PROFILE_MENU_NAME = "个人资料"
+_SHARED_CONTACT_FUNCTION_NAMES = ("商务", "运营", "研发", "产品")
 
 
 @dataclass(frozen=True)
@@ -496,6 +502,41 @@ async def _get_or_create_superadmin(
     return user
 
 
+async def _ensure_shared_contact_functions(session: AsyncSession) -> None:
+    async with serialize_contact_function_name_change(session):
+        for name in _SHARED_CONTACT_FUNCTION_NAMES:
+            active = list(
+                (
+                    await session.scalars(
+                        select(ContactFunction).where(
+                            ContactFunction.name == name,
+                            ContactFunction.status == ContactStatus.ACTIVE,
+                        )
+                    )
+                ).all()
+            )
+            if any(function.customer_id is None for function in active):
+                continue
+            if active:
+                logger.warning(
+                    "Skipping shared contact function seed %r: "
+                    "an active custom function exists for customer_id=%s",
+                    name,
+                    active[0].customer_id,
+                )
+                continue
+
+            session.add(
+                ContactFunction(
+                    name=name,
+                    customer_id=None,
+                    scope_key=0,
+                    status=ContactStatus.ACTIVE,
+                )
+            )
+            await session.flush()
+
+
 async def init_data(
     session: AsyncSession,
     *,
@@ -541,6 +582,7 @@ async def init_data(
         pending_department=pending_department,
         super_admin_role=super_admin_role,
     )
+    await _ensure_shared_contact_functions(session)
     await session.commit()
 
 

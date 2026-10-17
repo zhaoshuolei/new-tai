@@ -213,7 +213,8 @@ PROTECTED_ROUTES = [
     ("get", "/api/v1/customers/1", {}),
     ("patch", "/api/v1/customers/1", {"json": {"remark": "x"}}),
     ("delete", "/api/v1/customers/1", {}),
-    ("patch", "/api/v1/customers/1/owner", {"json": {"owner_user_id": 1}}),
+    ("get", "/api/v1/customers/recycle-bin", {}),
+    ("post", "/api/v1/customers/1/restore", {}),
     ("get", "/api/v1/integrations/tianyancha", {}),
     (
         "put",
