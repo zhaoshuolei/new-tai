@@ -19,15 +19,14 @@ from app.clients.feishu import FeishuClient
 from app.core.audit_meta import get_audit_route_meta
 from app.core.auth_context import AuthContext
 from app.core.config import settings
-from app.core.crypto import encrypt_secret
 from app.core.deps import get_current_context
 from app.core.errors import ErrorCode
 from app.db.session import get_session
 from app.main import create_app
 from app.models.audit_log import AuditLog
 from app.models.integration_config import IntegrationConfig
-from app.schemas.integration import FeishuConfigPayload
 from app.services import audit as audit_service
+from tests.feishu_helpers import add_feishu_config
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -326,26 +325,3 @@ async def test_test_probe_is_not_audited(
             )
         )
     assert list(rows.all()) == []
-
-
-async def add_feishu_config(
-    session: AsyncSession,
-    *,
-    app_id: str = "cli-test",
-    app_secret: str = "secret-value",
-    redirect_uri: str = "https://admin.example.com/auth/feishu/callback",
-) -> IntegrationConfig:
-    payload = FeishuConfigPayload(
-        version=1,
-        app_id=app_id,
-        app_secret=app_secret,
-        redirect_uri=redirect_uri,
-    )
-    row = IntegrationConfig(
-        provider="feishu",
-        secret_ciphertext=encrypt_secret(payload.model_dump_json()),
-        updated_by=7,
-    )
-    session.add(row)
-    await session.flush()
-    return row

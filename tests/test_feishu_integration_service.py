@@ -32,6 +32,7 @@ from app.services.feishu_integration import (
 from app.services.feishu_integration import (
     test_feishu_connection as probe_feishu_connection,
 )
+from tests.feishu_helpers import add_feishu_config
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -633,26 +634,3 @@ async def test_test_connection_rejects_unconfigured_and_damaged_sources(
     with pytest.raises(BusinessError) as damaged:
         await probe_feishu_connection(session)
     assert damaged.value.code == ErrorCode.FEISHU_CONFIG_UNREADABLE
-
-
-async def add_feishu_config(
-    session: AsyncSession,
-    *,
-    app_id: str = "cli-test",
-    app_secret: str = "secret-value",
-    redirect_uri: str = "https://admin.example.com/auth/feishu/callback",
-) -> IntegrationConfig:
-    payload = FeishuConfigPayload(
-        version=1,
-        app_id=app_id,
-        app_secret=app_secret,
-        redirect_uri=redirect_uri,
-    )
-    row = IntegrationConfig(
-        provider="feishu",
-        secret_ciphertext=encrypt_secret(payload.model_dump_json()),
-        updated_by=7,
-    )
-    session.add(row)
-    await session.flush()
-    return row
