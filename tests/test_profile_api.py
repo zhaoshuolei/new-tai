@@ -9,9 +9,11 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from asyncmy.errors import IntegrityError as AsyncMyIntegrityError
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -27,7 +29,9 @@ from app.models.audit_log import AuditLog, AuditResult
 from app.models.department import Department, DepartmentStatus
 from app.models.user import User, UserStatus
 from app.models.user_profile import UserProfile
+from app.repositories import user_profile as user_profile_repository
 from app.services import audit as audit_service
+from app.services import user_profile as user_profile_service
 
 TEST_DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -419,6 +423,39 @@ async def test_patch_replaces_json_lists_and_persists_empty_list(
     assert profile.personal_links == expected_links
 
 
+async def test_patch_explicit_null_lists_persist_as_empty_lists(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+    profile = UserProfile(
+        user_id=user.id,
+        expertise_tags=["old-tag"],
+        personal_links=[
+            {"label": "Old", "url": "https://old.example/profile"},
+        ],
+    )
+    session.add(profile)
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.patch(
+            "/api/v1/me/profile",
+            json={"expertise_tags": None, "personal_links": None},
+        )
+        read_response = await client.get("/api/v1/me/profile")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["expertise_tags"] == []
+    assert response.json()["data"]["personal_links"] == []
+    assert read_response.status_code == 200, read_response.text
+    assert read_response.json()["data"]["expertise_tags"] == []
+    assert read_response.json()["data"]["personal_links"] == []
+
+    await session.refresh(profile)
+    assert profile.expertise_tags == []
+    assert profile.personal_links == []
+
+
 async def test_first_patch_creates_missing_profile_row(
     session: AsyncSession,
 ) -> None:
@@ -575,10 +612,110 @@ async def test_concurrent_first_patch_creates_exactly_one_profile_row(
             )
         assert len(profiles) == 1
         assert profiles[0].bio == "concurrent first write"
-        assert all(
-            row.action == "user_profile:update"
-            for row in await _audit_rows(audit_session_factory)
-        )
+        audit_rows = await _audit_rows(audit_session_factory)
+        assert len(audit_rows) == 2
+        assert [row.resource_id for row in audit_rows] == [user_id, user_id]
+        assert all(row.action == "user_profile:update" for row in audit_rows)
+    finally:
+        if user_id is not None:
+            async with factory() as cleanup_session:
+                await cleanup_session.execute(
+                    delete(UserProfile).where(UserProfile.user_id == user_id)
+                )
+                await cleanup_session.execute(delete(User).where(User.id == user_id))
+                await cleanup_session.commit()
+        await engine.dispose()
+
+
+async def test_first_patch_recovers_from_injected_duplicate_key_race(
+    audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    winner_created = False
+    insert_attempts = 0
+    recovery_lock_calls = 0
+    duplicate_error = IntegrityError(
+        "INSERT INTO user_profile (user_id) VALUES (%s)",
+        {},
+        AsyncMyIntegrityError(
+            1062,
+            "Duplicate entry '1' for key 'user_profile.user_id'",
+        ),
+    )
+    assert user_profile_service._is_duplicate_profile(duplicate_error)
+    original_lock_by_user_id = user_profile_repository.lock_by_user_id
+
+    async def duplicate_add(
+        _session: AsyncSession,
+        candidate: UserProfile,
+    ) -> UserProfile:
+        nonlocal insert_attempts, winner_created
+        insert_attempts += 1
+        async with factory() as winner_session:
+            winner_session.add(
+                UserProfile(
+                    user_id=candidate.user_id,
+                    bio="out-of-band race winner",
+                )
+            )
+            await winner_session.commit()
+        winner_created = True
+        raise duplicate_error
+
+    async def tracking_lock_by_user_id(
+        lock_session: AsyncSession,
+        lock_user_id: int,
+    ) -> UserProfile | None:
+        nonlocal recovery_lock_calls
+        recovery_lock_calls += 1
+        return await original_lock_by_user_id(lock_session, lock_user_id)
+
+    monkeypatch.setattr(user_profile_repository, "add", duplicate_add)
+    monkeypatch.setattr(
+        user_profile_repository,
+        "lock_by_user_id",
+        tracking_lock_by_user_id,
+    )
+
+    try:
+        async with factory() as setup_session:
+            user = await _make_user(setup_session)
+            await setup_session.commit()
+            user_id = user.id
+
+        async with factory() as request_session:
+            async with api_client(
+                request_session,
+                _context(user_id),
+            ) as client:
+                response = await client.patch(
+                    "/api/v1/me/profile",
+                    json={"bio": "recovered update"},
+                )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["bio"] == "recovered update"
+        assert insert_attempts == 1
+        assert winner_created is True
+        assert recovery_lock_calls == 1
+
+        async with factory() as verification_session:
+            profiles = list(
+                (
+                    await verification_session.scalars(
+                        select(UserProfile).where(UserProfile.user_id == user_id)
+                    )
+                ).all()
+            )
+        assert len(profiles) == 1
+        assert profiles[0].bio == "recovered update"
+
+        audit_rows = await _audit_rows(audit_session_factory)
+        assert len(audit_rows) == 1
+        assert audit_rows[0].resource_id == user_id
     finally:
         if user_id is not None:
             async with factory() as cleanup_session:

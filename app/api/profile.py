@@ -40,6 +40,8 @@ async def update_my_profile(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
+    # Keep this guard ahead of the audited service. @audited records every
+    # return, including an early one, so an empty PATCH would create a success row.
     if not payload.model_dump(exclude_unset=True):
         profile = await user_profile_service.get_my_profile(
             session,
