@@ -82,6 +82,7 @@ def test_update_normalizes_allowed_redirect_uri(
         "http://admin.example.com/callback",
         "/relative",
         "https://example.com/a#fragment",
+        "https://example.com/callback#",
         "https://" + "a" * 2040,
     ],
 )
@@ -180,7 +181,51 @@ async def test_resolve_falls_back_to_environment(
     assert config.source is FeishuConfigSource.ENVIRONMENT
     assert config.app_id == "cli-env"
     assert config.app_secret == "env-secret"
+    assert config.redirect_uri == ""
     assert config.updated_at is None
+
+
+async def test_resolve_accepts_valid_https_environment_redirect_uri(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(
+        settings,
+        "feishu_redirect_uri",
+        "  https://admin.example.com/auth/feishu/callback  ",
+    )
+
+    config = await resolve_feishu_config(session)
+
+    assert config.source is FeishuConfigSource.ENVIRONMENT
+    assert config.redirect_uri == "https://admin.example.com/auth/feishu/callback"
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://admin.example.com/callback",
+        "/relative",
+        "https://example.com/callback#",
+    ],
+)
+async def test_resolve_rejects_invalid_environment_redirect_uri(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    redirect_uri: str,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", redirect_uri)
+
+    with pytest.raises(BusinessError) as error:
+        await resolve_feishu_config(session)
+
+    assert error.value.code == ErrorCode.INVALID_PARAMETER
+    assert error.value.http_status == 422
+    assert redirect_uri not in error.value.message
 
 
 async def test_resolve_returns_none_source_when_environment_is_incomplete(

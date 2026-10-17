@@ -14,6 +14,7 @@ from app.schemas.integration import (
     FeishuConfigPayload,
     FeishuConfigSource,
     FeishuIntegrationStatus,
+    validate_redirect_uri,
 )
 
 _PROVIDER = "feishu"
@@ -71,11 +72,20 @@ async def resolve_feishu_config(session: AsyncSession) -> EffectiveFeishuConfig:
             redirect_uri="",
         )
 
+    try:
+        redirect_uri = validate_redirect_uri(settings.feishu_redirect_uri)
+    except ValueError:
+        raise BusinessError(
+            ErrorCode.INVALID_PARAMETER,
+            "Feishu redirect URI is invalid",
+            http_status=422,
+        ) from None
+
     return EffectiveFeishuConfig(
         source=FeishuConfigSource.ENVIRONMENT,
         app_id=app_id,
         app_secret=app_secret,
-        redirect_uri=settings.feishu_redirect_uri.strip(),
+        redirect_uri=redirect_uri,
     )
 
 

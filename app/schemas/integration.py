@@ -34,15 +34,16 @@ def _normalize_app_secret(value: object, *, required: bool) -> object:
     return None
 
 
-def _normalize_redirect_uri(value: object) -> object:
+def validate_redirect_uri(value: str | None) -> str:
+    """校验并规范化飞书回调地址；空值表示未配置。"""
     if value is None:
         return ""
-    if not isinstance(value, str):
-        return value
 
     normalized = value.strip()
     if not normalized:
         return ""
+    if len(normalized) > 2048:
+        raise ValueError("redirect_uri is too long")
 
     try:
         parsed = urlsplit(normalized)
@@ -54,11 +55,17 @@ def _normalize_redirect_uri(value: object) -> object:
         parsed.scheme != "https"
         or hostname is None
         or len(hostname) > 253
-        or parsed.fragment
+        or "#" in normalized
         or any(character.isspace() for character in normalized)
     ):
         raise ValueError("redirect_uri must be an HTTPS URL without a fragment")
     return normalized
+
+
+def _normalize_redirect_uri(value: object) -> object:
+    if value is None or isinstance(value, str):
+        return validate_redirect_uri(value)
+    return value
 
 
 def _serialize_utc(value: datetime | None) -> str | None:
@@ -141,4 +148,5 @@ __all__: tuple[str, ...] = (
     "FeishuConfigSource",
     "FeishuIntegrationStatus",
     "FeishuIntegrationUpdate",
+    "validate_redirect_uri",
 )
