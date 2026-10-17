@@ -11,7 +11,12 @@ from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
 from app.models.role import DataScope, Role, RoleStatus
 from app.repositories import role as role_repository
-from app.schemas.role import RoleCreate, RoleDataScopeUpdate, RoleUpdate
+from app.schemas.role import (
+    RoleAssignmentsRead,
+    RoleCreate,
+    RoleDataScopeUpdate,
+    RoleUpdate,
+)
 from app.services import authorization as authorization_service
 from app.services import menu as menu_service
 from app.services.audit import audited
@@ -236,6 +241,28 @@ async def delete_role(
         await session.commit()
 
 
+async def get_role_assignments(
+    session: AsyncSession,
+    role_id: int,
+) -> RoleAssignmentsRead:
+    role = await get_role(session, role_id)
+    menu_ids: list[int] = []
+    if not (role.code == "super_admin" and role.is_system):
+        menu_ids = await role_repository.list_assigned_menu_ids(session, role.id)
+
+    department_ids: list[int] = []
+    if role.data_scope == DataScope.CUSTOM:
+        department_ids = await role_repository.list_assigned_department_ids(
+            session,
+            role.id,
+        )
+
+    return RoleAssignmentsRead(
+        menu_ids=menu_ids,
+        department_ids=department_ids,
+    )
+
+
 @audited(action="role:assign", resource_type="role", resource_id_param="role_id")
 async def assign_role_menus(
     session: AsyncSession,
@@ -354,6 +381,7 @@ __all__: tuple[str, ...] = (
     "create_role",
     "delete_role",
     "get_role",
+    "get_role_assignments",
     "list_role_permission_codes",
     "list_roles",
     "set_role_data_scope",

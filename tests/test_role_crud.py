@@ -16,6 +16,7 @@ from app.core.errors import BusinessError, ErrorCode
 from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
+from app.models.audit_log import AuditResult
 from app.models.department import Department, DepartmentStatus
 from app.models.menu import MenuStatus, MenuType
 from app.models.role import (
@@ -28,12 +29,14 @@ from app.models.role_department import RoleDepartment
 from app.repositories import role as role_repository
 from app.schemas.menu import MenuCreate, MenuUpdate
 from app.schemas.role import RoleCreate, RoleDataScopeUpdate, RoleUpdate
+from app.services import audit as audit_service
 from app.services.menu import create_menu, update_menu
 from app.services.role import (
     assign_role_menus,
     create_role,
     delete_role,
     get_role,
+    get_role_assignments,
     list_role_permission_codes,
     list_roles,
     set_role_data_scope,
@@ -682,6 +685,127 @@ async def test_non_custom_scope_clears_custom_departments(
         )
     )
     assert result.all() == []
+
+
+async def test_role_assignments_read_is_not_audited(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def record_audit_entry(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(audit_service, "record_audit_entry", record_audit_entry)
+    role = await create_role(
+        session,
+        RoleCreate(code="audit-reader", name="审计回显"),
+    )
+    calls.clear()
+
+    await get_role_assignments(session, role.id)
+    assert calls == []
+
+    await assign_role_menus(session, role.id, [])
+    assert len(calls) == 1
+    assert calls[0]["action"] == "role:assign"
+    assert calls[0]["result"] is AuditResult.SUCCESS
+
+
+async def test_role_assignments_api_reads_saved_assignments_and_missing_role(
+    session: AsyncSession,
+) -> None:
+    application = create_app()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    async def override_context() -> AuthContext:
+        return ROLE_PERMISSION_CONTEXT
+
+    application.dependency_overrides[get_session] = override_session
+    application.dependency_overrides[get_current_context] = override_context
+
+    role = await create_role(
+        session,
+        RoleCreate(code="assignment-reader", name="授权回显"),
+    )
+    first_menu = await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="用户查看",
+            permission_code="user:read",
+        ),
+    )
+    second_menu = await create_menu(
+        session,
+        MenuCreate(
+            type=MenuType.MENU,
+            name="用户更新",
+            permission_code="user:update",
+        ),
+    )
+    await assign_role_menus(
+        session,
+        role.id,
+        [second_menu.id, first_menu.id],
+    )
+    department = Department(
+        parent_id=None,
+        name="研发部",
+        path="",
+        sort_order=0,
+        status=DepartmentStatus.ACTIVE,
+        is_system=False,
+    )
+    session.add(department)
+    await session.flush()
+    department.path = f"/{department.id}/"
+    await session.commit()
+    await set_role_data_scope(
+        session,
+        role.id,
+        RoleDataScopeUpdate(
+            data_scope=DataScope.CUSTOM,
+            data_scope_include_children=False,
+            department_ids=[department.id],
+        ),
+    )
+    super_admin = await add_role(
+        session,
+        code="super_admin",
+        data_scope=DataScope.ALL,
+        is_system=True,
+    )
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            assigned = await client.get(
+                f"/api/v1/roles/{role.id}/assignments",
+            )
+            super_admin_assigned = await client.get(
+                f"/api/v1/roles/{super_admin.id}/assignments",
+            )
+            missing = await client.get("/api/v1/roles/999999/assignments")
+    finally:
+        application.dependency_overrides.clear()
+
+    assert assigned.status_code == 200
+    assert assigned.json()["data"] == {
+        "menu_ids": sorted([first_menu.id, second_menu.id]),
+        "department_ids": [department.id],
+    }
+    assert super_admin_assigned.status_code == 200
+    assert super_admin_assigned.json()["data"] == {
+        "menu_ids": [],
+        "department_ids": [],
+    }
+    assert missing.status_code == 404
+    assert missing.json()["code"] == ErrorCode.ROLE_NOT_FOUND
 
 
 async def test_role_api_crud_and_assignments(
