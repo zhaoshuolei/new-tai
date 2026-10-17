@@ -15,6 +15,7 @@ from app.models.contact import ContactFunction, ContactStatus
 from app.models.department import Department, DepartmentStatus
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
+from app.models.system_setting import SystemSetting
 from app.models.user import User, UserStatus
 from app.schemas.menu import MenuCreate
 from app.services.auth import normalize_username
@@ -309,6 +310,24 @@ _MENU_SEEDS = (
         sort_order=10,
     ),
     _MenuSeed(
+        key="system-setting",
+        parent_key="system",
+        menu_type=MenuType.MENU,
+        name="系统设置",
+        path="/system/settings",
+        permission_code="system_setting:read",
+        sort_order=100,
+    ),
+    _MenuSeed(
+        key="system-setting-update",
+        parent_key="system-setting",
+        menu_type=MenuType.BUTTON,
+        name="保存系统设置",
+        path=None,
+        permission_code="system_setting:update",
+        sort_order=10,
+    ),
+    _MenuSeed(
         key="customer",
         parent_key=None,
         menu_type=MenuType.DIR,
@@ -520,6 +539,30 @@ async def _get_or_create_superadmin(
     return user
 
 
+async def _get_or_create_global_setting(session: AsyncSession) -> SystemSetting:
+    setting = await session.scalar(
+        select(SystemSetting).where(SystemSetting.setting_key == "global")
+    )
+    if setting is not None:
+        return setting
+
+    setting = SystemSetting(
+        setting_key="global",
+        name=settings.app_name,
+        short_name=None,
+        site_url=None,
+        logo_url=None,
+        favicon_url=None,
+        description=None,
+        copyright=None,
+        icp_number=None,
+        updated_by=None,
+    )
+    session.add(setting)
+    await session.flush()
+    return setting
+
+
 async def _ensure_shared_contact_functions(session: AsyncSession) -> None:
     async with serialize_contact_function_name_change(session):
         for name in _SHARED_CONTACT_FUNCTION_NAMES:
@@ -600,6 +643,7 @@ async def init_data(
         pending_department=pending_department,
         super_admin_role=super_admin_role,
     )
+    await _get_or_create_global_setting(session)
     await _ensure_shared_contact_functions(session)
     await session.commit()
 

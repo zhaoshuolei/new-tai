@@ -21,6 +21,7 @@ from app.models.role import (
 )
 from app.models.role_department import RoleDepartment
 from app.models.system_metric import SystemMetric
+from app.models.system_setting import SystemSetting
 from app.models.user import User, UserStatus
 
 __all__: tuple[str, ...] = (
@@ -49,6 +50,7 @@ __all__: tuple[str, ...] = (
     "RoleMenu",
     "RoleStatus",
     "SystemMetric",
+    "SystemSetting",
     "User",
     "UserStatus",
 )

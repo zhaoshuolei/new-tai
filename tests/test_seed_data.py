@@ -7,10 +7,12 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from app.core.config import settings
 from app.core.security import verify_password
 from app.models.department import Department, DepartmentStatus
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
+from app.models.system_setting import SystemSetting
 from app.models.user import User, UserStatus
 from app.services import auth as auth_service
 from app.services.menu import _is_valid_parent_type
@@ -53,6 +55,8 @@ EXPECTED_PERMISSION_CODES = {
     "integration:update",
     "integration_feishu:read",
     "integration_feishu:update",
+    "system_setting:read",
+    "system_setting:update",
 }
 
 
@@ -270,6 +274,70 @@ async def test_integration_update_button_is_under_integration_menu(
     assert update_button.parent_id == integration_menu.id
 
 
+async def test_system_setting_menu_and_button_are_seeded(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    system_root = await session.scalar(
+        select(Menu).where(
+            Menu.type == MenuType.DIR,
+            Menu.name == "系统管理",
+            Menu.parent_id.is_(None),
+        )
+    )
+    read_menu = await session.scalar(
+        select(Menu).where(Menu.permission_code == "system_setting:read")
+    )
+    update_button = await session.scalar(
+        select(Menu).where(Menu.permission_code == "system_setting:update")
+    )
+
+    assert system_root is not None
+    assert read_menu is not None
+    assert read_menu.name == "系统设置"
+    assert read_menu.path == "/system/settings"
+    assert read_menu.type == MenuType.MENU
+    assert read_menu.parent_id == system_root.id
+    assert read_menu.sort_order == 100
+    assert update_button is not None
+    assert update_button.name == "保存系统设置"
+    assert update_button.type == MenuType.BUTTON
+    assert update_button.parent_id == read_menu.id
+
+
+async def test_init_creates_one_global_system_setting_from_app_name(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "app_name", "Configured Tianxi")
+
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    setting = await session.scalar(
+        select(SystemSetting).where(SystemSetting.setting_key == "global")
+    )
+
+    assert setting is not None
+    assert setting.name == "Configured Tianxi"
+    assert setting.short_name is None
+    assert setting.site_url is None
+    assert setting.logo_url is None
+    assert setting.favicon_url is None
+    assert setting.description is None
+    assert setting.copyright is None
+    assert setting.icp_number is None
+    assert setting.updated_by is None
+
+
 async def test_feishu_integration_menu_and_button_are_seeded(
     session: AsyncSession,
 ) -> None:
@@ -311,9 +379,7 @@ async def test_customer_buttons_are_under_customer_list(
     assert customer_list.type == MenuType.MENU
 
     for code in ("customer:create", "customer:update", "customer:delete"):
-        button = await session.scalar(
-            select(Menu).where(Menu.permission_code == code)
-        )
+        button = await session.scalar(select(Menu).where(Menu.permission_code == code))
         assert button is not None
         assert button.type == MenuType.BUTTON
         assert button.parent_id == customer_list.id
@@ -351,6 +417,8 @@ async def test_default_role_has_no_customer_permissions(
             "integration:update",
             "integration_feishu:read",
             "integration_feishu:update",
+            "system_setting:read",
+            "system_setting:update",
         }
     )
 
@@ -390,9 +458,13 @@ async def test_init_is_idempotent_when_run_twice(
     )
     super_admin = await session.scalar(select(Role).where(Role.code == "super_admin"))
     user = await session.scalar(select(User).where(User.username == "superadmin"))
+    setting = await session.scalar(
+        select(SystemSetting).where(SystemSetting.setting_key == "global")
+    )
     assert department is not None
     assert super_admin is not None
     assert user is not None
+    assert setting is not None
 
     await init_data(
         session,
@@ -402,9 +474,10 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 35
+    assert await _count(session, Menu) == 37
     assert await _count(session, User) == 1
     assert await _count(session, RoleMenu) == 1
+    assert await _count(session, SystemSetting) == 1
     assert (
         await session.scalar(select(Department.id).where(Department.name == "待分配"))
         == department.id
@@ -417,6 +490,21 @@ async def test_init_is_idempotent_when_run_twice(
         await session.scalar(select(User.id).where(User.username == "superadmin"))
         == user.id
     )
+    assert (
+        await session.scalar(
+            select(SystemSetting.id).where(SystemSetting.setting_key == "global")
+        )
+        == setting.id
+    )
+    for permission_code in ("system_setting:read", "system_setting:update"):
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Menu)
+                .where(Menu.permission_code == permission_code)
+            )
+            == 1
+        )
 
 
 async def test_init_requires_superadmin_password_from_env(

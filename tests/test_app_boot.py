@@ -58,7 +58,17 @@ async def test_app_boots_and_serves_openapi() -> None:
 def test_openapi_declares_business_domain_tags() -> None:
     tag_names = {tag["name"] for tag in app.openapi()["tags"]}
 
-    assert tag_names == {"认证", "用户", "角色", "菜单", "部门", "客户", "集成", "健康"}
+    assert tag_names == {
+        "认证",
+        "用户",
+        "角色",
+        "菜单",
+        "部门",
+        "客户",
+        "集成",
+        "系统设置",
+        "健康",
+    }
 
 
 @pytest.mark.asyncio
