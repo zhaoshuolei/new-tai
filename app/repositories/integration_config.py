@@ -1,6 +1,7 @@
 """第三方集成配置数据访问。"""
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.integration_config import IntegrationConfig
@@ -23,8 +24,19 @@ async def upsert(
     # 仅 flush 不 commit，事务边界由服务层控制。
     config = await get_by_provider(session, provider)
     if config is None:
-        config = IntegrationConfig(provider=provider)
-        session.add(config)
+        # 并发下两个 PUT 可能都查不到行；把插入放进 SAVEPOINT，唯一键冲突时
+        # 回退为更新已存在的那一行，避免裸 IntegrityError 冒泡成 500。
+        try:
+            async with session.begin_nested():
+                config = IntegrationConfig(provider=provider)
+                config.secret_ciphertext = ciphertext
+                config.updated_by = updated_by
+                session.add(config)
+                await session.flush()
+        except IntegrityError:
+            config = await get_by_provider(session, provider)
+            if config is None:
+                raise
     config.secret_ciphertext = ciphertext
     config.updated_by = updated_by
     await session.flush()

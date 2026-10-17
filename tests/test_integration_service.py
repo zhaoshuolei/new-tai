@@ -11,12 +11,15 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.clients.tianyancha import TianyanchaClient
 from app.core.auth_context import AuthContext
-from app.core.crypto import decrypt_secret
+from app.core.crypto import decrypt_secret, encrypt_secret
 from app.core.errors import BusinessError, ErrorCode
+from app.models.integration_config import IntegrationConfig
+from app.repositories import integration_config as integration_config_repository
 from app.repositories.integration_config import get_by_provider
 from app.services.integration import (
     get_tianyancha_client,
@@ -125,7 +128,6 @@ async def test_client_logs_decrypt_failure_without_ciphertext(
 ) -> None:
     foreign_key = Fernet.generate_key()
     ciphertext = Fernet(foreign_key).encrypt(b"unreadable-value").decode("utf-8")
-    from app.models.integration_config import IntegrationConfig
 
     session.add(
         IntegrationConfig(
@@ -176,3 +178,49 @@ async def test_connection_propagates_failure(
     with pytest.raises(BusinessError) as exc_info:
         await probe_connection(session, context=context)
     assert exc_info.value.code == ErrorCode.TIANYANCHA_AUTH_FAILED
+
+
+async def test_save_token_recovers_from_concurrent_insert(
+    session: AsyncSession,
+    context: AuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 预置一行，模拟另一个并发 PUT 已经插入，而本次请求的预查看不到它。
+    existing = IntegrationConfig(
+        provider="tianyancha",
+        secret_ciphertext=encrypt_secret("stale-value"),
+        updated_by=1,
+    )
+    session.add(existing)
+    await session.flush()
+
+    real_get = integration_config_repository.get_by_provider
+    calls = {"count": 0}
+
+    async def first_lookup_returns_none(
+        target: AsyncSession, provider: str
+    ) -> IntegrationConfig | None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return None
+        return await real_get(target, provider)
+
+    monkeypatch.setattr(
+        integration_config_repository,
+        "get_by_provider",
+        first_lookup_returns_none,
+    )
+
+    await save_tianyancha_token(session, "mcpk2_newest_value", context=context)
+
+    rows = (
+        await session.scalars(
+            select(IntegrationConfig).where(
+                IntegrationConfig.provider == "tianyancha"
+            )
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].id == existing.id
+    assert decrypt_secret(rows[0].secret_ciphertext) == "mcpk2_newest_value"
+    assert rows[0].updated_by == context.user_id
