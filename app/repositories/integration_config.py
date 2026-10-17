@@ -15,6 +15,23 @@ async def get_by_provider(
     return await session.scalar(statement)
 
 
+async def _get_by_provider_for_update(
+    session: AsyncSession,
+    provider: str,
+) -> IntegrationConfig | None:
+    """读取当前已提交的行。
+
+    MySQL 默认 REPEATABLE READ：预检查的普通 SELECT 会固定快照，并发提交的
+    行在回退查询里可能不可见；加锁读强制读取最新版本。
+    """
+    statement = (
+        select(IntegrationConfig)
+        .where(IntegrationConfig.provider == provider)
+        .with_for_update()
+    )
+    return await session.scalar(statement)
+
+
 async def upsert(
     session: AsyncSession,
     provider: str,
@@ -34,7 +51,7 @@ async def upsert(
                 session.add(config)
                 await session.flush()
         except IntegrityError:
-            config = await get_by_provider(session, provider)
+            config = await _get_by_provider_for_update(session, provider)
             if config is None:
                 raise
     config.secret_ciphertext = ciphertext

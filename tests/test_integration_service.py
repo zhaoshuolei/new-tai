@@ -194,21 +194,18 @@ async def test_save_token_recovers_from_concurrent_insert(
     session.add(existing)
     await session.flush()
 
-    real_get = integration_config_repository.get_by_provider
-    calls = {"count": 0}
+    lookups = {"count": 0}
 
-    async def first_lookup_returns_none(
-        target: AsyncSession, provider: str
+    async def lookup_sees_no_row(
+        _target: AsyncSession, _provider: str
     ) -> IntegrationConfig | None:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return None
-        return await real_get(target, provider)
+        lookups["count"] += 1
+        return None
 
     monkeypatch.setattr(
         integration_config_repository,
         "get_by_provider",
-        first_lookup_returns_none,
+        lookup_sees_no_row,
     )
 
     await save_tianyancha_token(session, "mcpk2_newest_value", context=context)
@@ -220,6 +217,7 @@ async def test_save_token_recovers_from_concurrent_insert(
             )
         )
     ).all()
+    assert lookups["count"] >= 1
     assert len(rows) == 1
     assert rows[0].id == existing.id
     assert decrypt_secret(rows[0].secret_ciphertext) == "mcpk2_newest_value"
