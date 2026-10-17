@@ -1300,7 +1300,7 @@ async def test_concurrent_create_and_function_delete_leave_no_dangling_reference
             await cleanup.execute(delete(User).where(User.id == user_id))
             await cleanup.commit()
         await engine.dispose()
-
+```
 
 - [ ] **Step 2: 运行确认通过**
 
