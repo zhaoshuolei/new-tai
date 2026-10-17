@@ -375,6 +375,49 @@ async def test_import_without_history_keeps_truncated_scope(
     assert customer.business_scope_truncated is True
 
 
+async def test_import_complete_scope_skips_history(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    fake_client.registration = replace(
+        fake_client.registration,
+        business_scope=FULL_SCOPE,
+    )
+
+    customer = await import_from_tianyancha(
+        session,
+        REQUESTED_CREDIT_CODE,
+        None,
+        context=context,
+    )
+
+    assert customer.business_scope == FULL_SCOPE
+    assert customer.business_scope_truncated is False
+    # 已完整的经营范围不再消耗一次历史查询额度。
+    assert fake_client.calls == ["registration"]
+
+
+async def test_import_truncated_scope_calls_history(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+
+    customer = await import_from_tianyancha(
+        session,
+        REQUESTED_CREDIT_CODE,
+        None,
+        context=context,
+    )
+
+    assert customer.business_scope == FULL_SCOPE
+    assert customer.business_scope_truncated is False
+    assert fake_client.calls == ["registration", "historical"]
+
+
 async def test_search_blank_keyword_is_rejected(
     session: AsyncSession,
     fake_client: FakeTianyanchaClient,

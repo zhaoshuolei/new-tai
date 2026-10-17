@@ -50,6 +50,14 @@ def test_none_displayed_returns_none_not_truncated() -> None:
     assert resolve_full_business_scope(None, []) == (None, False)
 
 
+def test_empty_displayed_is_incomplete() -> None:
+    assert resolve_full_business_scope("", []) == ("", True)
+
+
+def test_whitespace_displayed_is_incomplete() -> None:
+    assert resolve_full_business_scope("   ", []) == ("   ", True)
+
+
 def test_older_record_does_not_beat_newer_when_ordering_is_shuffled() -> None:
     displayed = "一般项目：A..."
     records = [

@@ -5,7 +5,7 @@
 包含完整文本，可据此还原。
 """
 
-_TRUNCATION_MARKERS = ("...", "…")
+TRUNCATION_MARKERS = ("...", "…")
 
 
 def resolve_full_business_scope(
@@ -19,6 +19,7 @@ def resolve_full_business_scope(
     规则（设计 6.4）：
 
     - ``displayed`` 为 ``None`` 时返回 ``(None, False)``。
+    - 空或纯空白文本视为不完整，返回 ``(displayed, True)``。
     - 不以截断标记结尾的文本视为已完整，直接返回且不查变更历史。
     - 去掉结尾标记得到前缀；前缀为空时保留原文本并标记截断。
     - 取「变更后原文」以前缀开头的记录中变更时间最新的一条，即按变更时间降序取第一条。
@@ -28,7 +29,10 @@ def resolve_full_business_scope(
         return None, False
 
     stripped = displayed.rstrip()
-    if not stripped.endswith(_TRUNCATION_MARKERS):
+    if not stripped:
+        # 空/纯空白文本视为不完整，交由调用方按截断处理。
+        return displayed, True
+    if not stripped.endswith(TRUNCATION_MARKERS):
         return displayed, False
 
     if stripped.endswith("..."):

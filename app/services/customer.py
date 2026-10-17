@@ -19,7 +19,10 @@ from app.repositories import customer as customer_repository
 from app.repositories.customer import get_by_credit_code
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services.audit import audited
-from app.services.customer_scope_text import resolve_full_business_scope
+from app.services.customer_scope_text import (
+    TRUNCATION_MARKERS,
+    resolve_full_business_scope,
+)
 from app.services.data_scope import (
     apply_customer_scope,
     apply_user_scope,
@@ -95,6 +98,20 @@ def _parse_established_date(value: str | None) -> date | None:
         return date.fromisoformat(value.strip())
     except ValueError:
         return None
+
+
+def _needs_history(displayed: str | None) -> bool:
+    """判断经营范围是否需要查询变更历史来还原完整文本。
+
+    仅当文本去空白后非空且以截断标记结尾时才需要，与
+    ``resolve_full_business_scope`` 的截断判定保持一致。
+    """
+    if displayed is None:
+        return False
+    stripped = displayed.strip()
+    if not stripped:
+        return False
+    return stripped.endswith(TRUNCATION_MARKERS)
 
 
 async def _visible_customer_ids(
@@ -259,8 +276,11 @@ async def import_from_tianyancha(
             http_status=502,
         )
 
-    historical_text = await client.fetch_historical_registration_text(code)
-    records = parse_change_scope_records(historical_text)
+    if _needs_history(registration.business_scope):
+        historical_text = await client.fetch_historical_registration_text(code)
+        records = parse_change_scope_records(historical_text)
+    else:
+        records = []
     business_scope, truncated = resolve_full_business_scope(
         registration.business_scope,
         records,
