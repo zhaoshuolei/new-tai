@@ -14,7 +14,11 @@ from app.core.response import (
     success,
 )
 from app.db.session import get_session
-from app.schemas.directory import DirectoryDepartmentRead, DirectoryEntryRead
+from app.schemas.directory import (
+    DirectoryDepartmentRead,
+    DirectoryEntryRead,
+    DirectoryProfileRead,
+)
 from app.services import directory as directory_service
 
 router = APIRouter(prefix="/directory", tags=["通讯录"])
@@ -54,7 +58,24 @@ async def list_directory_departments(
     return success(departments)
 
 
+@router.get(
+    "/{user_id}",
+    response_model=SuccessEnvelope[DirectoryProfileRead],
+)
+async def get_directory_profile(
+    user_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    _context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    profile = await directory_service.get_directory_profile(
+        session,
+        user_id=user_id,
+    )
+    return success(profile)
+
+
 __all__: tuple[str, ...] = (
+    "get_directory_profile",
     "list_directory",
     "list_directory_departments",
     "router",

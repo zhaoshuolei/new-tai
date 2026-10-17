@@ -2,11 +2,16 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import BusinessError, ErrorCode
 from app.core.response import Page
 from app.repositories import department as department_repository
 from app.repositories import user_profile as user_profile_repository
-from app.repositories.user_profile import DirectoryRow
-from app.schemas.directory import DirectoryDepartmentRead, DirectoryEntryRead
+from app.repositories.user_profile import DirectoryProfileRow, DirectoryRow
+from app.schemas.directory import (
+    DirectoryDepartmentRead,
+    DirectoryEntryRead,
+    DirectoryProfileRead,
+)
 
 
 def display_name(nickname: str | None, username: str | None, user_id: int) -> str:
@@ -41,6 +46,69 @@ def build_directory_entry(row: DirectoryRow) -> DirectoryEntryRead:
         signature=clip_scalar(row.signature, key="signature", hidden=hidden),
         department_name=row.department_name,
     )
+
+
+def build_directory_profile(row: DirectoryProfileRow) -> DirectoryProfileRead:
+    hidden = row.hidden_public_fields or []
+    return DirectoryProfileRead(
+        id=row.id,
+        display_name=display_name(row.nickname, row.username, row.id),
+        nickname=row.nickname,
+        department_name=row.department_name,
+        status=row.status,
+        avatar=clip_scalar(row.avatar, key="avatar", hidden=hidden),
+        signature=clip_scalar(row.signature, key="signature", hidden=hidden),
+        bio=clip_scalar(row.bio, key="bio", hidden=hidden),
+        work_phone=clip_scalar(
+            row.work_phone,
+            key="work_phone",
+            hidden=hidden,
+        ),
+        extension=clip_scalar(row.extension, key="extension", hidden=hidden),
+        work_email=clip_scalar(row.work_email, key="work_email", hidden=hidden),
+        office_location=clip_scalar(
+            row.office_location,
+            key="office_location",
+            hidden=hidden,
+        ),
+        seat=clip_scalar(row.seat, key="seat", hidden=hidden),
+        expertise_tags=(
+            clip_list(
+                row.expertise_tags,
+                key="expertise_tags",
+                hidden=hidden,
+            )
+            if row.expertise_tags is not None
+            else None
+        ),
+        personal_links=(
+            clip_list(
+                row.personal_links,
+                key="personal_links",
+                hidden=hidden,
+            )
+            if row.personal_links is not None
+            else None
+        ),
+    )
+
+
+async def get_directory_profile(
+    session: AsyncSession,
+    *,
+    user_id: int,
+) -> DirectoryProfileRead:
+    row = await user_profile_repository.get_directory_profile_row(
+        session,
+        user_id,
+    )
+    if row is None:
+        raise BusinessError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found",
+            http_status=404,
+        )
+    return build_directory_profile(row)
 
 
 async def list_directory(
@@ -87,9 +155,11 @@ async def list_directory_departments(
 
 __all__: tuple[str, ...] = (
     "build_directory_entry",
+    "build_directory_profile",
     "clip_list",
     "clip_scalar",
     "display_name",
+    "get_directory_profile",
     "list_directory",
     "list_directory_departments",
 )

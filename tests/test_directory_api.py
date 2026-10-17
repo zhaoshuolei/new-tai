@@ -119,6 +119,8 @@ async def _make_user(
     nickname: str | None,
     department_id: int | None = None,
     avatar: str | None = None,
+    status: UserStatus = UserStatus.ACTIVE,
+    deleted_at: datetime | None = None,
 ) -> User:
     user = User(
         feishu_open_id=f"ou_{uuid4().hex}",
@@ -126,12 +128,48 @@ async def _make_user(
         nickname=nickname,
         avatar=avatar,
         department_id=department_id,
-        status=UserStatus.ACTIVE,
+        status=status,
+        deleted_at=deleted_at,
         token_version=0,
     )
     session.add(user)
     await session.flush()
     return user
+
+
+async def _make_profile(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    signature: str | None = None,
+    bio: str | None = None,
+    work_phone: str | None = None,
+    extension: str | None = None,
+    work_email: str | None = None,
+    office_location: str | None = None,
+    seat: str | None = None,
+    expertise_tags: list[str] | None = None,
+    personal_links: list[dict[str, str]] | None = None,
+    hidden_public_fields: list[str] | None = None,
+) -> UserProfile:
+    profile = UserProfile(
+        user_id=user_id,
+        signature=signature,
+        bio=bio,
+        work_phone=work_phone,
+        extension=extension,
+        work_email=work_email,
+        office_location=office_location,
+        seat=seat,
+        expertise_tags=expertise_tags if expertise_tags is not None else [],
+        personal_links=personal_links if personal_links is not None else [],
+        hidden_public_fields=(
+            hidden_public_fields if hidden_public_fields is not None else []
+        ),
+    )
+    session.add(profile)
+    await session.flush()
+    return profile
 
 
 async def test_directory_list_requires_no_user_read_permission(
@@ -250,3 +288,184 @@ async def test_department_filter_options_exclude_system_disabled_and_deleted(
         key=lambda department: (department["sort_order"], department["id"]),
     )
     assert set(by_id[visible.id]) == {"id", "name", "parent_id", "sort_order"}
+
+
+async def test_directory_profile_returns_exact_business_card_key_set(
+    session: AsyncSession,
+) -> None:
+    department = await _make_department(session, name="名片部")
+    user = await _make_user(
+        session,
+        username=f"business-card-{uuid4().hex}",
+        nickname="Business Card",
+        department_id=department.id,
+        avatar="/media/avatars/business-card.png",
+    )
+    await _make_profile(
+        session,
+        user_id=user.id,
+        signature="Signature",
+        bio="Biography",
+        work_phone="+8613800138000",
+        extension="1001",
+        work_email="card@example.com",
+        office_location="Shanghai",
+        seat="A-12",
+        expertise_tags=["Python"],
+        personal_links=[
+            {"label": "Profile", "url": "https://example.com/profile"},
+        ],
+    )
+
+    async with api_client(session, _context(999_999_998)) as client:
+        response = await client.get(f"/api/v1/directory/{user.id}")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["code"] == 0
+    data = payload["data"]
+    business_card_keys = {
+        "avatar",
+        "signature",
+        "bio",
+        "work_phone",
+        "extension",
+        "work_email",
+        "office_location",
+        "seat",
+        "expertise_tags",
+        "personal_links",
+    }
+    assert set(data) == {
+        "id",
+        "display_name",
+        "nickname",
+        "department_name",
+        "status",
+    } | business_card_keys
+    assert {
+        "personal_phone",
+        "birthday",
+        "emergency_contact_name",
+        "emergency_contact_phone",
+    }.isdisjoint(data)
+    assert data["id"] == user.id
+    assert data["display_name"] == "Business Card"
+    assert data["nickname"] == "Business Card"
+    assert data["department_name"] == "名片部"
+    assert data["status"] == "active"
+    assert data["avatar"] == "/media/avatars/business-card.png"
+    assert data["signature"] == "Signature"
+    assert data["bio"] == "Biography"
+    assert data["work_phone"] == "+8613800138000"
+    assert data["extension"] == "1001"
+    assert data["work_email"] == "card@example.com"
+    assert data["office_location"] == "Shanghai"
+    assert data["seat"] == "A-12"
+    assert data["expertise_tags"] == ["Python"]
+    assert data["personal_links"] == [
+        {"label": "Profile", "url": "https://example.com/profile"},
+    ]
+
+
+async def test_directory_profile_hidden_and_unfilled_bio_are_indistinguishable(
+    session: AsyncSession,
+) -> None:
+    hidden = await _make_user(
+        session,
+        username=f"hidden-bio-{uuid4().hex}",
+        nickname="Hidden Bio",
+    )
+    unfilled = await _make_user(
+        session,
+        username=f"unfilled-bio-{uuid4().hex}",
+        nickname="Unfilled Bio",
+    )
+    await _make_profile(
+        session,
+        user_id=hidden.id,
+        bio="Do not expose",
+        seat="C-01",
+        expertise_tags=[],
+        personal_links=[],
+        hidden_public_fields=["bio"],
+    )
+    await _make_profile(
+        session,
+        user_id=unfilled.id,
+        expertise_tags=[],
+        personal_links=[],
+    )
+
+    async with api_client(session, _context(999_999_997)) as client:
+        hidden_response = await client.get(f"/api/v1/directory/{hidden.id}")
+        unfilled_response = await client.get(f"/api/v1/directory/{unfilled.id}")
+
+    assert hidden_response.status_code == 200, hidden_response.text
+    assert unfilled_response.status_code == 200, unfilled_response.text
+    hidden_data = hidden_response.json()["data"]
+    unfilled_data = unfilled_response.json()["data"]
+    assert "bio" in hidden_data
+    assert "bio" in unfilled_data
+    assert hidden_data["bio"] == unfilled_data["bio"] is None
+    assert hidden_data["seat"] == "C-01"
+    assert hidden_data["expertise_tags"] == []
+    assert hidden_data["personal_links"] == []
+
+
+async def test_directory_profile_self_view_uses_colleague_clipping(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(
+        session,
+        username=f"self-preview-{uuid4().hex}",
+        nickname="Self Preview",
+    )
+    await _make_profile(
+        session,
+        user_id=user.id,
+        bio="Hidden from own colleague preview",
+        seat="D-04",
+        hidden_public_fields=["bio"],
+    )
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.get(f"/api/v1/directory/{user.id}")
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["bio"] is None
+    assert data["seat"] == "D-04"
+
+
+async def test_directory_profile_disabled_and_deleted_users_return_404(
+    session: AsyncSession,
+) -> None:
+    disabled = await _make_user(
+        session,
+        username=f"disabled-profile-{uuid4().hex}",
+        nickname="Disabled Profile",
+        status=UserStatus.DISABLED,
+    )
+    deleted = await _make_user(
+        session,
+        username=f"deleted-profile-{uuid4().hex}",
+        nickname="Deleted Profile",
+        deleted_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+
+    async with api_client(session, _context(999_999_996)) as client:
+        for user_id in (disabled.id, deleted.id):
+            response = await client.get(f"/api/v1/directory/{user_id}")
+            assert response.status_code == 404, response.text
+            assert response.json()["code"] == 2000
+
+
+async def test_directory_profile_missing_user_returns_404(
+    session: AsyncSession,
+) -> None:
+    async with api_client(session, _context(999_999_995)) as client:
+        response = await client.get("/api/v1/directory/999999999")
+
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == 2000
