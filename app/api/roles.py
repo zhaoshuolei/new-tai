@@ -12,6 +12,7 @@ from app.core.permissions import require_permission
 from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.schemas.role import (
+    RoleAssignmentsRead,
     RoleCreate,
     RoleDataScopeUpdate,
     RoleMenuAssign,
@@ -48,6 +49,19 @@ async def create_role(
 ) -> dict[str, Any]:
     role = await role_service.create_role(session, payload, context=context)
     return success(RoleRead.model_validate(role), message="created")
+
+
+@router.get(
+    "/{role_id}/assignments",
+    response_model=SuccessEnvelope[RoleAssignmentsRead],
+    dependencies=[Depends(require_permission("role:read"))],
+)
+async def get_role_assignments(
+    role_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    assignments = await role_service.get_role_assignments(session, role_id)
+    return success(assignments)
 
 
 @router.get(
@@ -178,6 +192,7 @@ __all__: tuple[str, ...] = (
     "create_role",
     "delete_role",
     "get_role",
+    "get_role_assignments",
     "list_roles",
     "router",
     "set_role_data_scope",

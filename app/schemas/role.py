@@ -30,6 +30,11 @@ class RoleMenuAssign(BaseModel):
     menu_ids: list[int] = Field(default_factory=list)
 
 
+class RoleAssignmentsRead(BaseModel):
+    menu_ids: list[int]
+    department_ids: list[int]
+
+
 class RoleDataScopeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -52,6 +57,7 @@ class RoleRead(BaseModel):
 
 
 __all__: tuple[str, ...] = (
+    "RoleAssignmentsRead",
     "RoleCreate",
     "RoleDataScopeUpdate",
     "RoleMenuAssign",

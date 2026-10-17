@@ -55,6 +55,32 @@ async def list_menus_by_ids(
     return list(result.all())
 
 
+async def list_assigned_menu_ids(
+    session: AsyncSession,
+    role_id: int,
+) -> list[int]:
+    statement = (
+        select(RoleMenu.c.menu_id)
+        .where(RoleMenu.c.role_id == role_id)
+        .order_by(RoleMenu.c.menu_id)
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
+async def list_assigned_department_ids(
+    session: AsyncSession,
+    role_id: int,
+) -> list[int]:
+    statement = (
+        select(RoleDepartment.c.department_id)
+        .where(RoleDepartment.c.role_id == role_id)
+        .order_by(RoleDepartment.c.department_id)
+    )
+    result = await session.scalars(statement)
+    return list(result.all())
+
+
 async def list_assigned_permission_codes(
     session: AsyncSession,
     role_id: int,
@@ -122,6 +148,8 @@ __all__: tuple[str, ...] = (
     "get_by_id",
     "has_users",
     "list_all",
+    "list_assigned_department_ids",
+    "list_assigned_menu_ids",
     "list_assigned_permission_codes",
     "list_departments_by_ids",
     "list_menus_by_ids",
