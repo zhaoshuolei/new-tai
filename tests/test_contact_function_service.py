@@ -21,6 +21,7 @@ from app.models.contact import (
 from app.models.customer import Customer
 from app.models.user import User
 from app.services import audit as audit_service
+from app.services import contact as contact_service
 from app.services.contact import (
     create_custom_function,
     create_shared_function,
@@ -126,6 +127,46 @@ async def test_non_super_admin_cannot_list_shared_recycle_bin(session) -> None:
         )
 
     assert exc.value.http_status == 403
+
+
+async def test_deleted_shared_list_requires_super_admin(session) -> None:
+    user = await make_user(session)
+    context = make_context(user, permission_codes={"customer:delete"})
+
+    with pytest.raises(BusinessError) as exc:
+        await contact_service.list_deleted_shared_functions(
+            session,
+            context=context,
+        )
+
+    assert exc.value.http_status == 403
+
+
+async def test_deleted_shared_list_returns_only_deleted_in_name_id_order(
+    session,
+) -> None:
+    user = await make_user(session)
+    context = make_context(user, is_super_admin=True)
+    await add_function(session, name="活跃", customer_id=None)
+    deleted_z = await add_function(
+        session,
+        name="zeta",
+        customer_id=None,
+        status=ContactStatus.DELETED,
+    )
+    deleted_a = await add_function(
+        session,
+        name="alpha",
+        customer_id=None,
+        status=ContactStatus.DELETED,
+    )
+
+    rows = await contact_service.list_deleted_shared_functions(
+        session,
+        context=context,
+    )
+
+    assert [row.id for row in rows] == [deleted_a.id, deleted_z.id]
 
 
 async def test_shared_list_filters_deleted_unless_recycle_bin(session) -> None:

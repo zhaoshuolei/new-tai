@@ -421,6 +421,18 @@ async def list_shared_functions(
     return sorted([*active, *deleted], key=lambda row: (row.name, row.id))
 
 
+async def list_deleted_shared_functions(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+) -> list[ContactFunction]:
+    _require_super_admin(context)
+    return await contact_repository.list_shared_functions(
+        session,
+        status=ContactStatus.DELETED,
+    )
+
+
 @audited(
     action="contact_function:create",
     resource_type="contact_function",
@@ -894,6 +906,7 @@ __all__: tuple[str, ...] = (
     "list_customer_functions",
     "list_customer_recycle_functions",
     "list_deleted_contacts",
+    "list_deleted_shared_functions",
     "list_shared_functions",
     "restore_contact",
     "restore_custom_function",

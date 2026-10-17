@@ -102,10 +102,9 @@ async def list_deleted_shared_functions(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    functions = await contact_service.list_shared_functions(
+    functions = await contact_service.list_deleted_shared_functions(
         session,
         context=context,
-        include_deleted=True,
     )
     return success([_function_read(function, "SHARED") for function in functions])
 

@@ -7,6 +7,7 @@ import pytest_asyncio
 
 from app.core.audit_meta import get_audit_route_meta
 from app.models.contact import ContactStatus
+from app.schemas.contact import ContactFunctionCreate, ContactFunctionUpdate
 from app.services import audit as audit_service
 from tests.contact_helpers import add_contact, add_function
 from tests.customer_helpers import (  # noqa: F401
@@ -28,6 +29,33 @@ async def disable_audit_writes(
         return None
 
     monkeypatch.setattr(audit_service, "record_audit_entry", noop)
+
+
+@pytest.mark.parametrize("model", [ContactFunctionCreate, ContactFunctionUpdate])
+def test_function_name_schema_documents_length_without_runtime_constraints(
+    model: type[ContactFunctionCreate] | type[ContactFunctionUpdate],
+) -> None:
+    name_schema = model.model_json_schema()["properties"]["name"]
+
+    assert name_schema["minLength"] == 1
+    assert name_schema["maxLength"] == 64
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 65])
+async def test_shared_function_name_validation_surfaces_7003(
+    session,
+    name: str,
+) -> None:
+    user = await make_user(session)
+    ctx = make_context(user, is_super_admin=True)
+    async with api_client(session, ctx) as client:
+        response = await client.post(
+            "/api/v1/contact-functions",
+            json={"name": name},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == 7003
 
 
 async def test_shared_function_write_requires_super_admin(session) -> None:
@@ -223,8 +251,9 @@ async def test_function_recycle_bin_route_not_shadowed_by_id(session) -> None:
     assert response.status_code == 200
 
 
-async def test_super_admin_function_recycle_bin_works(session) -> None:
+async def test_super_admin_function_recycle_bin_returns_only_deleted(session) -> None:
     user = await make_user(session)
+    await add_function(session, name="商务", customer_id=None)
     deleted = await add_function(
         session,
         name="旧职能",

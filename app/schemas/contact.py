@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ContactFunctionCreate(BaseModel):
@@ -11,7 +11,9 @@ class ContactFunctionCreate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = Field(
+        json_schema_extra={"minLength": 1, "maxLength": 64},
+    )
 
 
 class ContactFunctionUpdate(BaseModel):
@@ -19,7 +21,9 @@ class ContactFunctionUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = Field(
+        json_schema_extra={"minLength": 1, "maxLength": 64},
+    )
 
 
 class ContactFunctionRead(BaseModel):
