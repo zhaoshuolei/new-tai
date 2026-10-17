@@ -101,11 +101,17 @@ def test_text_length_caps(field: str, maximum: int) -> None:
 
 def test_expertise_tags_normalize_before_count_and_length_checks() -> None:
     profile = ProfileUpdate(expertise_tags=["Java", " Java ", ""])
+    assert profile.expertise_tags == ["Java"]
 
+    profile = ProfileUpdate(expertise_tags=["Java"] * 11)
     assert profile.expertise_tags == ["Java"]
 
     with pytest.raises(ValidationError):
         ProfileUpdate(expertise_tags=[f"tag-{index}" for index in range(11)])
+
+    profile = ProfileUpdate(expertise_tags=["x" * 20])
+    assert profile.expertise_tags == ["x" * 20]
+
     with pytest.raises(ValidationError):
         ProfileUpdate(expertise_tags=["x" * 21])
 
@@ -172,14 +178,30 @@ def test_personal_link_label_cap_applies_after_fallback() -> None:
         )
 
 
-def test_personal_link_count_is_checked_after_normalization() -> None:
+def test_personal_link_count_is_checked_after_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     four_links = [
         {"label": f"Link {index}", "url": f"https://a.example/{index}"}
         for index in range(4)
     ]
+    assert len({link["url"] for link in four_links}) == 4
 
     with pytest.raises(ValidationError):
         ProfileUpdate(personal_links=four_links)
+
+    monkeypatch.setattr(profile_schema, "public_link_host", lambda _: None)
+    profile = ProfileUpdate(
+        personal_links=[
+            {"label": "  ", "url": "https://discarded.example/x"},
+            *four_links[:3],
+        ]
+    )
+
+    assert profile.personal_links is not None
+    assert [link.url for link in profile.personal_links] == [
+        link["url"] for link in four_links[:3]
+    ]
 
 
 def test_personal_links_do_not_deduplicate_urls() -> None:
