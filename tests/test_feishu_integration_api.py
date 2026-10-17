@@ -126,9 +126,14 @@ def api_client_factory(
 
 async def audit_rows(
     factory: async_sessionmaker[AsyncSession],
+    *,
+    request_ids: tuple[str, ...] | None = None,
 ) -> list[AuditLog]:
+    statement = select(AuditLog).order_by(AuditLog.id)
+    if request_ids is not None:
+        statement = statement.where(AuditLog.request_id.in_(request_ids))
     async with factory() as audit_session:
-        rows = await audit_session.scalars(select(AuditLog).order_by(AuditLog.id))
+        rows = await audit_session.scalars(statement)
         return list(rows.all())
 
 
@@ -329,7 +334,10 @@ async def test_put_success_records_audit_without_secret(
         )
 
     assert response.status_code == 200
-    rows = await audit_rows(audit_session_factory)
+    rows = await audit_rows(
+        audit_session_factory,
+        request_ids=(response.headers["x-request-id"],),
+    )
     assert len(rows) == 1
     assert rows[0].action == "integration_feishu:update"
     assert rows[0].resource_type == "integration"
@@ -347,9 +355,42 @@ async def test_delete_is_audited_even_when_idempotent(
 
     assert first.status_code == 200
     assert second.status_code == 200
-    rows = await audit_rows(audit_session_factory)
+    rows = await audit_rows(
+        audit_session_factory,
+        request_ids=(
+            first.headers["x-request-id"],
+            second.headers["x-request-id"],
+        ),
+    )
     assert len(rows) == 2
     assert all(row.result is AuditResult.SUCCESS for row in rows)
+
+
+async def test_delete_succeeds_and_is_audited_with_invalid_environment_fallback(
+    api_client_factory: ApiClientFactory,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await add_feishu_config(session)
+    invalid_redirect = "http://admin.example.com/callback"
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", invalid_redirect)
+
+    async with api_client_factory(permissions=("integration_feishu:update",)) as client:
+        response = await client.delete(FEISHU_PATH)
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "deleted"
+    assert response.json()["data"]["source"] == "environment"
+    assert response.json()["data"]["redirect_uri"] == invalid_redirect
+    rows = await audit_rows(
+        audit_session_factory,
+        request_ids=(response.headers["x-request-id"],),
+    )
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.SUCCESS
 
 
 async def test_permission_denial_is_audited_but_test_probe_is_not(
@@ -376,7 +417,13 @@ async def test_permission_denial_is_audited_but_test_probe_is_not(
         tested = await client.post(FEISHU_TEST_PATH)
     assert tested.status_code == 200
 
-    rows = await audit_rows(audit_session_factory)
+    rows = await audit_rows(
+        audit_session_factory,
+        request_ids=(
+            denied.headers["x-request-id"],
+            tested.headers["x-request-id"],
+        ),
+    )
     assert len(rows) == 1
     assert rows[0].result is AuditResult.DENIED
     assert rows[0].reason == "FORBIDDEN"
@@ -459,10 +506,8 @@ async def test_test_probe_is_not_audited(
         response = await client.post(FEISHU_TEST_PATH)
 
     assert response.status_code == 200
-    async with audit_session_factory() as audit_session:
-        rows = await audit_session.scalars(
-            select(AuditLog).where(
-                AuditLog.action == "integration_feishu:update",
-            )
-        )
-    assert list(rows.all()) == []
+    rows = await audit_rows(
+        audit_session_factory,
+        request_ids=(response.headers["x-request-id"],),
+    )
+    assert rows == []

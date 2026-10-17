@@ -128,7 +128,31 @@ def build_feishu_client(config: EffectiveFeishuConfig) -> FeishuClient:
     return FeishuClient(
         app_id=config.app_id,
         app_secret=config.app_secret,
-        redirect_uri=config.redirect_uri or None,
+        redirect_uri=config.redirect_uri,
+    )
+
+
+def _environment_status_projection() -> FeishuIntegrationStatus:
+    """Project environment status without validating its redirect URI."""
+    app_id = settings.feishu_app_id.strip()
+    app_secret = settings.feishu_app_secret.strip()
+    redirect_uri = settings.feishu_redirect_uri.strip()
+    if not app_id or not app_secret:
+        return FeishuIntegrationStatus(
+            configured=False,
+            source=FeishuConfigSource.NONE,
+            app_id=None,
+            redirect_uri=None,
+            updated_at=None,
+            updated_by=None,
+        )
+    return FeishuIntegrationStatus(
+        configured=True,
+        source=FeishuConfigSource.ENVIRONMENT,
+        app_id=app_id,
+        redirect_uri=redirect_uri or None,
+        updated_at=None,
+        updated_by=None,
     )
 
 
@@ -209,7 +233,7 @@ async def delete_feishu_integration(
 ) -> FeishuIntegrationStatus:
     await delete_by_provider(session, _PROVIDER)
     await session.commit()
-    return await get_feishu_integration_status(session)
+    return _environment_status_projection()
 
 
 __all__: tuple[str, ...] = (

@@ -1,5 +1,6 @@
 """Feishu integration configuration schema and service tests."""
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
@@ -7,7 +8,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.clients.feishu import FeishuClient
 from app.core.auth_context import AuthContext
@@ -19,8 +25,11 @@ from app.repositories.integration_config import get_by_provider
 from app.schemas.integration import (
     FeishuConfigPayload,
     FeishuConfigSource,
+    FeishuIntegrationStatus,
     FeishuIntegrationUpdate,
 )
+from app.services import audit as audit_service
+from app.services import feishu_integration as feishu_integration_service
 from app.services.feishu_integration import (
     EffectiveFeishuConfig,
     delete_feishu_integration,
@@ -56,6 +65,35 @@ async def session() -> AsyncIterator[AsyncSession]:
             await test_session.close()
             await transaction.rollback()
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def race_sessions() -> AsyncIterator[
+    tuple[AsyncSession, AsyncSession, AsyncSession]
+]:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    setup_session = factory()
+    save_session = factory()
+    delete_session = factory()
+    try:
+        await setup_session.execute(
+            delete(IntegrationConfig).where(IntegrationConfig.provider == "feishu")
+        )
+        await setup_session.commit()
+        yield setup_session, save_session, delete_session
+    finally:
+        await save_session.rollback()
+        await delete_session.rollback()
+        await setup_session.rollback()
+        await setup_session.execute(
+            delete(IntegrationConfig).where(IntegrationConfig.provider == "feishu")
+        )
+        await setup_session.commit()
+        await save_session.close()
+        await delete_session.close()
+        await setup_session.close()
+        await engine.dispose()
 
 
 @pytest.fixture
@@ -107,10 +145,35 @@ def test_update_normalizes_allowed_redirect_uri(
         "/relative",
         "https://example.com/a#fragment",
         "https://example.com/callback#",
-        "https://" + "a" * 2040,
+        "https://example.com:bad/callback",
+        "https://example.com/callback\x00",
     ],
 )
 def test_update_rejects_invalid_redirect_uri(redirect_uri: str) -> None:
+    with pytest.raises(ValidationError):
+        FeishuIntegrationUpdate(
+            app_id="cli-test",
+            app_secret=None,
+            redirect_uri=redirect_uri,
+        )
+
+
+def test_update_accepts_redirect_uri_at_exact_length_limit() -> None:
+    redirect_uri = "https://example.com/" + "a" * (2048 - len("https://example.com/"))
+
+    payload = FeishuIntegrationUpdate(
+        app_id="cli-test",
+        app_secret=None,
+        redirect_uri=redirect_uri,
+    )
+
+    assert len(redirect_uri) == 2048
+    assert payload.redirect_uri == redirect_uri
+
+
+def test_update_rejects_redirect_uri_one_character_over_limit() -> None:
+    redirect_uri = "https://example.com/" + "a" * (2049 - len("https://example.com/"))
+
     with pytest.raises(ValidationError):
         FeishuIntegrationUpdate(
             app_id="cli-test",
@@ -147,6 +210,23 @@ def test_payload_rejects_blank_app_secret(app_secret: str) -> None:
             app_secret=app_secret,
             redirect_uri="",
         )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 1, "app_id": "cli-test", "app_secret": "secret-value"},
+        {
+            "version": 1,
+            "app_id": "cli-test",
+            "app_secret": "secret-value",
+            "redirect_uri": None,
+        },
+    ],
+)
+def test_payload_requires_redirect_uri(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        FeishuConfigPayload.model_validate(payload)
 
 
 def test_secret_is_excluded_from_model_reprs() -> None:
@@ -295,10 +375,39 @@ async def test_damaged_database_config_never_falls_back_to_environment(
         '{"version":2,"app_id":"cli-x","app_secret":"x","redirect_uri":""}',
         '{"version":1,"app_id":"","app_secret":"x","redirect_uri":""}',
         '{"version":1,"app_id":"cli-x","app_secret":"x","redirect_uri":"http://insecure"}',
-        '{"version":1,"app_id":"cli-x","redirect_uri":""}',
     ],
 )
 async def test_invalid_decrypted_payload_is_unreadable(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    plaintext: str,
+) -> None:
+    monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    session.add(
+        IntegrationConfig(
+            provider="feishu",
+            secret_ciphertext=encrypt_secret(plaintext),
+            updated_by=1,
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(BusinessError) as error:
+        await resolve_feishu_config(session)
+
+    assert error.value.code == ErrorCode.FEISHU_CONFIG_UNREADABLE
+    assert error.value.http_status == 503
+
+
+@pytest.mark.parametrize(
+    "plaintext",
+    [
+        '{"version":1,"app_id":"cli-x","app_secret":"x"}',
+        '{"version":1,"app_id":"cli-x","app_secret":"x","redirect_uri":null}',
+    ],
+)
+async def test_missing_or_null_redirect_uri_maps_to_unreadable(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     plaintext: str,
@@ -516,6 +625,7 @@ async def test_update_without_database_row_can_reuse_environment_secret(
 ) -> None:
     monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
     monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", "")
     monkeypatch.setattr(
         FeishuClient,
         "verify_app_credentials",
@@ -588,6 +698,7 @@ async def test_delete_reveals_environment_config(
     await add_feishu_config(session)
     monkeypatch.setattr(settings, "feishu_app_id", "cli-env")
     monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", "")
 
     status = await delete_feishu_integration(session, context=context)
 
@@ -604,6 +715,7 @@ async def test_repeated_delete_is_idempotent(
 ) -> None:
     monkeypatch.setattr(settings, "feishu_app_id", "")
     monkeypatch.setattr(settings, "feishu_app_secret", "")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", "")
 
     first = await delete_feishu_integration(session, context=context)
     second = await delete_feishu_integration(session, context=context)
@@ -611,6 +723,150 @@ async def test_repeated_delete_is_idempotent(
     assert first.source is FeishuConfigSource.NONE
     assert second.source is FeishuConfigSource.NONE
     assert second.configured is False
+
+
+async def test_delete_returns_environment_status_without_validating_redirect(
+    session: AsyncSession,
+    context: AuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await add_feishu_config(session)
+    invalid_redirect = "http://admin.example.com/callback"
+    monkeypatch.setattr(settings, "feishu_app_id", " cli-env ")
+    monkeypatch.setattr(settings, "feishu_app_secret", "env-secret")
+    monkeypatch.setattr(settings, "feishu_redirect_uri", invalid_redirect)
+
+    status = await delete_feishu_integration(session, context=context)
+
+    assert await get_by_provider(session, "feishu") is None
+    assert status.configured is True
+    assert status.source is FeishuConfigSource.ENVIRONMENT
+    assert status.app_id == "cli-env"
+    assert status.redirect_uri == invalid_redirect
+
+
+async def test_save_after_concurrent_delete_does_not_stale_write(
+    race_sessions: tuple[AsyncSession, AsyncSession, AsyncSession],
+    context: AuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_session, save_session, delete_session = race_sessions
+    await add_feishu_config(
+        setup_session,
+        app_id="cli-old",
+        app_secret="old-secret",
+    )
+    await setup_session.commit()
+    verify_started = asyncio.Event()
+    allow_verify = asyncio.Event()
+
+    async def slow_verify(_self: FeishuClient) -> None:
+        verify_started.set()
+        await allow_verify.wait()
+
+    monkeypatch.setattr(FeishuClient, "verify_app_credentials", slow_verify)
+    monkeypatch.setattr(
+        audit_service,
+        "record_audit_entry",
+        AsyncMock(return_value=None),
+    )
+
+    save_task = asyncio.ensure_future(
+        save_feishu_integration(
+            save_session,
+            FeishuIntegrationUpdate(app_id="cli-new", app_secret=None),
+            context=context,
+        )
+    )
+    try:
+        await asyncio.wait_for(verify_started.wait(), timeout=2)
+        delete_status = await delete_feishu_integration(
+            delete_session,
+            context=context,
+        )
+        assert delete_status.source is FeishuConfigSource.NONE
+
+        allow_verify.set()
+        save_status = await asyncio.wait_for(save_task, timeout=2)
+        assert save_status.source is FeishuConfigSource.DATABASE
+
+        row = await get_by_provider(setup_session, "feishu")
+        assert row is not None
+        stored = FeishuConfigPayload.model_validate_json(
+            decrypt_secret(row.secret_ciphertext)
+        )
+        assert stored.app_id == "cli-new"
+        assert stored.app_secret == "old-secret"
+        assert save_status.app_id == "cli-new"
+    finally:
+        allow_verify.set()
+        if not save_task.done():
+            save_task.cancel()
+
+
+async def test_delete_after_concurrent_save_does_not_stale_write(
+    race_sessions: tuple[AsyncSession, AsyncSession, AsyncSession],
+    context: AuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_session, save_session, delete_session = race_sessions
+    await add_feishu_config(
+        setup_session,
+        app_id="cli-old",
+        app_secret="old-secret",
+    )
+    await setup_session.commit()
+    upsert_started = asyncio.Event()
+    allow_upsert = asyncio.Event()
+    original_upsert = feishu_integration_service.upsert
+
+    async def paused_upsert(
+        target_session: AsyncSession,
+        provider: str,
+        ciphertext: str,
+        updated_by: int,
+    ) -> IntegrationConfig:
+        row = await original_upsert(target_session, provider, ciphertext, updated_by)
+        upsert_started.set()
+        await allow_upsert.wait()
+        return row
+
+    monkeypatch.setattr(FeishuClient, "verify_app_credentials", AsyncMock())
+    monkeypatch.setattr(feishu_integration_service, "upsert", paused_upsert)
+    monkeypatch.setattr(
+        audit_service,
+        "record_audit_entry",
+        AsyncMock(return_value=None),
+    )
+
+    save_task = asyncio.ensure_future(
+        save_feishu_integration(
+            save_session,
+            FeishuIntegrationUpdate(app_id="cli-new", app_secret="new-secret"),
+            context=context,
+        )
+    )
+    delete_task: asyncio.Future[FeishuIntegrationStatus] | None = None
+    try:
+        await asyncio.wait_for(upsert_started.wait(), timeout=2)
+        delete_task = asyncio.ensure_future(
+            delete_feishu_integration(delete_session, context=context)
+        )
+        await asyncio.sleep(0)
+
+        allow_upsert.set()
+        save_status, delete_status = await asyncio.wait_for(
+            asyncio.gather(save_task, delete_task),
+            timeout=2,
+        )
+        assert save_status.source is FeishuConfigSource.DATABASE
+        assert delete_status.source is FeishuConfigSource.NONE
+        assert await get_by_provider(save_session, "feishu") is None
+    finally:
+        allow_upsert.set()
+        for task in (save_task, delete_task):
+            if task is not None and not task.done():
+                task.cancel()
 
 
 async def test_test_connection_rejects_unconfigured_and_damaged_sources(

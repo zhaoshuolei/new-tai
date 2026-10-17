@@ -38,6 +38,8 @@ def validate_redirect_uri(value: str | None) -> str:
     """校验并规范化飞书回调地址；空值表示未配置。"""
     if value is None:
         return ""
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("redirect_uri contains control characters")
 
     normalized = value.strip()
     if not normalized:
@@ -48,6 +50,7 @@ def validate_redirect_uri(value: str | None) -> str:
     try:
         parsed = urlsplit(normalized)
         hostname = parsed.hostname
+        _port = parsed.port
     except ValueError:
         raise ValueError("redirect_uri is invalid") from None
 
@@ -68,6 +71,12 @@ def _normalize_redirect_uri(value: object) -> object:
     return value
 
 
+def _normalize_required_redirect_uri(value: object) -> object:
+    if not isinstance(value, str):
+        raise ValueError("redirect_uri must be a string")
+    return validate_redirect_uri(value)
+
+
 def _serialize_utc(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -83,7 +92,7 @@ class FeishuConfigPayload(BaseModel):
     version: Literal[1]
     app_id: str = Field(min_length=1, max_length=256)
     app_secret: str = Field(min_length=1, max_length=512, repr=False)
-    redirect_uri: str = Field(default="", max_length=2048)
+    redirect_uri: str = Field(max_length=2048)
 
     @field_validator("app_id", mode="before")
     @classmethod
@@ -98,7 +107,7 @@ class FeishuConfigPayload(BaseModel):
     @field_validator("redirect_uri", mode="before")
     @classmethod
     def normalize_redirect_uri(cls, value: object) -> object:
-        return _normalize_redirect_uri(value)
+        return _normalize_required_redirect_uri(value)
 
 
 class FeishuIntegrationUpdate(BaseModel):

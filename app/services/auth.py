@@ -538,7 +538,9 @@ async def _login_with_feishu(
     client: FeishuClient | None = None,
 ) -> LoginResult:
     await enforce_login_ip_rate_limit(redis, client_ip=client_ip)
-    config = require_configured_feishu_config(await resolve_feishu_config(session))
+    config = await resolve_feishu_config(session)
+    await session.commit()
+    config = require_configured_feishu_config(config)
     feishu_client = client or build_feishu_client(config)
     user_access_token = await feishu_client.exchange_code(code)
     info = await feishu_client.get_user_info(user_access_token)
