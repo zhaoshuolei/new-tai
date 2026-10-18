@@ -266,6 +266,87 @@ def test_api_json_parser_preserves_exponent_and_negative_zero() -> None:
     assert row.cost.as_tuple().exponent == -2
 
 
+_MALFORMED_RAW_JSON: tuple[tuple[str, bytes], ...] = (
+    ("invalid-utf8", b"\xff\xfeRAW-INVALID-UTF8"),
+    ("truncated", b'{"rows":[{"revenue":RAW-MALFORMED-SECRET'),
+    ("trailing-garbage", b'{"rows":[],"raw":"RAW-TRAILING-SECRET"}x'),
+    ("nonfinite-constant", b'{"rows":[{"revenue":NaN}]}'),
+    ("non-object-root", b'[{"raw":"RAW-NON-OBJECT-ROOT"}]'),
+    ("deep-nesting", b'{"rows":' + b"[" * 50_000 + b"0" + b"]" * 50_000 + b"}"),
+    ("oversized-integer", b'{"rows":[' + b"9" * 4_301 + b"]}"),
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [content for _, content in _MALFORMED_RAW_JSON],
+    ids=[label for label, _ in _MALFORMED_RAW_JSON],
+)
+def test_api_json_parser_maps_malformed_raw_json_to_9006_without_echo(
+    content: bytes,
+) -> None:
+    with pytest.raises(BusinessError) as error:
+        parse_data_import_json_request(content)
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert error.value.code == 9006
+    assert error.value.http_status == 422
+    assert error.value.message == "Import JSON is invalid"
+    assert error.value.extra is None
+    # The public surface is the fixed message; the chained cause stays internal
+    # and is never serialized into the API response.
+    public_surface = " ".join(
+        [error.value.message, str(error.value), repr(error.value.extra)]
+    )
+    for secret in (
+        "RAW-INVALID-UTF8",
+        "RAW-MALFORMED-SECRET",
+        "RAW-TRAILING-SECRET",
+        "RAW-NON-OBJECT-ROOT",
+        "revenue",
+        "NaN",
+        "9" * 32,
+    ):
+        assert secret not in public_surface
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"rows":[],"raw":"RAW-UNSUPPORTED-ROOT"}',
+        b'{"rows":{}, "raw": "RAW-UNSUPPORTED-ROWS"}',
+        b'{"rows":[], "raw": {"nested": "RAW-UNSUPPORTED-EXTRA"}}',
+    ],
+    ids=["extra-root-key", "wrong-rows-shape", "nested-extra-root"],
+)
+def test_api_json_parser_maps_unsupported_schema_to_9006_without_echo(
+    content: bytes,
+) -> None:
+    with pytest.raises(BusinessError) as error:
+        parse_data_import_json_request(content)
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert error.value.http_status == 422
+    assert error.value.message == "Import JSON is invalid"
+    public_surface = " ".join(
+        [error.value.message, str(error.value), repr(error.value.extra)]
+    )
+    assert "RAW-UNSUPPORTED" not in public_surface
+
+
+def test_api_json_parser_keeps_bytes_in_model_bytes_out_api() -> None:
+    body = (
+        b'{"rows":[{"business_date":"2026-10-18","upstream_customer_id":1,'
+        b'"downstream_customer_id":2,"revenue":0.10000000,"cost":0,'
+        b'"custom_values":{}}]}'
+    )
+
+    payload = parse_data_import_json_request(body)
+
+    assert isinstance(payload, DataImportJsonRequest)
+    assert payload.rows[0].revenue.as_tuple() == Decimal("0.10000000").as_tuple()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

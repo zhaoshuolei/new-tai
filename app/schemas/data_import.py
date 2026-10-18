@@ -7,8 +7,16 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Never
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_serializer,
+)
 
+from app.core.errors import BusinessError, ErrorCode
 from app.models.data_management import DataImportSource, DataImportStatus
 
 
@@ -36,15 +44,50 @@ def _reject_json_constant(constant: str) -> Never:
     raise ValueError(f"Non-standard JSON constant: {constant}")
 
 
+_INVALID_JSON_MESSAGE = "Import JSON is invalid"
+
+
+def _invalid_json() -> BusinessError:
+    return BusinessError(
+        ErrorCode.DATA_IMPORT_INVALID,
+        _INVALID_JSON_MESSAGE,
+        http_status=422,
+    )
+
+
 def parse_data_import_json_request(content: bytes) -> DataImportJsonRequest:
     """Parse raw API JSON without allowing decimal numbers through binary float.
 
-    Task 10 MUST call this with the original request bytes instead of binding
-    DataImportJsonRequest directly as a FastAPI body. FastAPI's default JSON
-    decoder creates ``float`` values before Pydantic can preserve their decimal
-    representation. The original bytes must also be persisted unchanged; never
-    persist ``model_dump()`` or ``model_dump_json()`` output from this parsed
-    request.
+    Takes the **original request bytes** and returns a validated
+    :class:`DataImportJsonRequest`. Numbers are decoded with
+    ``parse_float=Decimal`` so digit strings, exponents, signs, and trailing
+    zeros survive unchanged.
+
+    Malformed or unsupported content (invalid UTF-8, malformed JSON,
+    non-finite constants, decoder limits, or a payload that does not match the
+    request schema) raises ``BusinessError(ErrorCode.DATA_IMPORT_INVALID,
+    http_status=422)`` with the fixed generic message ``"Import JSON is
+    invalid"``. Raw request content is never echoed into the error.
+
+    Task 10 MUST:
+
+    - accept a FastAPI ``Request`` (not a bound body model) and call this
+      helper as ``parse_data_import_json_request(await request.body())``;
+    - persist those **exact request bytes unchanged** as the import source.
+
+    Task 10 MUST NOT:
+
+    - bind ``DataImportJsonRequest`` directly as the endpoint body, because
+      FastAPI's default JSON decoder produces ``float`` values before Pydantic
+      can preserve their decimal representation;
+    - persist ``model_dump()`` / ``model_dump_json()`` output, because
+      reserialization loses decimal precision *and* erases duplicate-key
+      evidence from the source bytes.
+
+    Duplicate keys are last-wins at this API layer, which is acceptable for
+    immediate schema feedback only. The persisted raw bytes remain the
+    validation source of truth, and the worker's strict object-pairs parser
+    rejects duplicate row, custom, and root keys deterministically.
     """
     try:
         decoded = json.loads(
@@ -52,14 +95,15 @@ def parse_data_import_json_request(content: bytes) -> DataImportJsonRequest:
             parse_float=Decimal,
             parse_constant=_reject_json_constant,
         )
+        return DataImportJsonRequest.model_validate(decoded)
     except (
         UnicodeDecodeError,
         ValueError,
         InvalidOperation,
         RecursionError,
+        ValidationError,
     ) as error:
-        raise ValueError("Data import JSON must be valid UTF-8 JSON") from error
-    return DataImportJsonRequest.model_validate(decoded)
+        raise _invalid_json() from error
 
 
 def _serialize_utc(value: datetime | None) -> str | None:
