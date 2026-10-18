@@ -28,6 +28,11 @@ class FollowUpRow:
     created_by_nickname: str | None
     created_by_username: str | None
 
+    @property
+    def id(self) -> int:
+        """Expose the record id for audit resource attribution."""
+        return self.follow_up.id
+
 
 async def get_method(
     session: AsyncSession,
