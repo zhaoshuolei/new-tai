@@ -279,10 +279,17 @@ async def count_attachments(
     session: AsyncSession,
     follow_up_id: int,
 ) -> int:
+    """锁定并统计跟进记录附件数。
+
+    REPEATABLE READ 快照会让锁内普通 COUNT 读到并发提交前的旧值，这里必须使用
+    `FOR UPDATE` 当前读。它与附件写入的“先记录行锁、后计数”加锁顺序配套，
+    确保并发上传不能突破数量上限。
+    """
     statement = (
         select(func.count())
         .select_from(ContactFollowUpAttachment)
         .where(ContactFollowUpAttachment.follow_up_id == follow_up_id)
+        .with_for_update()
     )
     total = await session.scalar(statement)
     return int(total or 0)

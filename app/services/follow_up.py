@@ -317,7 +317,7 @@ def _contact_not_found_error() -> BusinessError:
     )
 
 
-def _follow_up_not_found_error() -> BusinessError:
+def follow_up_not_found_error() -> BusinessError:
     return BusinessError(
         ErrorCode.FOLLOW_UP_NOT_FOUND,
         "Follow-up record not found",
@@ -403,7 +403,7 @@ async def require_active_follow_up(
         follow_up_id,
     )
     if follow_up is None or follow_up.status != ContactStatus.ACTIVE:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     return follow_up
 
 
@@ -517,7 +517,7 @@ async def _follow_up_row(
 ) -> FollowUpRow:
     row = await follow_up_repository.get_follow_up_row(session, follow_up_id)
     if row is None:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     return row
 
 
@@ -646,7 +646,7 @@ async def update_follow_up(
         follow_up_id,
     )
     if follow_up is None or follow_up.status != ContactStatus.ACTIVE:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     require_follow_up_owner(follow_up, context=context)
 
     if "follow_up_user_id" in changes:
@@ -693,7 +693,7 @@ async def delete_follow_up(
         follow_up_id,
     )
     if follow_up is None or follow_up.status != ContactStatus.ACTIVE:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     require_follow_up_owner(follow_up, context=context)
 
     follow_up.status = ContactStatus.DELETED
@@ -727,7 +727,7 @@ async def restore_follow_up(
         follow_up_id,
     )
     if follow_up is None:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     if follow_up.status != ContactStatus.DELETED:
         raise _follow_up_not_deleted_error()
     require_follow_up_owner(follow_up, context=context)
@@ -813,6 +813,7 @@ __all__: tuple[str, ...] = (
     "delete_follow_up",
     "delete_method",
     "due_summary",
+    "follow_up_not_found_error",
     "list_deleted_follow_ups",
     "list_deleted_methods",
     "list_due_customers",

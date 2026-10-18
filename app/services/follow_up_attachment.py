@@ -14,7 +14,7 @@ from app.models.follow_up import ContactFollowUp, ContactFollowUpAttachment
 from app.repositories import follow_up as follow_up_repository
 from app.services.audit import audited
 from app.services.follow_up import (
-    _follow_up_not_found_error,
+    follow_up_not_found_error,
     require_active_contact,
     require_active_follow_up,
     require_follow_up_owner,
@@ -89,7 +89,7 @@ async def _lock_owned_active_follow_up(
         follow_up_id,
     )
     if follow_up is None or follow_up.status != ContactStatus.ACTIVE:
-        raise _follow_up_not_found_error()
+        raise follow_up_not_found_error()
     require_follow_up_owner(follow_up, context=context)
     return follow_up
 

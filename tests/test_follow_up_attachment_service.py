@@ -83,8 +83,11 @@ async def test_sixth_attachment_is_rejected(session, tmp_path, monkeypatch) -> N
 async def test_non_owner_cannot_upload_or_delete(
     session, tmp_path, monkeypatch
 ) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, _ = await _fixture(
+    owner, customer, contact, follow_up, owner_ctx = await _fixture(
         session, tmp_path, monkeypatch
+    )
+    attachment = await _upload_pdf(
+        session, customer, contact, follow_up, owner_ctx
     )
     outsider = await make_user(session)
     ctx = make_context(
@@ -107,6 +110,42 @@ async def test_non_owner_cannot_upload_or_delete(
             context=ctx,
         )
     assert error.value.code == ErrorCode.FOLLOW_UP_NOT_OWNER
+
+    with pytest.raises(BusinessError) as error:
+        await attachment_service.delete_attachment(
+            session,
+            customer.id,
+            contact.id,
+            follow_up.id,
+            attachment.id,
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.FOLLOW_UP_NOT_OWNER
+
+
+async def test_non_owner_with_customer_read_can_download(
+    session, tmp_path, monkeypatch
+) -> None:  # noqa: F811
+    owner, customer, contact, follow_up, owner_ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
+    attachment = await _upload_pdf(
+        session, customer, contact, follow_up, owner_ctx
+    )
+    reader = await make_user(session)
+    reader_ctx = make_context(reader, permission_codes={"customer:read"})
+
+    path, loaded = await attachment_service.get_attachment_for_download(
+        session,
+        customer.id,
+        contact.id,
+        follow_up.id,
+        attachment.id,
+        context=reader_ctx,
+    )
+
+    assert path.read_bytes() == PDF
+    assert loaded.id == attachment.id
 
 
 async def test_deleted_attachment_file_is_gone(session, tmp_path, monkeypatch) -> None:  # noqa: F811
