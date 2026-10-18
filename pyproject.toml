@@ -17,6 +17,8 @@ dependencies = [
     "argon2-cffi",
     "httpx",
     "psutil>=7.2.2",
+    "openpyxl>=3.1.5",
+    "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]

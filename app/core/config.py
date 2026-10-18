@@ -47,6 +47,39 @@ def resolve_follow_up_attachment_root(value: str, media_root: str) -> Path:
     return attachment_root
 
 
+def _resolve_data_import_root_path(value: str) -> Path:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("data_import_root must not be empty")
+
+    import_root = Path(stripped).expanduser().resolve()
+    working_directory = Path.cwd().resolve()
+    if import_root == working_directory or import_root in working_directory.parents:
+        raise ValueError(
+            "data_import_root must not be the current working directory or an ancestor"
+        )
+    return import_root
+
+
+def resolve_data_import_root(
+    value: str,
+    media_root: str,
+    follow_up_attachment_root: str,
+) -> Path:
+    import_root = _resolve_data_import_root_path(value)
+    private_roots = (
+        ("media_root", media_root),
+        ("follow_up_attachment_root", follow_up_attachment_root),
+    )
+    for field_name, private_root in private_roots:
+        resolved_private_root = Path(private_root).expanduser().resolve()
+        if import_root.is_relative_to(resolved_private_root) or (
+            resolved_private_root.is_relative_to(import_root)
+        ):
+            raise ValueError(f"data_import_root must not overlap {field_name}")
+    return import_root
+
+
 def normalize_media_url_path(value: str) -> str:
     stripped = value.strip()
     if not stripped:
@@ -95,6 +128,8 @@ class Settings(BaseSettings):
     follow_up_attachment_root: str = Field(default="attachments", validate_default=True)
     follow_up_attachment_max_bytes: int = Field(default=10485760, ge=1)
     follow_up_attachment_max_per_record: int = Field(default=5, ge=1)
+    data_import_root: str = Field(default="data-imports", validate_default=True)
+    data_import_max_bytes: int = Field(default=52428800, ge=1)
 
     @field_validator("media_root")
     @classmethod
@@ -111,11 +146,21 @@ class Settings(BaseSettings):
     def _validate_follow_up_attachment_root(cls, value: str) -> str:
         return str(_resolve_follow_up_attachment_root_path(value))
 
+    @field_validator("data_import_root")
+    @classmethod
+    def _validate_data_import_root(cls, value: str) -> str:
+        return str(_resolve_data_import_root_path(value))
+
     @model_validator(mode="after")
-    def _validate_follow_up_attachment_root_does_not_overlap_media(self) -> Self:
+    def _validate_private_storage_roots_do_not_overlap(self) -> Self:
         resolve_follow_up_attachment_root(
             self.follow_up_attachment_root,
             self.media_root,
+        )
+        resolve_data_import_root(
+            self.data_import_root,
+            self.media_root,
+            self.follow_up_attachment_root,
         )
         return self
 

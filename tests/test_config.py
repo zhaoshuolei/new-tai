@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
@@ -103,4 +105,70 @@ def test_media_root_inside_attachment_root_is_rejected(tmp_path, monkeypatch) ->
         _settings(
             media_root=str(tmp_path / "files" / "media"),
             follow_up_attachment_root=str(tmp_path / "files"),
+        )
+
+
+def test_data_import_defaults_below_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    settings = _settings()
+
+    assert Path(settings.data_import_root) == (tmp_path / "data-imports").resolve()
+    assert settings.data_import_max_bytes == 52428800
+
+
+@pytest.mark.parametrize("data_import_root", ["", "   ", ".", ".."])
+def test_data_import_root_rejects_empty_current_or_ancestor(
+    data_import_root: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+
+    with pytest.raises(ValidationError):
+        _settings(data_import_root=data_import_root)
+
+
+@pytest.mark.parametrize(
+    ("private_root", "relation"),
+    [
+        ("media", "same"),
+        ("media", "descendant"),
+        ("media", "ancestor"),
+        ("follow_up", "same"),
+        ("follow_up", "descendant"),
+        ("follow_up", "ancestor"),
+    ],
+)
+def test_data_import_root_must_not_overlap_private_roots(
+    private_root: str,
+    relation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    private_base = tmp_path / "private"
+    media_root = private_base / "media"
+    follow_up_root = private_base / "attachments"
+    if private_root == "media":
+        media_root = media_root / "nested"
+        overlapping_root = media_root
+    else:
+        follow_up_root = follow_up_root / "nested"
+        overlapping_root = follow_up_root
+    if relation == "descendant":
+        overlapping_root = overlapping_root / "imports"
+    elif relation == "ancestor":
+        overlapping_root = overlapping_root.parent
+
+    with pytest.raises(ValidationError):
+        _settings(
+            media_root=str(media_root),
+            follow_up_attachment_root=str(follow_up_root),
+            data_import_root=str(overlapping_root),
         )
