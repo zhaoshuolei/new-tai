@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
@@ -23,10 +24,9 @@ class ContactFollowUpMethod(Base):
 
     __tablename__ = "contact_follow_up_method"
     __table_args__ = (
-        Index(
-            "uq_contact_follow_up_method_active_name",
+        UniqueConstraint(
             "active_name",
-            unique=True,
+            name="uq_contact_follow_up_method_active_name",
         ),
     )
 

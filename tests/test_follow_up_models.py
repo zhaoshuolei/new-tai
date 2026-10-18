@@ -1,6 +1,6 @@
 from typing import cast
 
-from sqlalchemy import Computed, String, Table, inspect
+from sqlalchemy import Computed, String, Table, UniqueConstraint, inspect
 
 from app.models.follow_up import (
     ContactFollowUp,
@@ -16,10 +16,14 @@ def test_method_columns_and_generated_name() -> None:
     computed = table.c.active_name.computed
     assert isinstance(computed, Computed)
     assert "status = 'ACTIVE'" in str(computed.sqltext)
-    unique_columns = {
-        tuple(c.name for c in index.columns) for index in table.indexes if index.unique
+    unique_constraints = {
+        constraint.name: tuple(c.name for c in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
     }
-    assert ("active_name",) in unique_columns
+    assert unique_constraints.get("uq_contact_follow_up_method_active_name") == (
+        "active_name",
+    )
 
 
 def test_follow_up_columns() -> None:

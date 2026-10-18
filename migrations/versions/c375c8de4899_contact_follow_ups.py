@@ -51,12 +51,10 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        "uq_contact_follow_up_method_active_name",
-        "contact_follow_up_method",
-        ["active_name"],
-        unique=True,
+        sa.UniqueConstraint(
+            "active_name",
+            name="uq_contact_follow_up_method_active_name",
+        ),
     )
     op.create_table(
         "contact_follow_up",
