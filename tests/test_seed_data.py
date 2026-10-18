@@ -57,6 +57,11 @@ EXPECTED_PERMISSION_CODES = {
     "integration_feishu:update",
     "system_setting:read",
     "system_setting:update",
+    "data:read",
+    "data:create",
+    "data:update",
+    "data:delete",
+    "data:import",
 }
 
 
@@ -523,6 +528,97 @@ async def test_customer_buttons_are_under_customer_list(
         assert button.parent_id == customer_list.id
 
 
+async def test_data_management_menu_and_buttons_are_seeded(
+    session: AsyncSession,
+) -> None:
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    data_menu = await session.scalar(
+        select(Menu).where(Menu.permission_code == "data:read")
+    )
+
+    assert data_menu is not None
+    assert data_menu.name == "数据管理"
+    assert data_menu.path == "/data"
+    assert data_menu.type == MenuType.MENU
+    assert data_menu.parent_id is None
+    assert data_menu.sort_order == 15
+
+    expected_buttons = {
+        "data:create": "创建数据表",
+        "data:update": "编辑数据表",
+        "data:delete": "删除数据表",
+        "data:import": "导入数据",
+    }
+    for permission_code, name in expected_buttons.items():
+        button = await session.scalar(
+            select(Menu).where(Menu.permission_code == permission_code)
+        )
+        assert button is not None
+        assert button.name == name
+        assert button.type == MenuType.BUTTON
+        assert button.parent_id == data_menu.id
+
+
+async def test_non_super_admin_roles_do_not_receive_data_permissions(
+    session: AsyncSession,
+) -> None:
+    existing_role = Role(
+        code="data-limited-role",
+        name="Data Limited Role",
+        description=None,
+        data_scope=DataScope.SELF,
+        data_scope_include_children=True,
+        is_system=False,
+        status=RoleStatus.ACTIVE,
+    )
+    session.add(existing_role)
+    await session.flush()
+
+    await init_data(
+        session,
+        superadmin_username="superadmin",
+        superadmin_password="test-password1",
+    )
+
+    default = await session.scalar(select(Role).where(Role.code == "default"))
+    assert default is not None
+    for role in (existing_role, default):
+        assigned_codes = set(
+            (
+                await session.scalars(
+                    select(Menu.permission_code)
+                    .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                    .where(RoleMenu.c.role_id == role.id)
+                )
+            ).all()
+        )
+        assert assigned_codes.isdisjoint(
+            {
+                "data:read",
+                "data:create",
+                "data:update",
+                "data:delete",
+                "data:import",
+            }
+        )
+
+    super_admin = await session.scalar(select(Role).where(Role.code == "super_admin"))
+    assert super_admin is not None
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(RoleMenu)
+            .where(RoleMenu.c.role_id == super_admin.id)
+        )
+        == 0
+    )
+
+
 async def test_default_role_has_no_customer_permissions(
     session: AsyncSession,
 ) -> None:
@@ -557,6 +653,11 @@ async def test_default_role_has_no_customer_permissions(
             "integration_feishu:update",
             "system_setting:read",
             "system_setting:update",
+            "data:read",
+            "data:create",
+            "data:update",
+            "data:delete",
+            "data:import",
         }
     )
 
@@ -612,7 +713,7 @@ async def test_init_is_idempotent_when_run_twice(
 
     assert await _count(session, Department) == 1
     assert await _count(session, Role) == 2
-    assert await _count(session, Menu) == 38
+    assert await _count(session, Menu) == 43
     assert await _count(session, User) == 1
     assert await _count(session, RoleMenu) == 2
     assert await _count(session, SystemSetting) == 1
@@ -634,7 +735,15 @@ async def test_init_is_idempotent_when_run_twice(
         )
         == setting.id
     )
-    for permission_code in ("system_setting:read", "system_setting:update"):
+    for permission_code in (
+        "system_setting:read",
+        "system_setting:update",
+        "data:read",
+        "data:create",
+        "data:update",
+        "data:delete",
+        "data:import",
+    ):
         assert (
             await session.scalar(
                 select(func.count())

@@ -8,7 +8,9 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from app.models.menu import MenuStatus, MenuType
 
-PERMISSION_CODE_ACTIONS = frozenset({"create", "read", "update", "delete", "assign"})
+PERMISSION_CODE_ACTIONS = frozenset(
+    {"create", "read", "update", "delete", "assign", "import"}
+)
 _PERMISSION_CODE_PATTERN = re.compile(r"^([a-z][a-z_]*):([a-z]+)$")
 
 
