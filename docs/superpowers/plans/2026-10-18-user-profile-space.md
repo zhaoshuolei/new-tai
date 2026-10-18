@@ -72,8 +72,16 @@ Create `app/models/user_profile.py`. Declare `PUBLIC_PROFILE_FIELD_KEYS` in exac
 
 ```python
 PUBLIC_PROFILE_FIELD_KEYS: tuple[str, ...] = (
-    "signature", "bio", "work_phone", "extension", "work_email",
-    "office_location", "seat", "expertise_tags", "personal_links", "avatar",
+    "signature",
+    "bio",
+    "work_phone",
+    "extension",
+    "work_email",
+    "office_location",
+    "seat",
+    "expertise_tags",
+    "personal_links",
+    "avatar",
 )
 ```
 
@@ -241,6 +249,7 @@ try:
 except ZoneInfoNotFoundError:
     BUSINESS_TIMEZONE = timezone(timedelta(hours=8))
 
+
 def business_today() -> date:
     return datetime.now(BUSINESS_TIMEZONE).date()
 ```
@@ -331,7 +340,9 @@ In `app/api/profile.py`, `PATCH ""` with `response_model=SuccessEnvelope[Profile
 
 ```python
 if not payload.model_dump(exclude_unset=True):
-    return success(await user_profile_service.get_my_profile(session, user_id=context.user_id))
+    return success(
+        await user_profile_service.get_my_profile(session, user_id=context.user_id)
+    )
 profile = await user_profile_service.update_my_profile(
     session, payload, user_id=context.user_id, context=context
 )
@@ -343,7 +354,9 @@ return success(profile, message="updated")
 Then register the route metadata at module bottom (the spec requires it; without it dependency-layer denials are not audited):
 
 ```python
-register_audit_route("PATCH", "/me/profile", action="user_profile:update", resource_type="user_profile")
+register_audit_route(
+    "PATCH", "/me/profile", action="user_profile:update", resource_type="user_profile"
+)
 ```
 
 The path is the router-prefixed template (`/me/profile`), matching how `app/api/system_settings.py` registers `"/system-settings"`.
@@ -450,6 +463,7 @@ Expected: FAIL — 404 on `/api/v1/me/profile/avatar`
 ```python
 AVATAR_UPLOAD_WINDOW_SECONDS = 3600
 AVATAR_UPLOAD_MAX_REQUESTS = 10
+
 
 def avatar_upload_rate_limit_key(user_id: int) -> str:
     return key("user_profile", "avatar_upload", str(user_id))
@@ -752,6 +766,7 @@ Expected: FAIL — no `通讯录` menu
 Add `_DIRECTORY_MENU_NAME = "通讯录"` beside the existing `_PROFILE_MENU_NAME`. Insert into `_MENU_SEEDS` **before** the `profile` entry:
 
 ```python
+(
     _MenuSeed(
         key="directory",
         parent_key=None,
@@ -760,6 +775,7 @@ Add `_DIRECTORY_MENU_NAME = "通讯录"` beside the existing `_PROFILE_MENU_NAME
         path="/directory",
         sort_order=5,
     ),
+)
 ```
 
 `sort_order=5` places it ahead of `个人资料` (10). No `permission_code` — the directory is open to every logged-in employee.

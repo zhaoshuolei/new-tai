@@ -161,6 +161,7 @@ async def test_business_error_extra_is_rendered(client) -> None:
     r = await client.get("/__test__/extra")
     assert r.json()["existing_customer_id"] == 9
 
+
 def test_business_error_default_extra_is_none() -> None:
     assert BusinessError(1000, "x").extra is None
 ```
@@ -209,8 +210,10 @@ def test_round_trip_returns_plaintext() -> None:
     token = "mcpk2_example_value"
     assert decrypt_secret(encrypt_secret(token)) == token
 
+
 def test_ciphertext_does_not_contain_plaintext() -> None:
     assert "mcpk2_example" not in encrypt_secret("mcpk2_example_value")
+
 
 def test_tampered_ciphertext_raises_unreadable() -> None:
     with pytest.raises(BusinessError) as exc:
@@ -330,6 +333,7 @@ async def test_credit_code_is_unique(session: AsyncSession, make_user) -> None:
     with pytest.raises(IntegrityError):
         await add(session, make_customer(owner, credit_code="911100007693890511"))
 
+
 async def test_null_credit_codes_do_not_conflict(session, make_user) -> None:
     owner = await make_user()
     await add(session, make_customer(owner, credit_code=None))
@@ -388,18 +392,26 @@ git commit -m "feat: add customer model and repository"
 ```python
 def test_customer_scope_self_matches_owner_user_id() -> None:
     ctx = _ctx(data_scope=DataScope.SELF, user_id=7)
-    sql = str(build_customer_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True}))
+    sql = str(
+        build_customer_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True})
+    )
     assert "customer.owner_user_id = 7" in sql
+
 
 def test_customer_dept_scope_uses_owner_department_column() -> None:
     ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
-    sql = str(build_customer_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True}))
+    sql = str(
+        build_customer_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True})
+    )
     assert "customer.owner_department_id" in sql
+
 
 def test_user_scope_filter_unchanged_after_refactor() -> None:
     # 期望字符串在 Task 6 Step 3 开始前，用当前 master 的 build_user_scope_filter 生成并固定到测试中
     ctx = _ctx(data_scope=DataScope.DEPT, department_id=3)
-    sql = str(build_user_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True}))
+    sql = str(
+        build_user_scope_filter(ctx).compile(compile_kwargs={"literal_binds": True})
+    )
     assert sql == EXPECTED_USER_DEPT_SQL  # 常量在测试文件顶部，由实施者按上述方法固定
 ```
 
@@ -464,18 +476,26 @@ def test_parse_search_table_extracts_candidates_and_total() -> None:
     assert candidates[0].credit_code == "911100007693890511"
     assert candidates[0].company_id == "14427175"
 
+
 def test_parse_search_table_keeps_dash_credit_code_as_none() -> None:
     md = "| 8 | 樂視網信息技術（香港）有限公司 | - | 仍注册 | YANFENG LIU | - | 2011-05-24 00:00:00.0 | 2 | 2011-05-24 00:00:00.0 | 3086162174 | 公司名称匹配 |"
     candidates, _ = parse_search_table(md)
     assert candidates[0].credit_code is None
 
+
 def test_parse_registration_keeps_truncation_marker() -> None:
-    info = parse_registration_table((FIXTURES / "registration.md").read_text(encoding="utf-8"))
+    info = parse_registration_table(
+        (FIXTURES / "registration.md").read_text(encoding="utf-8")
+    )
     assert info.business_scope.endswith("...")
 
+
 def test_empty_result_text_is_zero_candidates() -> None:
-    candidates, total = parse_search_table("# 企业候选列表\n\n> 空结果：未发现该维度记录\n")
+    candidates, total = parse_search_table(
+        "# 企业候选列表\n\n> 空结果：未发现该维度记录\n"
+    )
     assert candidates == [] and total == 0
+
 
 def test_map_upstream_error_quota() -> None:
     err = map_upstream_error({"code": 300007})
@@ -527,20 +547,28 @@ git commit -m "feat: add tianyancha mcp client with markdown table parsers"
 ```python
 def test_returns_latest_full_text_matching_prefix() -> None:
     displayed = "一般项目：软件开发；技术服务、技术开发、技术咨询、技术交流、技术转让、技术推广；计算机系统服务；计算机软硬件及辅助设备批发；计算机软硬件及辅助设备零售；服装服饰批发；服装服饰零售；鞋帽批发；鞋帽零售；皮革制品销售；针纺织品销售；日用品销售；玩具销售；文具用品批发；文具用品零售；体育用品及器材批发；体育用品及器材零售；家..."
-    records = [("2022-03-11", displayed[:-3] + "用品销售。（完整）"), ("2018-11-05", "其他经营范围")]
+    records = [
+        ("2022-03-11", displayed[:-3] + "用品销售。（完整）"),
+        ("2018-11-05", "其他经营范围"),
+    ]
     full, truncated = resolve_full_business_scope(displayed, records)
     assert full.startswith(displayed[:-3]) and full.endswith("（完整）")
     assert truncated is False
 
+
 def test_no_matching_record_keeps_truncated_and_flags() -> None:
-    full, truncated = resolve_full_business_scope("一般项目：A...", [("2020-01-01", "完全无关")])
+    full, truncated = resolve_full_business_scope(
+        "一般项目：A...", [("2020-01-01", "完全无关")]
+    )
     assert full == "一般项目：A..." and truncated is True
+
 
 def test_older_record_does_not_beat_newer_when_ordering_is_shuffled() -> None:
     displayed = "一般项目：A..."
     records = [("2010-01-01", "一般项目：A旧版本"), ("2022-01-01", "一般项目：A新版本")]
     full, _ = resolve_full_business_scope(displayed, records)
     assert full == "一般项目：A新版本"
+
 
 def test_none_displayed_returns_none_not_truncated() -> None:
     assert resolve_full_business_scope(None, []) == (None, False)
@@ -592,6 +620,7 @@ async def test_status_reports_not_configured_then_configured(session, context) -
     status = await get_tianyancha_status(session)
     assert status["configured"] is True
     assert "mcpk2_x" not in str(status)
+
 
 async def test_client_raises_not_configured(session) -> None:
     with pytest.raises(BusinessError) as exc:
@@ -649,47 +678,75 @@ git commit -m "feat: add tianyancha token management service"
 - [ ] **Step 1: 写失败测试（以 fake client 注入，不调用真实天眼查）**
 
 ```python
-async def test_import_rejects_existing_credit_code_without_calling_upstream(session, context, fake_client) -> None:
+async def test_import_rejects_existing_credit_code_without_calling_upstream(
+    session, context, fake_client
+) -> None:
     await create_customer_row(session, credit_code="911100007693890511", owner=context)
     with pytest.raises(BusinessError) as exc:
-        await import_from_tianyancha(session, "911100007693890511", None, context=context)
+        await import_from_tianyancha(
+            session, "911100007693890511", None, context=context
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
     assert fake_client.calls == []
 
-async def test_import_rejects_malformed_credit_code(session, context, fake_client) -> None:
+
+async def test_import_rejects_malformed_credit_code(
+    session, context, fake_client
+) -> None:
     with pytest.raises(BusinessError) as exc:
         await import_from_tianyancha(session, "bad", None, context=context)
     assert exc.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
     assert fake_client.calls == []
 
-async def test_import_refuses_when_upstream_subject_differs(session, context, fake_client) -> None:
+
+async def test_import_refuses_when_upstream_subject_differs(
+    session, context, fake_client
+) -> None:
     fake_client.registration_credit_code = "91110000000000000X"
     with pytest.raises(BusinessError) as exc:
-        await import_from_tianyancha(session, "911100007693890511", None, context=context)
+        await import_from_tianyancha(
+            session, "911100007693890511", None, context=context
+        )
     assert exc.value.code == ErrorCode.TIANYANCHA_MALFORMED_RESPONSE
     assert await count_customers(session) == 0
 
-async def test_duplicate_hidden_from_viewer_omits_existing_id(session, other_context, owner_customer) -> None:
+
+async def test_duplicate_hidden_from_viewer_omits_existing_id(
+    session, other_context, owner_customer
+) -> None:
     with pytest.raises(BusinessError) as exc:
-        await import_from_tianyancha(session, owner_customer.credit_code, None, context=other_context)
+        await import_from_tianyancha(
+            session, owner_customer.credit_code, None, context=other_context
+        )
     assert exc.value.code == ErrorCode.CUSTOMER_CREDIT_CODE_EXISTS
     assert exc.value.extra is None  # 不可见时不附带 existing_customer_id
 
+
 async def test_search_pages_do_not_overlap(session, context, fake_client) -> None:
     fake_client.pages = {1: [c("111"), c("222")], 2: [c("333"), c("444")]}
-    first = await search_candidates(session, "乐视网", page=1, page_size=2, context=context)
-    second = await search_candidates(session, "乐视网", page=2, page_size=2, context=context)
+    first = await search_candidates(
+        session, "乐视网", page=1, page_size=2, context=context
+    )
+    second = await search_candidates(
+        session, "乐视网", page=2, page_size=2, context=context
+    )
     ids_first = {i["company_id"] for i in first["items"]}
     ids_second = {i["company_id"] for i in second["items"]}
     assert ids_first.isdisjoint(ids_second)
     assert first["total"] == second["total"]
 
-async def test_transfer_to_unavailable_user_is_rejected(session, context, disabled_user, customer) -> None:
+
+async def test_transfer_to_unavailable_user_is_rejected(
+    session, context, disabled_user, customer
+) -> None:
     with pytest.raises(BusinessError) as exc:
         await transfer_owner(session, customer.id, disabled_user.id, context=context)
     assert exc.value.code == ErrorCode.CUSTOMER_OWNER_UNAVAILABLE
 
-async def test_transfer_snapshots_new_owner_department(session, context, target_user, customer) -> None:
+
+async def test_transfer_snapshots_new_owner_department(
+    session, context, target_user, customer
+) -> None:
     await transfer_owner(session, customer.id, target_user.id, context=context)
     refreshed = await get_customer_row(session, customer.id)
     assert refreshed.owner_user_id == target_user.id
@@ -736,12 +793,15 @@ git commit -m "feat: add customer service with tianyancha import and owner trans
 - [ ] **Step 1: 写失败测试**
 
 ```python
-async def test_transfer_writes_audit_row(session, context, target_user, customer) -> None:
+async def test_transfer_writes_audit_row(
+    session, context, target_user, customer
+) -> None:
     await transfer_owner(session, customer.id, target_user.id, context=context)
     row = await latest_audit(session)
     assert row.action == "customer:transfer"
     assert row.resource_type == "customer"
     assert row.resource_id == customer.id
+
 
 async def test_save_token_audit_stores_no_secret(session, context) -> None:
     await save_tianyancha_token(session, "mcpk2_secret_value", context=context)
@@ -796,19 +856,29 @@ git commit -m "feat: audit customer and integration write use cases"
 
 ```python
 async def test_search_requires_customer_create(client_without_permission) -> None:
-    r = await client_without_permission.get("/api/v1/customers/search", params={"keyword": "乐视网"})
+    r = await client_without_permission.get(
+        "/api/v1/customers/search", params={"keyword": "乐视网"}
+    )
     assert r.status_code == 403
 
+
 async def test_token_response_never_contains_secret(client_super_admin) -> None:
-    await client_super_admin.put("/api/v1/integrations/tianyancha", json={"api_key": "mcpk2_secret"})
+    await client_super_admin.put(
+        "/api/v1/integrations/tianyancha", json={"api_key": "mcpk2_secret"}
+    )
     r = await client_super_admin.get("/api/v1/integrations/tianyancha")
     assert r.status_code == 200
     assert "mcpk2_secret" not in r.text
     assert r.json()["data"]["configured"] is True
 
-async def test_import_quota_error_maps_to_402(client_sales, fake_tyc_quota_exceeded) -> None:
+
+async def test_import_quota_error_maps_to_402(
+    client_sales, fake_tyc_quota_exceeded
+) -> None:
     # fake_tyc_quota_exceeded 使 TianyanchaClient 抛出 8005（上游 300007）
-    r = await client_sales.post("/api/v1/customers/import", json={"credit_code": "911100007693890511"})
+    r = await client_sales.post(
+        "/api/v1/customers/import", json={"credit_code": "911100007693890511"}
+    )
     assert r.status_code == 402
     assert r.json()["code"] == 8005
 ```
@@ -923,29 +993,46 @@ git commit -m "feat: seed customer and tianyancha menus and permissions"
 覆盖设计第 14 节的关键路径（以 fake 天眼查客户端注入，不消耗真实额度）：
 
 ```python
-async def test_search_then_import_then_customer_visible_in_list(client_sales, fake_tyc) -> None:
-    search = await client_sales.get("/api/v1/customers/search", params={"keyword": "乐视网"})
+async def test_search_then_import_then_customer_visible_in_list(
+    client_sales, fake_tyc
+) -> None:
+    search = await client_sales.get(
+        "/api/v1/customers/search", params={"keyword": "乐视网"}
+    )
     assert search.status_code == 200
     credit_code = search.json()["data"]["items"][0]["credit_code"]
 
-    imported = await client_sales.post("/api/v1/customers/import", json={"credit_code": credit_code})
+    imported = await client_sales.post(
+        "/api/v1/customers/import", json={"credit_code": credit_code}
+    )
     assert imported.status_code == 200
     data = imported.json()["data"]
     assert data["source"] == "TIANYANCHA"
     assert data["business_scope_truncated"] is False
 
-    listed = await client_sales.get("/api/v1/customers", params={"keyword": credit_code})
+    listed = await client_sales.get(
+        "/api/v1/customers", params={"keyword": credit_code}
+    )
     assert listed.json()["data"]["total"] == 1
 
-async def test_department_scoped_user_cannot_see_other_department_customer(client_dept_a, customer_in_dept_b) -> None:
+
+async def test_department_scoped_user_cannot_see_other_department_customer(
+    client_dept_a, customer_in_dept_b
+) -> None:
     r = await client_dept_a.get(f"/api/v1/customers/{customer_in_dept_b.id}")
     assert r.status_code == 404
     assert r.json()["code"] == 7001
 
-async def test_transfer_then_original_owner_loses_visibility_under_self_scope(client_self, customer_owned_by_self, other_user) -> None:
+
+async def test_transfer_then_original_owner_loses_visibility_under_self_scope(
+    client_self, customer_owned_by_self, other_user
+) -> None:
     before = await client_self.get(f"/api/v1/customers/{customer_owned_by_self.id}")
     assert before.status_code == 200
-    await client_self.patch(f"/api/v1/customers/{customer_owned_by_self.id}/owner", json={"owner_user_id": other_user.id})
+    await client_self.patch(
+        f"/api/v1/customers/{customer_owned_by_self.id}/owner",
+        json={"owner_user_id": other_user.id},
+    )
     after = await client_self.get(f"/api/v1/customers/{customer_owned_by_self.id}")
     assert after.status_code == 404
 ```

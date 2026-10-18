@@ -77,9 +77,7 @@ async def get_tianyancha_client(session: AsyncSession) -> TianyanchaClient:
     try:
         api_key = decrypt_secret(config.secret_ciphertext)
     except BusinessError:
-        logger.error(
-            "Failed to decrypt stored Tianyancha credential; re-save required"
-        )
+        logger.error("Failed to decrypt stored Tianyancha credential; re-save required")
         raise
 
     return TianyanchaClient(api_key=api_key)

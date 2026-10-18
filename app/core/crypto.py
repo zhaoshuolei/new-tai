@@ -25,7 +25,7 @@ def decrypt_secret(
     """
     try:
         return _FERNET.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
-    except (InvalidToken, UnicodeDecodeError):
+    except InvalidToken, UnicodeDecodeError:
         raise BusinessError(
             error_code,
             error_message,

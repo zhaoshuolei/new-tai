@@ -94,11 +94,18 @@ def test_settings_monitor_defaults(test_settings):
 
 ```python
 def test_auth_context_defaults():
-    context = AuthContext(user_id=1, role_id=None, department_id=None,
-                          data_scope=None, custom_department_ids=frozenset(),
-                          include_children=False, permission_codes=frozenset(),
-                          is_super_admin=False)
+    context = AuthContext(
+        user_id=1,
+        role_id=None,
+        department_id=None,
+        data_scope=None,
+        custom_department_ids=frozenset(),
+        include_children=False,
+        permission_codes=frozenset(),
+        is_super_admin=False,
+    )
     assert context.username is None and context.nickname is None
+
 
 async def test_build_auth_context_carries_actor(session_with_user):
     context = await build_auth_context(session_with_user, user)

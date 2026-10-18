@@ -231,7 +231,7 @@ def _payload_text(payload_or_text: object) -> str:
         return payload_or_text.decode("utf-8", "replace")
     try:
         return json.dumps(payload_or_text, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return str(payload_or_text)
 
 
@@ -315,7 +315,7 @@ def _decode_json_payload(response: httpx.Response) -> dict[str, Any]:
         raw = data
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         raise map_upstream_error(response.status_code, raw) from None
     if not isinstance(payload, dict):
         raise _malformed_error()
@@ -441,24 +441,17 @@ class TianyanchaClient:
             "params": {},
         }
         try:
-            response = await self._post(
-                body, operation="notifications/initialized"
-            )
+            response = await self._post(body, operation="notifications/initialized")
         except BusinessError:
-            logger.warning(
-                "Tianyancha initialized notification failed; continuing"
-            )
+            logger.warning("Tianyancha initialized notification failed; continuing")
             return
         if response.status_code >= 400:
             logger.warning(
-                "Tianyancha rejected initialized notification: status=%s; "
-                "continuing",
+                "Tianyancha rejected initialized notification: status=%s; continuing",
                 response.status_code,
             )
 
-    async def _call_tool(
-        self, tool_name: str, arguments: dict[str, Any]
-    ) -> str:
+    async def _call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         await self._ensure_session()
         body = {
             "jsonrpc": "2.0",

@@ -476,9 +476,7 @@ async def update_customer(
             changes[field_name] = _clean_optional(changes[field_name])
 
     if "business_scope" in changes:
-        changes["business_scope_truncated"] = _needs_history(
-            changes["business_scope"]
-        )
+        changes["business_scope_truncated"] = _needs_history(changes["business_scope"])
 
     if updated_credit_code is not None:
         # 主动查重与写入之间可能有并发提交；用 SAVEPOINT 把唯一约束冲突

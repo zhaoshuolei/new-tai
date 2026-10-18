@@ -562,9 +562,7 @@ async def test_delete_user_race_with_new_customer_returns_2005(
     real_has_customers = customer_repository.has_customers
     call_count = {"n": 0}
 
-    async def _precheck_misses_customer(
-        _session: AsyncSession, _user_id: int
-    ) -> bool:
+    async def _precheck_misses_customer(_session: AsyncSession, _user_id: int) -> bool:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return False

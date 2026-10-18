@@ -308,9 +308,7 @@ async def test_client_sends_authorization_exactly_api_key() -> None:
             )
         return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
 
-    client = TianyanchaClient(
-        api_key="abc123", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="abc123", transport=httpx.MockTransport(handler))
 
     await client.search_candidates("x", page=1, page_size=1)
 
@@ -359,9 +357,7 @@ async def test_quota_error_maps_to_quota_exceeded() -> None:
             )
         return httpx.Response(402, json={"code": 300007, "message": "quota"})
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     with pytest.raises(BusinessError) as error:
         await client.search_candidates("x", page=1, page_size=1)
@@ -382,9 +378,7 @@ async def test_rate_limit_maps_to_rate_limited() -> None:
             )
         return httpx.Response(429, json={"code": 300004})
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     with pytest.raises(BusinessError) as error:
         await client.search_candidates("x", page=1, page_size=1)
@@ -405,9 +399,7 @@ async def test_server_error_maps_to_unavailable() -> None:
             )
         return httpx.Response(503, text="upstream down")
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     with pytest.raises(BusinessError) as error:
         await client.search_candidates("x", page=1, page_size=1)
@@ -428,9 +420,7 @@ async def test_malformed_body_maps_to_malformed_response() -> None:
             )
         return httpx.Response(200, text="this is not json")
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     with pytest.raises(BusinessError) as error:
         await client.search_candidates("x", page=1, page_size=1)
@@ -451,9 +441,7 @@ async def test_sse_response_parses_like_json() -> None:
             return httpx.Response(
                 200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
             )
-        payload = json.dumps(
-            _tools_result(body["id"], search_text), ensure_ascii=False
-        )
+        payload = json.dumps(_tools_result(body["id"], search_text), ensure_ascii=False)
         sse = f"event: message\ndata: {payload}\n\n"
         return httpx.Response(
             200,
@@ -461,9 +449,7 @@ async def test_sse_response_parses_like_json() -> None:
             text=sse,
         )
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     candidates, total = await client.search_candidates("乐视", page=1, page_size=10)
 
@@ -486,9 +472,7 @@ async def test_fetch_registration_empty_result_raises_not_found() -> None:
             json=_tools_result(body["id"], "> 空结果：未发现该维度记录"),
         )
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     with pytest.raises(BusinessError) as error:
         await client.fetch_registration("91000000000000000X")
@@ -511,13 +495,9 @@ async def test_fetch_registration_uses_call_tool_payload() -> None:
                 200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
             )
         captured.append(body)
-        return httpx.Response(
-            200, json=_tools_result(body["id"], registration_text)
-        )
+        return httpx.Response(200, json=_tools_result(body["id"], registration_text))
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     info = await client.fetch_registration("911100007693890511")
 
@@ -546,13 +526,9 @@ async def test_fetch_historical_registration_text_returns_raw_markdown() -> None
                 200, headers={"Mcp-Session-Id": "s"}, json=INITIALIZE_RESPONSE
             )
         captured.append(body)
-        return httpx.Response(
-            200, json=_tools_result(body["id"], historical_text)
-        )
+        return httpx.Response(200, json=_tools_result(body["id"], historical_text))
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     text = await client.fetch_historical_registration_text("911100007693890511")
 
@@ -602,9 +578,7 @@ async def test_connection_invokes_tools_call() -> None:
             )
         return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
 
-    client = TianyanchaClient(
-        api_key="k", transport=httpx.MockTransport(handler)
-    )
+    client = TianyanchaClient(api_key="k", transport=httpx.MockTransport(handler))
 
     await client.test_connection()
 
@@ -647,7 +621,8 @@ async def test_tools_call_carries_session_and_protocol_version() -> None:
         body = json.loads(request.content)
         if body["method"] == "initialize":
             return httpx.Response(
-                200, headers={"Mcp-Session-Id": "session-abc"},
+                200,
+                headers={"Mcp-Session-Id": "session-abc"},
                 json=INITIALIZE_RESPONSE,
             )
         tool_requests.append(request)
@@ -676,9 +651,7 @@ async def test_missing_protocol_version_falls_back_to_sent_version() -> None:
             return ack
         body = json.loads(request.content)
         if body["method"] == "initialize":
-            return httpx.Response(
-                200, headers={"Mcp-Session-Id": "s"}, json=response
-            )
+            return httpx.Response(200, headers={"Mcp-Session-Id": "s"}, json=response)
         tool_requests.append(request)
         return httpx.Response(200, json=_tools_result(body["id"], "空结果"))
 
@@ -713,4 +686,3 @@ async def test_rejected_initialized_notification_does_not_block_tool_call(
     assert total == 0
     assert candidates == []
     assert tool_calls == ["tools/call"]
-

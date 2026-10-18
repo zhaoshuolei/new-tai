@@ -460,9 +460,7 @@ async def test_refresh_business_scope_returns_complete_text(
     session.add(customer)
     await session.flush()
     fake_client.historical_text = (
-        "##### 经营范围 2022-03-11\n"
-        "###### 变更后原文\n"
-        "互联网信息服务完整经营范围。\n"
+        "##### 经营范围 2022-03-11\n###### 变更后原文\n互联网信息服务完整经营范围。\n"
     )
 
     context = _context(caller, *ALL_CUSTOMER_PERMISSIONS)

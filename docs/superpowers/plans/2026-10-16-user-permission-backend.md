@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     initial_superadmin_username: str = "superadmin"
     initial_superadmin_password: str = ""
 
+
 settings = Settings()
 ```
 
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name)
     ...
     return app
+
 
 app = create_app()
 ```
@@ -162,6 +164,7 @@ git commit -m "chore: bootstrap FastAPI project with config and tooling"
 ```python
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
 
+
 def key(*parts: str) -> str:
     return ":".join([settings.app_name, settings.env, *parts])
 ```
@@ -176,6 +179,7 @@ def key(*parts: str) -> str:
 @router.get("/health/live")
 async def liveness() -> dict: ...
 
+
 @router.get("/health/ready")
 async def readiness(session: AsyncSession = Depends(get_session)) -> dict: ...
 ```
@@ -187,7 +191,9 @@ async def readiness(session: AsyncSession = Depends(get_session)) -> dict: ...
 ```python
 async def test_liveness_ok(): ...  # 200
 
+
 async def test_readiness_ok_when_db_and_redis_up(): ...  # 200
+
 
 async def test_readiness_503_when_redis_down(monkeypatch): ...  # 503
 ```
@@ -261,7 +267,9 @@ class ErrorCode(IntEnum):
 
 ```python
 class BusinessError(Exception):
-    def __init__(self, code: ErrorCode, message: str, http_status: int = 400) -> None: ...
+    def __init__(
+        self, code: ErrorCode, message: str, http_status: int = 400
+    ) -> None: ...
 ```
 
 - [ ] **Step 3: 写 `app/core/response.py`**
@@ -269,6 +277,7 @@ class BusinessError(Exception):
 ```python
 def success(data: Any = None, message: str = "ok") -> dict[str, Any]:
     return {"code": 0, "message": message, "data": data}
+
 
 class Page(BaseModel, Generic[T]):
     items: list[T]
@@ -690,13 +699,17 @@ class AuthContext:
 固定树：`总公司(1) → 研发部(2) → 前端组(3)`，`总公司(1) → 市场部(4)`；用户 `alice@研发部`、`bob@研发部`、`carol@前端组`、`dave@市场部`；观察者放在研发部。
 
 ```python
-@pytest.mark.parametrize("scope,expected", [
-    (DataScope.ALL, {"alice", "bob", "carol", "dave"}),
-    (DataScope.DEPT, {"alice", "bob"}),
-    (DataScope.DEPT_AND_CHILD, {"alice", "bob", "carol"}),
-    (DataScope.SELF, {"alice"}),
-])
+@pytest.mark.parametrize(
+    "scope,expected",
+    [
+        (DataScope.ALL, {"alice", "bob", "carol", "dave"}),
+        (DataScope.DEPT, {"alice", "bob"}),
+        (DataScope.DEPT_AND_CHILD, {"alice", "bob", "carol"}),
+        (DataScope.SELF, {"alice"}),
+    ],
+)
 async def test_user_list_respects_data_scope(scope, expected): ...
+
 
 async def test_custom_scope_without_children_matches_exact_departments(): ...
 async def test_custom_scope_with_children_includes_subtree(): ...

@@ -38,9 +38,7 @@ async def session() -> AsyncIterator[AsyncSession]:
         try:
             # 隔离其他测试遗留的飞书配置；事务回滚后不影响测试库。
             await test_session.execute(
-                delete(IntegrationConfig).where(
-                    IntegrationConfig.provider == "feishu"
-                )
+                delete(IntegrationConfig).where(IntegrationConfig.provider == "feishu")
             )
             await test_session.flush()
             yield test_session

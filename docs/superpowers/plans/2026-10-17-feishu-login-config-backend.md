@@ -196,8 +196,14 @@ git commit -m "feat: validate Feishu app credentials"
     ("redirect_uri", "expected"),
     [
         (None, ""),
-        ("https://admin.example.com/auth/feishu/callback", "https://admin.example.com/auth/feishu/callback"),
-        ("  https://admin.example.com/callback  ", "https://admin.example.com/callback"),
+        (
+            "https://admin.example.com/auth/feishu/callback",
+            "https://admin.example.com/auth/feishu/callback",
+        ),
+        (
+            "  https://admin.example.com/callback  ",
+            "https://admin.example.com/callback",
+        ),
     ],
 )
 def test_update_normalizes_allowed_redirect_uri(
@@ -216,7 +222,12 @@ def test_update_normalizes_allowed_redirect_uri(
 
 @pytest.mark.parametrize(
     "redirect_uri",
-    ["http://admin.example.com/callback", "/relative", "https://example.com/a#fragment", "https://" + "a" * 2040],
+    [
+        "http://admin.example.com/callback",
+        "/relative",
+        "https://example.com/a#fragment",
+        "https://" + "a" * 2040,
+    ],
 )
 def test_update_rejects_invalid_redirect_uri(redirect_uri: str) -> None:
     with pytest.raises(ValidationError):
@@ -452,20 +463,17 @@ class EffectiveFeishuConfig:
     updated_by: int | None = None
 
 
-async def resolve_feishu_config(session: AsyncSession) -> EffectiveFeishuConfig:
-    ...
+async def resolve_feishu_config(session: AsyncSession) -> EffectiveFeishuConfig: ...
 
 
 def require_configured_feishu_config(
     config: EffectiveFeishuConfig,
-) -> EffectiveFeishuConfig:
-    ...
+) -> EffectiveFeishuConfig: ...
 
 
 async def get_feishu_integration_status(
     session: AsyncSession,
-) -> FeishuIntegrationStatus:
-    ...
+) -> FeishuIntegrationStatus: ...
 ```
 
 实现要求：数据库行存在时调用 `decrypt_secret(row.secret_ciphertext, error_code=ErrorCode.FEISHU_CONFIG_UNREADABLE, error_message="Feishu configuration cannot be read")`，再用 `FeishuConfigPayload.model_validate_json`；解密、UTF-8、JSON、版本或字段错误全部映射为 8010，不记录载荷内容。数据库不存在时读取 `.env`，App ID 与 Secret 都 trim 后非空才返回 `ENVIRONMENT`，否则返回 `NONE`。`require_configured_feishu_config` 对 `NONE` 抛 `8009` / HTTP 409。
@@ -478,8 +486,7 @@ def decrypt_secret(
     *,
     error_code: ErrorCode = ErrorCode.TIANYANCHA_TOKEN_UNREADABLE,
     error_message: str = "Stored credential cannot be read; please re-save it",
-) -> str:
-    ...
+) -> str: ...
 ```
 
 保持天眼查默认行为完全不变。
@@ -572,7 +579,9 @@ async def test_update_reuses_database_secret(
     )
 
     row = await get_by_provider(session, "feishu")
-    stored = FeishuConfigPayload.model_validate_json(decrypt_secret(row.secret_ciphertext))
+    stored = FeishuConfigPayload.model_validate_json(
+        decrypt_secret(row.secret_ciphertext)
+    )
     assert seen == [("cli-updated", "old-secret")]
     assert stored.app_secret == "old-secret"
     assert status.app_id == "cli-updated"
@@ -642,7 +651,9 @@ async def test_new_secret_can_repair_damaged_database_config(
     )
 
     row = await get_by_provider(session, "feishu")
-    stored = FeishuConfigPayload.model_validate_json(decrypt_secret(row.secret_ciphertext))
+    stored = FeishuConfigPayload.model_validate_json(
+        decrypt_secret(row.secret_ciphertext)
+    )
     assert status.source is FeishuConfigSource.DATABASE
     assert stored.app_id == "cli-repaired"
     assert stored.app_secret == "new-secret"
@@ -697,7 +708,9 @@ async def test_update_without_database_row_can_reuse_environment_secret(
     )
 
     row = await get_by_provider(session, "feishu")
-    stored = FeishuConfigPayload.model_validate_json(decrypt_secret(row.secret_ciphertext))
+    stored = FeishuConfigPayload.model_validate_json(
+        decrypt_secret(row.secret_ciphertext)
+    )
     assert stored.app_secret == "env-secret"
 
 
@@ -844,16 +857,14 @@ async def save_feishu_integration(
     *,
     context: AuthContext,
     client: FeishuClient | None = None,
-) -> FeishuIntegrationStatus:
-    ...
+) -> FeishuIntegrationStatus: ...
 
 
 async def test_feishu_connection(
     session: AsyncSession,
     *,
     client: FeishuClient | None = None,
-) -> None:
-    ...
+) -> None: ...
 
 
 @audited(action="integration_feishu:update", resource_type="integration")
@@ -861,8 +872,7 @@ async def delete_feishu_integration(
     session: AsyncSession,
     *,
     context: AuthContext,
-) -> FeishuIntegrationStatus:
-    ...
+) -> FeishuIntegrationStatus: ...
 ```
 
 保存实现必须遵守：
@@ -927,7 +937,9 @@ async def test_feishu_config_requires_permissions(
     async with api_client_factory(permissions=()) as client:
         response = await getattr(client, method)(
             path,
-            json={"app_id": "cli-test", "app_secret": "secret"} if method == "put" else None,
+            json={"app_id": "cli-test", "app_secret": "secret"}
+            if method == "put"
+            else None,
         )
     assert response.status_code == 403
 
@@ -948,7 +960,9 @@ async def test_read_permission_cannot_mutate_or_probe(
     async with api_client_factory(permissions=("integration_feishu:read",)) as client:
         response = await getattr(client, method)(
             path,
-            json={"app_id": "cli-test", "app_secret": "secret"} if method == "put" else None,
+            json={"app_id": "cli-test", "app_secret": "secret"}
+            if method == "put"
+            else None,
         )
     assert response.status_code == 403
 ```
@@ -1214,24 +1228,28 @@ Expected: FAIL，原因是种子菜单与新权限码不存在。
 在 `scripts/init_data.py` 的天眼查菜单后加入：
 
 ```python
-_MenuSeed(
-    key="integration-feishu",
-    parent_key="system",
-    menu_type=MenuType.MENU,
-    name="飞书登录配置",
-    path="/system/integrations/feishu",
-    permission_code="integration_feishu:read",
-    sort_order=90,
-),
-_MenuSeed(
-    key="integration-feishu-update",
-    parent_key="integration-feishu",
-    menu_type=MenuType.BUTTON,
-    name="保存飞书配置",
-    path=None,
-    permission_code="integration_feishu:update",
-    sort_order=10,
-),
+(
+    _MenuSeed(
+        key="integration-feishu",
+        parent_key="system",
+        menu_type=MenuType.MENU,
+        name="飞书登录配置",
+        path="/system/integrations/feishu",
+        permission_code="integration_feishu:read",
+        sort_order=90,
+    ),
+)
+(
+    _MenuSeed(
+        key="integration-feishu-update",
+        parent_key="integration-feishu",
+        menu_type=MenuType.BUTTON,
+        name="保存飞书配置",
+        path=None,
+        permission_code="integration_feishu:update",
+        sort_order=10,
+    ),
+)
 ```
 
 - [ ] **Step 4: 运行种子测试确认通过**

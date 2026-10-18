@@ -284,7 +284,9 @@ def _settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **values)
 
 
-def test_attachment_root_defaults_below_working_directory(tmp_path, monkeypatch) -> None:
+def test_attachment_root_defaults_below_working_directory(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     settings = _settings(media_root=str(tmp_path / "media"))
     assert settings.follow_up_attachment_root.startswith(str(tmp_path))
@@ -293,7 +295,9 @@ def test_attachment_root_defaults_below_working_directory(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("suffix", ["", "/nested", "/../media/nested"])
-def test_attachment_root_must_not_overlap_media_root(tmp_path, monkeypatch, suffix) -> None:
+def test_attachment_root_must_not_overlap_media_root(
+    tmp_path, monkeypatch, suffix
+) -> None:
     monkeypatch.chdir(tmp_path)
     media_root = tmp_path / "media"
     with pytest.raises(ValidationError):
@@ -704,7 +708,9 @@ async def _fixture(session):  # noqa: F811
     function = await add_function(session, name="商务", customer_id=None)
     contact = await add_contact(session, customer, function)
     method = await add_method(session, name="电话")
-    ctx = make_context(owner, permission_codes={"customer:read", "customer:update", "customer:delete"})
+    ctx = make_context(
+        owner, permission_codes={"customer:read", "customer:update", "customer:delete"}
+    )
     return owner, customer, contact, method, ctx
 
 
@@ -810,7 +816,9 @@ async def test_only_owner_can_update_and_delete(session) -> None:  # noqa: F811
         follow_up_user=other,
         content="别人的记录",
     )
-    ctx = make_context(decoy, permission_codes={"customer:read", "customer:update", "customer:delete"})
+    ctx = make_context(
+        decoy, permission_codes={"customer:read", "customer:update", "customer:delete"}
+    )
     with pytest.raises(BusinessError) as error:
         await follow_up_service.update_follow_up(
             session,
@@ -939,7 +947,9 @@ async def test_deleted_contact_hides_records(session) -> None:  # noqa: F811
     assert error.value.code == ErrorCode.CUSTOMER_CONTACT_NOT_FOUND
 
 
-async def test_record_of_soft_deleted_user_stays_readable_but_read_only(session) -> None:  # noqa: F811
+async def test_record_of_soft_deleted_user_stays_readable_but_read_only(
+    session,
+) -> None:  # noqa: F811
     owner, customer, contact, method, _ = await _fixture(session)
     author = await make_user(session)
     created = await add_follow_up(
@@ -947,7 +957,9 @@ async def test_record_of_soft_deleted_user_stays_readable_but_read_only(session)
     )
     author.deleted_at = datetime.now(UTC).replace(tzinfo=None)
     await session.flush()
-    ctx = make_context(owner, permission_codes={"customer:read", "customer:update", "customer:delete"})
+    ctx = make_context(
+        owner, permission_codes={"customer:read", "customer:update", "customer:delete"}
+    )
 
     rows, total = await follow_up_service.list_follow_ups(
         session, customer.id, contact.id, context=ctx, page=1, page_size=20
@@ -1046,7 +1058,7 @@ from tests.follow_up_helpers import add_follow_up, add_method
 __all__ = ("session",)
 
 # 固定「现在」：上海 2026-10-18 04:00 → 今日边界 = UTC 2026-10-17 16:00
-NOW = datetime(2026, 10, 17, 20, 0)          # 朴素 UTC
+NOW = datetime(2026, 10, 17, 20, 0)  # 朴素 UTC
 TODAY_START = datetime(2026, 10, 17, 16, 0)
 YESTERDAY_LAST = datetime(2026, 10, 17, 15, 59, 59)
 TODAY_LAST = datetime(2026, 10, 18, 15, 59, 59)
@@ -1081,9 +1093,13 @@ async def _setup(session, next_follow_up_at, follow_up_user=None):  # noqa: F811
         (None, []),
     ],
 )
-async def test_due_boundaries(session, next_follow_up_at, expected, monkeypatch) -> None:  # noqa: F811
+async def test_due_boundaries(
+    session, next_follow_up_at, expected, monkeypatch
+) -> None:  # noqa: F811
     placeholder = await make_user(session)  # 保证 session 已连接
-    _, customer, _, ctx = await _setup(session, next_follow_up_at, follow_up_user=placeholder)
+    _, customer, _, ctx = await _setup(
+        session, next_follow_up_at, follow_up_user=placeholder
+    )
     monkeypatch.setattr(follow_up_service, "_now_naive", lambda: NOW)
 
     rows, total = await follow_up_service.list_due_follow_ups(
@@ -1147,7 +1163,12 @@ async def test_due_filter_and_summary_counts(session, monkeypatch) -> None:  # n
     monkeypatch.setattr(follow_up_service, "_now_naive", lambda: NOW)
 
     overdue_rows, _ = await follow_up_service.list_due_follow_ups(
-        session, context=ctx, due="overdue", follow_up_user_id=None, page=1, page_size=20
+        session,
+        context=ctx,
+        due="overdue",
+        follow_up_user_id=None,
+        page=1,
+        page_size=20,
     )
     assert [row.customer.name for row in overdue_rows] == ["逾期客户"]
 
@@ -1160,7 +1181,9 @@ async def test_due_filter_and_summary_counts(session, monkeypatch) -> None:  # n
         session, context=ctx, due="all", follow_up_user_id=None, page=1, page_size=20
     )
     assert total == 2
-    assert [(row.customer_name, row.due_count, row.overdue_count) for row in customer_rows] == [
+    assert [
+        (row.customer_name, row.due_count, row.overdue_count) for row in customer_rows
+    ] == [
         ("逾期客户", 1, 1),
         ("今日客户", 1, 0),
     ]
@@ -1196,7 +1219,12 @@ async def test_large_page_returns_empty(session, monkeypatch) -> None:  # noqa: 
     monkeypatch.setattr(follow_up_service, "_now_naive", lambda: NOW)
 
     rows, _ = await follow_up_service.list_due_follow_ups(
-        session, context=ctx, due="all", follow_up_user_id=None, page=10_000, page_size=20
+        session,
+        context=ctx,
+        due="all",
+        follow_up_user_id=None,
+        page=10_000,
+        page_size=20,
     )
     assert rows == []
 
@@ -1365,7 +1393,9 @@ async def test_store_attachment_writes_random_name(tmp_path, monkeypatch) -> Non
     assert await storage.remove_attachment_file(stored.storage_path) is True
 
 
-async def test_store_attachment_rejects_declared_type_mismatch(tmp_path, monkeypatch) -> None:
+async def test_store_attachment_rejects_declared_type_mismatch(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr(settings, "follow_up_attachment_root", str(tmp_path / "a"))
 
     async def chunks():
@@ -1452,7 +1482,9 @@ PDF = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n"
 
 
 async def _fixture(session, tmp_path, monkeypatch):  # noqa: F811
-    monkeypatch.setattr(settings, "follow_up_attachment_root", str(tmp_path / "attachments"))
+    monkeypatch.setattr(
+        settings, "follow_up_attachment_root", str(tmp_path / "attachments")
+    )
     owner = await make_user(session)
     customer = await make_customer_row(session, owner=owner)
     function = await add_function(session, name="商务", customer_id=None)
@@ -1485,7 +1517,9 @@ async def _upload_pdf(session, customer, contact, follow_up, ctx, *, name="报�
 
 
 async def test_upload_and_download_round_trip(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, ctx = await _fixture(session, tmp_path, monkeypatch)
+    owner, customer, contact, follow_up, ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     attachment = await _upload_pdf(session, customer, contact, follow_up, ctx)
 
     assert attachment.original_name == "报价单.pdf"
@@ -1500,17 +1534,25 @@ async def test_upload_and_download_round_trip(session, tmp_path, monkeypatch) ->
 
 
 async def test_sixth_attachment_is_rejected(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, ctx = await _fixture(session, tmp_path, monkeypatch)
+    owner, customer, contact, follow_up, ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     for index in range(5):
-        await _upload_pdf(session, customer, contact, follow_up, ctx, name=f"{index}.pdf")
+        await _upload_pdf(
+            session, customer, contact, follow_up, ctx, name=f"{index}.pdf"
+        )
 
     with pytest.raises(BusinessError) as error:
         await _upload_pdf(session, customer, contact, follow_up, ctx, name="6.pdf")
     assert error.value.code == ErrorCode.FOLLOW_UP_ATTACHMENT_LIMIT
 
 
-async def test_non_owner_cannot_upload_or_delete(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, _ = await _fixture(session, tmp_path, monkeypatch)
+async def test_non_owner_cannot_upload_or_delete(
+    session, tmp_path, monkeypatch
+) -> None:  # noqa: F811
+    owner, customer, contact, follow_up, _ = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     outsider = await make_user(session)
     ctx = make_context(
         outsider,
@@ -1535,7 +1577,9 @@ async def test_non_owner_cannot_upload_or_delete(session, tmp_path, monkeypatch)
 
 
 async def test_deleted_attachment_file_is_gone(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, ctx = await _fixture(session, tmp_path, monkeypatch)
+    owner, customer, contact, follow_up, ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     attachment = await _upload_pdf(session, customer, contact, follow_up, ctx)
     path = storage.resolve_attachment_path(attachment.storage_path)
     assert path is not None and path.exists()
@@ -1551,8 +1595,12 @@ async def test_deleted_attachment_file_is_gone(session, tmp_path, monkeypatch) -
     assert error.value.code == ErrorCode.FOLLOW_UP_ATTACHMENT_NOT_FOUND
 
 
-async def test_tampered_storage_path_cannot_escape_root(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, ctx = await _fixture(session, tmp_path, monkeypatch)
+async def test_tampered_storage_path_cannot_escape_root(
+    session, tmp_path, monkeypatch
+) -> None:  # noqa: F811
+    owner, customer, contact, follow_up, ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     media_root = tmp_path / "media"
     media_root.mkdir()
     secret = media_root / "secret.pdf"
@@ -1569,7 +1617,9 @@ async def test_tampered_storage_path_cannot_escape_root(session, tmp_path, monke
 
 
 async def test_deleted_record_hides_attachments(session, tmp_path, monkeypatch) -> None:  # noqa: F811
-    owner, customer, contact, follow_up, ctx = await _fixture(session, tmp_path, monkeypatch)
+    owner, customer, contact, follow_up, ctx = await _fixture(
+        session, tmp_path, monkeypatch
+    )
     attachment = await _upload_pdf(session, customer, contact, follow_up, ctx)
 
     await follow_up_service.delete_follow_up(
@@ -1658,7 +1708,13 @@ from app.core.audit_meta import get_audit_route_meta
 from app.models.contact import ContactStatus
 from app.services import audit as audit_service
 from tests.contact_helpers import add_contact, add_function
-from tests.customer_helpers import api_client, make_context, make_customer_row, make_user, session  # noqa: F401
+from tests.customer_helpers import (
+    api_client,
+    make_context,
+    make_customer_row,
+    make_user,
+    session,
+)  # noqa: F401
 from tests.follow_up_helpers import add_follow_up, add_method
 
 __all__ = ("session",)
@@ -1719,7 +1775,9 @@ async def test_non_owner_gets_7017_from_api(session) -> None:  # noqa: F811
     record = await add_follow_up(
         session, contact, method, follow_up_user=author, content="别人的"
     )
-    ctx = make_context(owner, permission_codes={"customer:read", "customer:update", "customer:delete"})
+    ctx = make_context(
+        owner, permission_codes={"customer:read", "customer:update", "customer:delete"}
+    )
     async with api_client(session, ctx) as client:
         response = await client.patch(
             f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups/{record.id}",
@@ -1734,8 +1792,14 @@ async def test_routes_require_permissions(session) -> None:  # noqa: F811
     ctx = make_context(owner)  # 无任何权限码
     async with api_client(session, ctx) as client:
         for method_name, url in (
-            ("GET", f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups"),
-            ("POST", f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups"),
+            (
+                "GET",
+                f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups",
+            ),
+            (
+                "POST",
+                f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups",
+            ),
             ("GET", "/api/v1/follow-ups/due"),
             ("GET", "/api/v1/follow-up-methods"),
         ):
@@ -1755,7 +1819,9 @@ async def test_method_route_denies_non_super_admin(session) -> None:  # noqa: F8
     assert response.status_code == 403
 
 
-async def test_due_summary_and_customers_endpoints(session, tmp_path, monkeypatch) -> None:  # noqa: F811
+async def test_due_summary_and_customers_endpoints(
+    session, tmp_path, monkeypatch
+) -> None:  # noqa: F811
     owner, customer, contact, method, ctx = await _fixture(session)
     await add_follow_up(
         session,
@@ -1783,9 +1849,13 @@ async def test_due_summary_and_customers_endpoints(session, tmp_path, monkeypatc
 async def test_attachment_upload_and_download(session, tmp_path, monkeypatch) -> None:  # noqa: F811
     from app.core.config import settings
 
-    monkeypatch.setattr(settings, "follow_up_attachment_root", str(tmp_path / "attachments"))
+    monkeypatch.setattr(
+        settings, "follow_up_attachment_root", str(tmp_path / "attachments")
+    )
     owner, customer, contact, method, ctx = await _fixture(session)
-    record = await add_follow_up(session, contact, method, follow_up_user=owner, content="附件")
+    record = await add_follow_up(
+        session, contact, method, follow_up_user=owner, content="附件"
+    )
     pdf = b"%PDF-1.7\n%%EOF\n"
     async with api_client(session, ctx) as client:
         upload = await client.post(
@@ -1814,16 +1884,76 @@ async def test_attachment_upload_and_download(session, tmp_path, monkeypatch) ->
 @pytest.mark.parametrize(
     ("method", "template", "action", "resource_type", "resource_id_param"),
     [
-        ("POST", "/follow-up-methods", "follow_up_method:create", "contact_follow_up_method", None),
-        ("PATCH", "/follow-up-methods/{method_id}", "follow_up_method:update", "contact_follow_up_method", "method_id"),
-        ("DELETE", "/follow-up-methods/{method_id}", "follow_up_method:delete", "contact_follow_up_method", "method_id"),
-        ("POST", "/follow-up-methods/{method_id}/restore", "follow_up_method:restore", "contact_follow_up_method", "method_id"),
-        ("POST", "/customers/{customer_id}/contacts/{contact_id}/follow-ups", "contact_follow_up:create", "contact_follow_up", None),
-        ("PATCH", "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}", "contact_follow_up:update", "contact_follow_up", "follow_up_id"),
-        ("DELETE", "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}", "contact_follow_up:delete", "contact_follow_up", "follow_up_id"),
-        ("POST", "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/restore", "contact_follow_up:restore", "contact_follow_up", "follow_up_id"),
-        ("POST", "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/attachments", "contact_follow_up:attachment_upload", "contact_follow_up_attachment", None),
-        ("DELETE", "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/attachments/{attachment_id}", "contact_follow_up:attachment_delete", "contact_follow_up_attachment", "attachment_id"),
+        (
+            "POST",
+            "/follow-up-methods",
+            "follow_up_method:create",
+            "contact_follow_up_method",
+            None,
+        ),
+        (
+            "PATCH",
+            "/follow-up-methods/{method_id}",
+            "follow_up_method:update",
+            "contact_follow_up_method",
+            "method_id",
+        ),
+        (
+            "DELETE",
+            "/follow-up-methods/{method_id}",
+            "follow_up_method:delete",
+            "contact_follow_up_method",
+            "method_id",
+        ),
+        (
+            "POST",
+            "/follow-up-methods/{method_id}/restore",
+            "follow_up_method:restore",
+            "contact_follow_up_method",
+            "method_id",
+        ),
+        (
+            "POST",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups",
+            "contact_follow_up:create",
+            "contact_follow_up",
+            None,
+        ),
+        (
+            "PATCH",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}",
+            "contact_follow_up:update",
+            "contact_follow_up",
+            "follow_up_id",
+        ),
+        (
+            "DELETE",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}",
+            "contact_follow_up:delete",
+            "contact_follow_up",
+            "follow_up_id",
+        ),
+        (
+            "POST",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/restore",
+            "contact_follow_up:restore",
+            "contact_follow_up",
+            "follow_up_id",
+        ),
+        (
+            "POST",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/attachments",
+            "contact_follow_up:attachment_upload",
+            "contact_follow_up_attachment",
+            None,
+        ),
+        (
+            "DELETE",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/attachments/{attachment_id}",
+            "contact_follow_up:attachment_delete",
+            "contact_follow_up_attachment",
+            "attachment_id",
+        ),
     ],
 )
 def test_write_routes_are_registered_for_audit(
@@ -1897,9 +2027,7 @@ async def test_follow_up_methods_are_seeded_once(session) -> None:  # noqa: F811
 
 
 async def test_existing_active_method_is_not_duplicated(session) -> None:  # noqa: F811
-    session.add(
-        ContactFollowUpMethod(name="电话", status=ContactStatus.ACTIVE)
-    )
+    session.add(ContactFollowUpMethod(name="电话", status=ContactStatus.ACTIVE))
     await session.flush()
 
     await _ensure_follow_up_methods(session)
@@ -1910,9 +2038,7 @@ async def test_existing_active_method_is_not_duplicated(session) -> None:  # noq
 
 
 async def test_deleted_method_is_not_restored_by_seed(session) -> None:  # noqa: F811
-    session.add(
-        ContactFollowUpMethod(name="电话", status=ContactStatus.DELETED)
-    )
+    session.add(ContactFollowUpMethod(name="电话", status=ContactStatus.DELETED))
     await session.flush()
 
     await _ensure_follow_up_methods(session)
