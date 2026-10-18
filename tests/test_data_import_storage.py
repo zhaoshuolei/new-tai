@@ -40,10 +40,41 @@ def test_save_import_bytes_writes_random_name_and_exact_metadata(
     assert stored_path.read_bytes() == JSON_CONTENT
     assert stored.storage_path == stored_path.name
     assert UUID(stored_path.stem)
-    assert stored.original_name == "../../source.json"
+    assert stored.original_name == "source.json"
     assert stored.size_bytes == len(JSON_CONTENT)
     assert stored.content_sha256 == JSON_SHA256
     assert "source" not in stored.storage_path
+
+
+@pytest.mark.parametrize(
+    ("original_name", "expected"),
+    [
+        ("../../source.json", "source.json"),
+        ("source\r\n\x00.json", "source.json"),
+        ("x" * 400, "x" * 255),
+        ("\r\n\t\x00", None),
+        ("", None),
+    ],
+)
+def test_save_import_bytes_sanitizes_original_name_for_downstream_metadata(
+    original_name: str,
+    expected: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _configure_storage(tmp_path, monkeypatch)
+
+    stored = storage.save_import_bytes(
+        JSON_CONTENT,
+        suffix=".json",
+        original_name=original_name,
+    )
+
+    assert stored.original_name == expected
+    filename, suffix = stored.storage_path.rsplit(".", maxsplit=1)
+    assert suffix == "json"
+    assert UUID(filename)
+    assert (root / stored.storage_path).is_file()
 
 
 def test_save_import_bytes_generates_distinct_uuids(
@@ -113,6 +144,30 @@ def test_save_import_bytes_cleans_up_temporary_file_after_replace_failure(
     with pytest.raises(OSError, match="replace failed"):
         storage.save_import_bytes(JSON_CONTENT, suffix=".json")
 
+    assert list(root.iterdir()) == []
+
+
+def test_save_import_bytes_cleans_up_after_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _configure_storage(tmp_path, monkeypatch)
+    real_fsync = storage.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(storage.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        storage.save_import_bytes(JSON_CONTENT, suffix=".json")
+
+    assert fsync_calls == 2
     assert list(root.iterdir()) == []
 
 

@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
+from app.services.private_storage import sanitize_original_name
 
 ImportSuffix = Literal[".xlsx", ".json"]
 
@@ -119,7 +120,7 @@ def save_import_bytes(
     content_sha256 = _write_atomic(root, filename, content)
     return StoredImportSource(
         storage_path=filename,
-        original_name=original_name,
+        original_name=sanitize_original_name(original_name),
         size_bytes=len(content),
         content_sha256=content_sha256,
     )

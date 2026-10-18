@@ -4,7 +4,6 @@ import asyncio
 import io
 import os
 import tempfile
-import unicodedata
 import zipfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,6 +12,7 @@ from uuid import uuid4
 
 from app.core.config import settings
 from app.core.errors import BusinessError, ErrorCode
+from app.services.private_storage import sanitize_original_name
 
 
 class AttachmentFormat(NamedTuple):
@@ -124,20 +124,6 @@ def _validate_declared_content_type(
     normalized = _normalize_content_type(content_type)
     if normalized not in _ALLOWED_DECLARED_CONTENT_TYPES[detected.content_type]:
         raise _invalid_attachment(_INVALID_ATTACHMENT_MESSAGE)
-
-
-def sanitize_original_name(value: str | None) -> str | None:
-    """移除控制字符和路径前缀，返回可安全展示的原始文件名。"""
-    if value is None:
-        return None
-
-    without_controls = "".join(
-        character for character in value if unicodedata.category(character) != "Cc"
-    )
-    last_segment = without_controls.replace("\\", "/").rsplit("/", 1)[-1].strip()
-    if not last_segment:
-        return None
-    return last_segment[:255]
 
 
 async def _read_bounded(
