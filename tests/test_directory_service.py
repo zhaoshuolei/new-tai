@@ -3,6 +3,7 @@
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.core.errors import BusinessError, ErrorCode
 from app.models.department import Department, DepartmentStatus
 from app.models.user import User, UserStatus
-from app.models.user_profile import UserProfile
+from app.models.user_profile import PUBLIC_PROFILE_FIELD_KEYS, UserProfile
 from app.services import directory as directory_service
 
 TEST_DATABASE_URL = os.environ.get(
@@ -477,6 +478,119 @@ async def test_directory_profile_clips_hidden_scalars_and_preserves_empty_lists(
     assert result.seat == "B-21"
     assert result.expertise_tags == []
     assert result.personal_links == []
+
+
+async def test_hiding_each_scalar_card_field_returns_none(
+    session: AsyncSession,
+) -> None:
+    """Every scalar public field must be independently hideable (spec §13)."""
+    values = {
+        "signature": "公开签名",
+        "bio": "公开简介",
+        "work_phone": "010-12345678",
+        "extension": "801",
+        "work_email": "colleague@example.com",
+        "office_location": "北京办公室",
+        "seat": "A-01",
+    }
+
+    for hidden_key in values:
+        user = await _make_user(
+            session,
+            username=f"hide-{hidden_key}-{uuid4().hex}",
+            nickname=f"Hide {hidden_key}",
+        )
+        await _make_profile(
+            session,
+            user_id=user.id,
+            hidden_public_fields=[hidden_key],
+            **values,
+        )
+
+        result = await directory_service.get_directory_profile(
+            session,
+            user_id=user.id,
+        )
+
+        assert getattr(result, hidden_key) is None, hidden_key
+        control_key = next(key for key in values if key != hidden_key)
+        assert getattr(result, control_key) == values[control_key], control_key
+
+
+async def test_hiding_each_list_card_field_returns_none(
+    session: AsyncSession,
+) -> None:
+    values: dict[str, list[Any]] = {
+        "expertise_tags": ["Python", "SQLAlchemy"],
+        "personal_links": [{"label": "主页", "url": "https://example.com"}],
+    }
+
+    for hidden_key in values:
+        user = await _make_user(
+            session,
+            username=f"hide-list-{hidden_key}-{uuid4().hex}",
+            nickname=f"Hide {hidden_key}",
+        )
+        await _make_profile(
+            session,
+            user_id=user.id,
+            expertise_tags=list(values["expertise_tags"]),
+            personal_links=list(values["personal_links"]),
+            hidden_public_fields=[hidden_key],
+        )
+
+        result = await directory_service.get_directory_profile(
+            session,
+            user_id=user.id,
+        )
+
+        assert getattr(result, hidden_key) is None, hidden_key
+        control_key = next(key for key in values if key != hidden_key)
+        if control_key == "personal_links":
+            assert [
+                (link.label, link.url) for link in result.personal_links or []
+            ] == [(link["label"], link["url"]) for link in values["personal_links"]]
+        else:
+            assert getattr(result, control_key) == values[control_key], control_key
+
+
+async def test_hiding_avatar_returns_none(session: AsyncSession) -> None:
+    user = await _make_user(
+        session,
+        username=f"hide-avatar-{uuid4().hex}",
+        nickname="Hide Avatar",
+        avatar="/media/avatars/hidden.png",
+    )
+    await _make_profile(
+        session,
+        user_id=user.id,
+        signature="Keep me visible",
+        hidden_public_fields=["avatar"],
+    )
+
+    result = await directory_service.get_directory_profile(
+        session,
+        user_id=user.id,
+    )
+
+    assert result.avatar is None
+    assert result.signature == "Keep me visible"
+
+
+def test_every_public_card_field_has_hiding_coverage() -> None:
+    """Guard: all fixed public keys are covered by the hiding tests above."""
+    assert set(PUBLIC_PROFILE_FIELD_KEYS) == {
+        "signature",
+        "bio",
+        "work_phone",
+        "extension",
+        "work_email",
+        "office_location",
+        "seat",
+        "expertise_tags",
+        "personal_links",
+        "avatar",
+    }
 
 
 async def test_directory_profile_excludes_disabled_and_deleted_users(
