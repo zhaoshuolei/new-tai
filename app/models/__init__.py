@@ -10,6 +10,11 @@ from app.models.contact import (
 from app.models.customer import Customer, CustomerSource
 from app.models.department import Department, DepartmentStatus
 from app.models.exception_log import ExceptionLevel, ExceptionLog
+from app.models.follow_up import (
+    ContactFollowUp,
+    ContactFollowUpAttachment,
+    ContactFollowUpMethod,
+)
 from app.models.integration_config import IntegrationConfig
 from app.models.login_log import LoginLog, LoginResultEnum, LoginType
 from app.models.menu import Menu, MenuStatus, MenuType
@@ -28,6 +33,9 @@ from app.models.user_profile import PUBLIC_PROFILE_FIELD_KEYS, UserProfile
 __all__: tuple[str, ...] = (
     "AuditLog",
     "AuditResult",
+    "ContactFollowUp",
+    "ContactFollowUpAttachment",
+    "ContactFollowUpMethod",
     "ContactFunction",
     "ContactFunctionNameLock",
     "ContactStatus",
