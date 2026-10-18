@@ -5,6 +5,7 @@
 """
 
 import importlib
+import os
 import stat
 from dataclasses import replace
 from uuid import uuid4
@@ -30,7 +31,6 @@ from app.services.customer_name import (
     customer_name_lookup_key,
     normalize_customer_name,
 )
-from scripts import check_duplicate_customer_names as duplicate_name_script
 from scripts.check_duplicate_customer_names import (
     DuplicateNameGroup,
     _duplicate_active_name_rows,
@@ -78,11 +78,13 @@ def test_active_name_is_generated_from_trimmed_name_and_unique() -> None:
     computed = str(column.computed.sqltext)
     assert "TRIM(name)" in computed
     assert "status = 'ACTIVE'" in computed
-    assert column.type.collation == REQUIRED_NAME_COLLATION
+    column_type = column.type
+    assert isinstance(column_type, sa.String)
+    assert column_type.collation == REQUIRED_NAME_COLLATION
 
     unique_columns = {
         tuple(item.name for item in index.columns)
-        for index in Customer.__table__.indexes
+        for index in Customer.__table__.indexes  # type: ignore[attr-defined]
         if index.unique
     }
     assert ("active_name",) in unique_columns
@@ -790,7 +792,8 @@ def test_report_preserves_write_failure_without_double_closing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output = tmp_path / "duplicates.txt"
-    real_close = duplicate_name_script.os.close
+    # 脚本与测试引用同一个 os 模块对象：替换该引用即拦截脚本内部调用。
+    real_close = os.close
     closed_descriptors: list[int] = []
 
     def tracking_close(descriptor: int) -> None:
@@ -817,8 +820,8 @@ def test_report_preserves_write_failure_without_double_closing(
     ) -> FailingWriter:
         return FailingWriter(descriptor)
 
-    monkeypatch.setattr(duplicate_name_script.os, "close", tracking_close)
-    monkeypatch.setattr(duplicate_name_script.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
 
     with pytest.raises(RuntimeError, match="simulated write failure"):
         emit_report("客户甲\n", output)
