@@ -6,6 +6,7 @@ from app.api.contacts import router as contacts_router
 from app.api.customers import router as customers_router
 from app.api.departments import router as departments_router
 from app.api.directory import router as directory_router
+from app.api.follow_ups import router as follow_ups_router
 from app.api.integrations import router as integrations_router
 from app.api.logs import router as logs_router
 from app.api.menus import me_router
@@ -22,6 +23,7 @@ api_v1_router.include_router(contacts_router)
 api_v1_router.include_router(customers_router)
 api_v1_router.include_router(departments_router)
 api_v1_router.include_router(directory_router)
+api_v1_router.include_router(follow_ups_router)
 api_v1_router.include_router(exceptions_monitor_router)
 api_v1_router.include_router(integrations_router)
 api_v1_router.include_router(logs_router)
