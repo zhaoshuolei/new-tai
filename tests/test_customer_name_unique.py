@@ -106,24 +106,42 @@ async def test_active_name_database_uses_required_collation(
     assert collation == REQUIRED_NAME_COLLATION
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "legacy_equal", "required_equal"),
+    [
+        # 旧规则把 BMP 外的两个字符合并，新规则区分它们（旧规则会误报重名）。
+        ("𠀪", "𠀫", 1, 0),
+        # 旧规则区分 æ 与 ae，新规则合并它们（旧规则会漏掉重名）。
+        ("æ 客户", "ae 客户", 0, 1),
+    ],
+)
 async def test_selected_pair_distinguishes_legacy_and_required_collations(
     session: AsyncSession,
+    left: str,
+    right: str,
+    legacy_equal: int,
+    required_equal: int,
 ) -> None:
-    unicode_equal, required_equal = (
+    """所选字符对必须在两种排序规则下给出不同结论。"""
+    actual = (
         await session.execute(
             sa.text(
                 """
                 SELECT
-                    '𠀪' COLLATE utf8mb4_unicode_ci
-                        = '𠀫' COLLATE utf8mb4_unicode_ci,
-                    '𠀪' COLLATE utf8mb4_0900_ai_ci
-                        = '𠀫' COLLATE utf8mb4_0900_ai_ci
+                    :left COLLATE utf8mb4_unicode_ci
+                        = :right COLLATE utf8mb4_unicode_ci AS legacy,
+                    :left COLLATE utf8mb4_0900_ai_ci
+                        = :right COLLATE utf8mb4_0900_ai_ci AS required
                 """
-            )
+            ),
+            {"left": left, "right": right},
         )
     ).one()
 
-    assert (int(unicode_equal), int(required_equal)) == (1, 0)
+    assert (int(actual.legacy), int(actual.required)) == (
+        legacy_equal,
+        required_equal,
+    )
 
 
 def test_normalize_customer_name_trims_surrounding_whitespace() -> None:
@@ -206,6 +224,28 @@ async def test_active_name_uniqueness_does_not_use_legacy_collation(
     assert first.id != second.id
     assert first.active_name == "𠀪"
     assert second.active_name == "𠀫"
+
+
+async def test_active_name_uniqueness_requires_0900_equivalence(
+    session: AsyncSession,
+) -> None:
+    """``æ`` 与 ``ae`` 仅在新排序规则下相等，是旧规则会漏掉的重名。
+
+    ``utf8mb4_unicode_ci`` 认为两者不同，若唯一索引沿用旧规则，第二行会被
+    放行；``utf8mb4_0900_ai_ci`` 认为它们相等，因此必须报 7022。
+    """
+    owner = await make_user(session)
+    context = make_context(owner)
+    await create_customer(session, CustomerCreate(name="æ 客户"), context=context)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_customer(
+            session,
+            CustomerCreate(name="ae 客户"),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
 
 
 async def test_deleted_customer_releases_name(session: AsyncSession) -> None:
