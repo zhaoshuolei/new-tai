@@ -18,7 +18,8 @@ class FollowUpMethodCreate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(
+    name: str | None = Field(
+        default=None,
         json_schema_extra={"minLength": 1, "maxLength": 64},
     )
 
@@ -28,7 +29,8 @@ class FollowUpMethodUpdate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(
+    name: str | None = Field(
+        default=None,
         json_schema_extra={"minLength": 1, "maxLength": 64},
     )
 

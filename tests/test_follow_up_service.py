@@ -13,6 +13,8 @@ from tests.follow_up_helpers import add_follow_up, add_method
 
 __all__ = ("session",)
 
+_FIXED_FOLLOW_UP_AT = datetime(2026, 10, 1, 2, 0)
+
 
 async def _fixture(session):  # noqa: F811
     owner = await make_user(session)
@@ -33,13 +35,38 @@ async def test_create_defaults_follow_up_user_to_caller(session) -> None:  # noq
         session,
         customer.id,
         contact.id,
-        FollowUpCreate(method_id=method.id, content="电话沟通预算"),
+        FollowUpCreate(
+            method_id=method.id,
+            content="电话沟通预算",
+            follow_up_at=_FIXED_FOLLOW_UP_AT,
+        ),
         context=ctx,
     )
     assert created.id == created.follow_up.id
     assert created.follow_up.follow_up_user_id == owner.id
     assert created.follow_up.created_by == owner.id
     assert created.method_name == "电话"
+
+
+@pytest.mark.parametrize("include_follow_up_at", [False, True])
+async def test_create_requires_follow_up_at(
+    session,  # noqa: F811
+    include_follow_up_at: bool,
+) -> None:
+    _, customer, contact, method, ctx = await _fixture(session)
+    fields: dict[str, object] = {"method_id": method.id, "content": "x"}
+    if include_follow_up_at:
+        fields["follow_up_at"] = None
+
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.create_follow_up(
+            session,
+            customer.id,
+            contact.id,
+            FollowUpCreate(**fields),
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
 
 
 async def test_create_rejects_unavailable_follow_up_user(session) -> None:  # noqa: F811
@@ -59,6 +86,7 @@ async def test_create_rejects_unavailable_follow_up_user(session) -> None:  # no
             FollowUpCreate(
                 method_id=method.id,
                 content="x",
+                follow_up_at=_FIXED_FOLLOW_UP_AT,
                 follow_up_user_id=invisible.id,
             ),
             context=hidden,
@@ -70,8 +98,8 @@ async def test_create_validates_content_and_times(session) -> None:  # noqa: F81
     owner, customer, contact, method, ctx = await _fixture(session)
     now = datetime.now(UTC).replace(tzinfo=None)
     cases = [
-        {"content": "   "},
-        {"content": "x" * 5001},
+        {"content": "   ", "follow_up_at": now},
+        {"content": "x" * 5001, "follow_up_at": now},
         {"content": "ok", "follow_up_at": now + timedelta(minutes=30)},
         {
             "content": "ok",
@@ -99,7 +127,11 @@ async def test_create_rejects_deleted_method(session) -> None:  # noqa: F811
             session,
             customer.id,
             contact.id,
-            FollowUpCreate(method_id=deleted.id, content="x"),
+            FollowUpCreate(
+                method_id=deleted.id,
+                content="x",
+                follow_up_at=_FIXED_FOLLOW_UP_AT,
+            ),
             context=ctx,
         )
     assert error.value.code == ErrorCode.FOLLOW_UP_METHOD_NOT_FOUND
@@ -113,7 +145,11 @@ async def test_foreign_customer_contact_pair_returns_7005(session) -> None:  # n
             session,
             other_customer.id,
             contact.id,
-            FollowUpCreate(method_id=method.id, content="x"),
+            FollowUpCreate(
+                method_id=method.id,
+                content="x",
+                follow_up_at=_FIXED_FOLLOW_UP_AT,
+            ),
             context=ctx,
         )
     assert error.value.code == ErrorCode.CUSTOMER_CONTACT_NOT_FOUND
@@ -182,7 +218,11 @@ async def test_transfer_moves_edit_rights(session) -> None:  # noqa: F811
         session,
         customer.id,
         contact.id,
-        FollowUpCreate(method_id=method.id, content="原始"),
+        FollowUpCreate(
+            method_id=method.id,
+            content="原始",
+            follow_up_at=_FIXED_FOLLOW_UP_AT,
+        ),
         context=ctx,
     )
     await follow_up_service.update_follow_up(
@@ -227,7 +267,11 @@ async def test_recycle_bin_lists_only_own_records(session) -> None:  # noqa: F81
         session,
         customer.id,
         contact.id,
-        FollowUpCreate(method_id=method.id, content="我的"),
+        FollowUpCreate(
+            method_id=method.id,
+            content="我的",
+            follow_up_at=_FIXED_FOLLOW_UP_AT,
+        ),
         context=ctx,
     )
     await follow_up_service.delete_follow_up(
@@ -291,7 +335,11 @@ async def test_restore_requires_deleted_record_and_current_owner(  # noqa: F811
         session,
         customer.id,
         contact.id,
-        FollowUpCreate(method_id=method.id, content="待恢复"),
+        FollowUpCreate(
+            method_id=method.id,
+            content="待恢复",
+            follow_up_at=_FIXED_FOLLOW_UP_AT,
+        ),
         context=ctx,
     )
 
@@ -396,7 +444,11 @@ async def test_invisible_customer_rejects_write(session) -> None:  # noqa: F811
             session,
             other_customer.id,
             contact.id,
-            FollowUpCreate(method_id=method.id, content="越权"),
+            FollowUpCreate(
+                method_id=method.id,
+                content="越权",
+                follow_up_at=_FIXED_FOLLOW_UP_AT,
+            ),
             context=hidden,
         )
     assert error.value.code == ErrorCode.CUSTOMER_NOT_FOUND

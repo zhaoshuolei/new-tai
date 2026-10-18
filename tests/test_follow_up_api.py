@@ -69,6 +69,17 @@ async def test_create_and_list_records(session) -> None:  # noqa: F811
         assert data["items"][0]["id"] == body["id"]
 
 
+async def test_create_without_follow_up_at_returns_7003(session) -> None:  # noqa: F811
+    _, customer, contact, method, ctx = await _fixture(session)
+    async with api_client(session, ctx) as client:
+        response = await client.post(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups",
+            json={"method_id": method.id, "content": "缺少跟进时间"},
+        )
+    assert response.status_code == 422
+    assert response.json()["code"] == 7003
+
+
 async def test_non_owner_gets_7017_from_api(session) -> None:  # noqa: F811
     owner, customer, contact, method, _ = await _fixture(session)
     author = await make_user(session)
@@ -113,7 +124,11 @@ async def test_routes_require_permissions(session) -> None:  # noqa: F811
             response = await client.request(
                 method_name,
                 url,
-                json={"method_id": method.id, "content": "x"},
+                json={
+                    "method_id": method.id,
+                    "content": "x",
+                    "follow_up_at": "2026-10-18T06:30:00+00:00",
+                },
             )
             assert response.status_code == 403, url
 
@@ -158,6 +173,20 @@ async def test_method_routes_deny_non_super_admin(session) -> None:  # noqa: F81
                 json=payload,
             )
             assert response.status_code == 403, url
+
+
+async def test_method_create_and_update_without_name_return_7003(  # noqa: F811
+    session,
+) -> None:
+    _, _, _, method, ctx = await _fixture(session)
+    async with api_client(session, ctx) as client:
+        for http_method, url in (
+            ("POST", "/api/v1/follow-up-methods"),
+            ("PATCH", f"/api/v1/follow-up-methods/{method.id}"),
+        ):
+            response = await client.request(http_method, url, json={})
+            assert response.status_code == 422, url
+            assert response.json()["code"] == 7003, url
 
 
 async def test_due_summary_and_customers_endpoints(
@@ -282,6 +311,52 @@ async def test_attachment_download_fallback_preserves_detected_extension(
         filename = content_disposition.partition('filename="')[2].removesuffix('"')
         assert filename == f"attachment-{attachment['id']}.pdf"
         assert filename.endswith(".pdf")
+
+
+async def test_invalid_percent_encoded_attachment_name_falls_back(
+    session,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: F811
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "follow_up_attachment_root",
+        str(tmp_path / "attachments"),
+    )
+    owner, customer, contact, method, ctx = await _fixture(session)
+    record = await add_follow_up(
+        session,
+        contact,
+        method,
+        follow_up_user=owner,
+        content="无效文件名附件",
+    )
+    pdf = b"%PDF-1.7\n%%EOF\n"
+    async with api_client(session, ctx) as client:
+        upload = await client.post(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+            f"/follow-ups/{record.id}/attachments",
+            content=pdf,
+            headers={
+                "Content-Type": "application/pdf",
+                "X-File-Name": "%FF",
+            },
+        )
+        assert upload.status_code == 200
+        attachment = upload.json()["data"]
+        assert attachment["original_name"] is None
+
+        download = await client.get(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+            f"/follow-ups/{record.id}/attachments/{attachment['id']}/download"
+        )
+        assert download.status_code == 200
+        assert download.content == pdf
+        content_disposition = download.headers["content-disposition"]
+        filename = content_disposition.partition('filename="')[2].removesuffix('"')
+        assert filename == f"attachment-{attachment['id']}.pdf"
 
 
 @pytest.mark.parametrize(

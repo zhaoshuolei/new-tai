@@ -87,7 +87,9 @@ def _require_super_admin(context: AuthContext) -> None:
         raise _forbidden_error()
 
 
-def _normalize_method_name(name: str) -> str:
+def _normalize_method_name(name: str | None) -> str:
+    if not isinstance(name, str):
+        raise _invalid_name_error("Follow-up method name is required")
     value = name.strip()
     if not value:
         raise _invalid_name_error("Follow-up method name is required")
@@ -180,7 +182,7 @@ async def list_deleted_methods(
 )
 async def create_method(
     session: AsyncSession,
-    name: str,
+    name: str | None,
     *,
     context: AuthContext,
 ) -> ContactFollowUpMethod:
@@ -206,7 +208,7 @@ async def create_method(
 async def update_method(
     session: AsyncSession,
     method_id: int,
-    name: str,
+    name: str | None,
     *,
     context: AuthContext,
 ) -> ContactFollowUpMethod:
@@ -596,8 +598,6 @@ async def create_follow_up(
         context=context,
     )
 
-    if changes.get("follow_up_at") is None:
-        changes["follow_up_at"] = _now_naive()
     _validate_follow_up_fields(changes)
 
     follow_up = ContactFollowUp(

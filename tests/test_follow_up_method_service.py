@@ -36,6 +36,25 @@ async def test_non_super_admin_cannot_read_recycle_bin(session) -> None:  # noqa
     assert error.value.code == ErrorCode.FORBIDDEN
 
 
+async def test_create_method_without_name_returns_7003(session) -> None:  # noqa: F811
+    user = await make_user(session)
+    ctx = make_context(user, is_super_admin=True)
+
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.create_method(session, None, context=ctx)
+    assert error.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
+async def test_update_method_without_name_returns_7003(session) -> None:  # noqa: F811
+    user = await make_user(session)
+    ctx = make_context(user, is_super_admin=True)
+    method = await add_method(session, name="电话")
+
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.update_method(session, method.id, None, context=ctx)
+    assert error.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
+
+
 async def test_method_name_must_be_unique_among_active(session) -> None:  # noqa: F811
     user = await make_user(session)
     ctx = make_context(user, is_super_admin=True)

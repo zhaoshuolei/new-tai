@@ -505,7 +505,7 @@ async def upload_attachment(
 ) -> dict[str, Any]:
     encoded_name = request.headers.get("x-file-name")
     try:
-        original_name = unquote(encoded_name) if encoded_name else None
+        original_name = unquote(encoded_name, errors="strict") if encoded_name else None
     except TypeError, ValueError, UnicodeError:
         original_name = None
     attachment = await attachment_service.upload_attachment(
