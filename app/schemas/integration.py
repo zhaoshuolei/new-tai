@@ -135,6 +135,14 @@ class FeishuIntegrationUpdate(BaseModel):
         return _normalize_redirect_uri(value)
 
 
+class FeishuIntegrationPublicStatus(BaseModel):
+    """未登录可见的飞书授权引导信息，仅暴露公开字段。"""
+
+    configured: bool
+    app_id: str | None
+    redirect_uri: str | None
+
+
 class FeishuIntegrationStatus(BaseModel):
     """飞书配置状态，永不包含 App Secret。"""
 
@@ -155,6 +163,7 @@ class FeishuIntegrationStatus(BaseModel):
 __all__: tuple[str, ...] = (
     "FeishuConfigPayload",
     "FeishuConfigSource",
+    "FeishuIntegrationPublicStatus",
     "FeishuIntegrationStatus",
     "FeishuIntegrationUpdate",
     "validate_redirect_uri",

@@ -12,11 +12,26 @@ from app.core.permissions import require_permission
 from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
 from app.schemas.customer import IntegrationStatus, IntegrationTokenUpdate
-from app.schemas.integration import FeishuIntegrationStatus, FeishuIntegrationUpdate
+from app.schemas.integration import (
+    FeishuIntegrationPublicStatus,
+    FeishuIntegrationStatus,
+    FeishuIntegrationUpdate,
+)
 from app.services import feishu_integration as feishu_integration_service
 from app.services import integration as integration_service
 
 router = APIRouter(prefix="/integrations", tags=["集成"])
+
+
+@router.get(
+    "/feishu/public",
+    response_model=SuccessEnvelope[FeishuIntegrationPublicStatus],
+)
+async def get_public_feishu_integration(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, Any]:
+    status = await feishu_integration_service.get_public_feishu_status(session)
+    return success(status)
 
 
 @router.get(
@@ -147,6 +162,7 @@ register_audit_route(
 __all__: tuple[str, ...] = (
     "delete_feishu_integration",
     "get_feishu_integration",
+    "get_public_feishu_integration",
     "get_tianyancha_integration",
     "router",
     "test_feishu_integration",

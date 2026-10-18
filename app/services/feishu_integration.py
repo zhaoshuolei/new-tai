@@ -19,6 +19,7 @@ from app.repositories.integration_config import (
 from app.schemas.integration import (
     FeishuConfigPayload,
     FeishuConfigSource,
+    FeishuIntegrationPublicStatus,
     FeishuIntegrationStatus,
     FeishuIntegrationUpdate,
     validate_redirect_uri,
@@ -121,6 +122,18 @@ async def get_feishu_integration_status(
         redirect_uri=config.redirect_uri or None,
         updated_at=config.updated_at,
         updated_by=config.updated_by,
+    )
+
+
+async def get_public_feishu_status(
+    session: AsyncSession,
+) -> FeishuIntegrationPublicStatus:
+    """未登录可见的飞书授权引导信息；配置损坏时与登录接口一致地抛出。"""
+    config = await resolve_feishu_config(session)
+    return FeishuIntegrationPublicStatus(
+        configured=config.source is not FeishuConfigSource.NONE,
+        app_id=config.app_id or None,
+        redirect_uri=config.redirect_uri or None,
     )
 
 
@@ -241,6 +254,7 @@ __all__: tuple[str, ...] = (
     "build_feishu_client",
     "delete_feishu_integration",
     "get_feishu_integration_status",
+    "get_public_feishu_status",
     "require_configured_feishu_config",
     "resolve_feishu_config",
     "save_feishu_integration",
