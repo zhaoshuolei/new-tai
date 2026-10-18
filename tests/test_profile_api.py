@@ -348,9 +348,14 @@ async def test_patch_nickname_changes_user_without_bumping_token_version(
     assert profile.seat == "A1"
 
 
-async def test_patch_cannot_clear_nickname_when_account_has_no_username(
+async def test_patch_can_clear_nickname_when_account_has_no_username(
     session: AsyncSession,
 ) -> None:
+    """Clearing the nickname is allowed even for Feishu accounts (spec 8.4/10.2).
+
+    The directory then has no name to show for that row; that is the documented
+    cost of keeping clearing semantics uniform across both write paths.
+    """
     user = User(
         feishu_open_id=f"ou_{uuid4().hex}",
         username=None,
@@ -370,10 +375,10 @@ async def test_patch_cannot_clear_nickname_when_account_has_no_username(
             json={"nickname": None},
         )
 
-    assert response.status_code == 422, response.text
-    assert response.json()["code"] == 1006
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["nickname"] is None
     await session.refresh(user)
-    assert user.nickname == "飞书员工"
+    assert user.nickname is None
 
 
 async def test_patch_can_clear_nickname_when_account_has_username(

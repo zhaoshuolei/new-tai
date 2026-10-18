@@ -163,16 +163,7 @@ async def update_my_profile(
     nickname = provided.pop("nickname", _UNSET)
     nickname_provided = nickname is not _UNSET
     if nickname_provided:
-        new_nickname = nickname if isinstance(nickname, str) else None
-        if not new_nickname and not user.username:
-            # 通讯录靠昵称或登录名辨认员工；飞书账号没有登录名，清空昵称会让
-            # 该员工在通讯录里变成占位名且无法被检索到。
-            raise BusinessError(
-                ErrorCode.INVALID_PARAMETER,
-                "该账号没有登录名，昵称不能为空",
-                http_status=422,
-            )
-        user.nickname = new_nickname
+        user.nickname = nickname if isinstance(nickname, str) else None
 
     if provided:
         profile = await _get_or_create_profile(session, user_id)
@@ -225,13 +216,9 @@ async def update_my_privacy(
     return await get_my_profile(session, user_id=user_id)
 
 
-replace_privacy = update_my_privacy
-
-
 __all__: tuple[str, ...] = (
     "get_my_profile",
     "profile_values",
-    "replace_privacy",
     "update_my_privacy",
     "update_my_profile",
 )

@@ -223,6 +223,47 @@ async def test_department_filter_is_exact_not_subtree(
     assert [item.id for item in page.items] == [parent_user.id]
 
 
+async def test_nickname_less_employee_is_listed_and_sorted_by_username(
+    session: AsyncSession,
+) -> None:
+    """spec §13: a null nickname falls back to the login name, including sort."""
+    department = await _make_department(session, name="无昵称部", sort_order=1)
+    token = uuid4().hex[:12]
+    no_nickname = await _make_user(
+        session,
+        username=f"zzz-{token}",
+        nickname=None,
+        department_id=department.id,
+    )
+    with_nickname = await _make_user(
+        session,
+        username=f"yyy-{token}",
+        nickname=f"aaa-{token}",
+        department_id=department.id,
+    )
+
+    page = await directory_service.list_directory(
+        session,
+        page=1,
+        page_size=100,
+        keyword=token,
+        department_id=department.id,
+    )
+
+    by_id = {item.id: item for item in page.items}
+    assert by_id[no_nickname.id].nickname is None
+    assert by_id[no_nickname.id].display_name == f"zzz-{token}"
+    # Sort key is COALESCE(nickname, username): "aaa-..." precedes "zzz-...".
+    # Sorting on nickname alone would put the NULL first instead.
+    assert [item.id for item in page.items] == [with_nickname.id, no_nickname.id]
+
+    profile = await directory_service.get_directory_profile(
+        session,
+        user_id=no_nickname.id,
+    )
+    assert profile.display_name == f"zzz-{token}"
+
+
 def test_display_name_falls_back_from_nickname_to_username_to_id() -> None:
     assert directory_service.display_name("Nickname", "username", 1) == "Nickname"
     assert directory_service.display_name(None, "username", 2) == "username"
