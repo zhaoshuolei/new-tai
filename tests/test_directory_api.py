@@ -336,13 +336,17 @@ async def test_directory_profile_returns_exact_business_card_key_set(
         "expertise_tags",
         "personal_links",
     }
-    assert set(data) == {
-        "id",
-        "display_name",
-        "nickname",
-        "department_name",
-        "status",
-    } | business_card_keys
+    assert (
+        set(data)
+        == {
+            "id",
+            "display_name",
+            "nickname",
+            "department_name",
+            "status",
+        }
+        | business_card_keys
+    )
     assert {
         "personal_phone",
         "birthday",

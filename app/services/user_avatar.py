@@ -45,6 +45,7 @@ async def upload_avatar(
     try:
         await session.commit()
     except Exception:
+
         async def remove_failed_upload() -> None:
             await remove_user_avatar(url)
 

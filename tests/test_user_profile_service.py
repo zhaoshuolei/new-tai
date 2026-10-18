@@ -154,9 +154,7 @@ def test_personal_link_url_length_cap() -> None:
     assert profile.personal_links is not None
 
     with pytest.raises(ValidationError):
-        ProfileUpdate(
-            personal_links=[{"label": "Example", "url": prefix + "x" * 483}]
-        )
+        ProfileUpdate(personal_links=[{"label": "Example", "url": prefix + "x" * 483}])
 
 
 def test_personal_link_label_cap_applies_after_fallback() -> None:

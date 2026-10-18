@@ -425,11 +425,7 @@ async def test_pagination_with_identical_sort_keys_is_disjoint_and_complete(
         for page in (1, 2, 3)
     ]
 
-    collected_ids = [
-        item.id
-        for page in pages
-        for item in page.items
-    ]
+    collected_ids = [item.id for page in pages for item in page.items]
     assert [page.total for page in pages] == [5, 5, 5]
     assert [len(page.items) for page in pages] == [2, 2, 1]
     assert len(set(collected_ids)) == 5
@@ -588,9 +584,9 @@ async def test_hiding_each_list_card_field_returns_none(
         assert getattr(result, hidden_key) is None, hidden_key
         control_key = next(key for key in values if key != hidden_key)
         if control_key == "personal_links":
-            assert [
-                (link.label, link.url) for link in result.personal_links or []
-            ] == [(link["label"], link["url"]) for link in values["personal_links"]]
+            assert [(link.label, link.url) for link in result.personal_links or []] == [
+                (link["label"], link["url"]) for link in values["personal_links"]
+            ]
         else:
             assert getattr(result, control_key) == values[control_key], control_key
 

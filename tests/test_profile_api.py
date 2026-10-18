@@ -172,9 +172,7 @@ async def _audit_rows(
     factory: async_sessionmaker[AsyncSession],
 ) -> list[AuditLog]:
     async with factory() as audit_session:
-        rows = await audit_session.scalars(
-            select(AuditLog).order_by(AuditLog.id)
-        )
+        rows = await audit_session.scalars(select(AuditLog).order_by(AuditLog.id))
         return list(rows.all())
 
 
@@ -859,9 +857,7 @@ async def test_put_privacy_empty_list_clears_without_persisting_sql_null(
     await session.refresh(profile)
     assert profile.hidden_public_fields == []
     stored_value = await session.scalar(
-        select(UserProfile.hidden_public_fields).where(
-            UserProfile.user_id == user.id
-        )
+        select(UserProfile.hidden_public_fields).where(UserProfile.user_id == user.id)
     )
     assert stored_value == []
 
