@@ -30,6 +30,7 @@ from app.services.customer_name import (
     customer_name_lookup_key,
     normalize_customer_name,
 )
+from scripts import check_duplicate_customer_names as duplicate_name_script
 from scripts.check_duplicate_customer_names import (
     DuplicateNameGroup,
     _duplicate_active_name_rows,
@@ -48,6 +49,7 @@ from tests.customer_helpers import (
 
 __all__ = ("session",)
 MIGRATION_MODULE = "migrations.versions.a7d3c9e15b42_customer_active_name"
+REQUIRED_NAME_COLLATION = "utf8mb4_0900_ai_ci"
 
 
 @pytest.fixture
@@ -76,6 +78,7 @@ def test_active_name_is_generated_from_trimmed_name_and_unique() -> None:
     computed = str(column.computed.sqltext)
     assert "TRIM(name)" in computed
     assert "status = 'ACTIVE'" in computed
+    assert column.type.collation == REQUIRED_NAME_COLLATION
 
     unique_columns = {
         tuple(item.name for item in index.columns)
@@ -83,6 +86,44 @@ def test_active_name_is_generated_from_trimmed_name_and_unique() -> None:
         if index.unique
     }
     assert ("active_name",) in unique_columns
+
+
+async def test_active_name_database_uses_required_collation(
+    session: AsyncSession,
+) -> None:
+    collation = await session.scalar(
+        sa.text(
+            """
+            SELECT COLLATION_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'customer'
+              AND COLUMN_NAME = 'active_name'
+            """
+        )
+    )
+
+    assert collation == REQUIRED_NAME_COLLATION
+
+
+async def test_selected_pair_distinguishes_legacy_and_required_collations(
+    session: AsyncSession,
+) -> None:
+    unicode_equal, required_equal = (
+        await session.execute(
+            sa.text(
+                """
+                SELECT
+                    '𠀪' COLLATE utf8mb4_unicode_ci
+                        = '𠀫' COLLATE utf8mb4_unicode_ci,
+                    '𠀪' COLLATE utf8mb4_0900_ai_ci
+                        = '𠀫' COLLATE utf8mb4_0900_ai_ci
+                """
+            )
+        )
+    ).one()
+
+    assert (int(unicode_equal), int(required_equal)) == (1, 0)
 
 
 def test_normalize_customer_name_trims_surrounding_whitespace() -> None:
@@ -152,6 +193,19 @@ async def test_active_name_uniqueness_uses_database_collation(
         )
 
     assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
+
+
+async def test_active_name_uniqueness_does_not_use_legacy_collation(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    context = make_context(owner)
+    first = await create_customer(session, CustomerCreate(name="𠀪"), context=context)
+    second = await create_customer(session, CustomerCreate(name="𠀫"), context=context)
+
+    assert first.id != second.id
+    assert first.active_name == "𠀪"
+    assert second.active_name == "𠀫"
 
 
 async def test_deleted_customer_releases_name(session: AsyncSession) -> None:
@@ -487,6 +541,19 @@ async def test_get_active_by_name_matches_trimmed_active_rows(
     assert await customer_repository.get_active_by_name(session, "客户甲") is None
 
 
+async def test_get_active_by_name_uses_required_collation_explicitly(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    customer = await make_customer_row(session, owner=owner, name="𠀪")
+    await session.flush()
+
+    assert await customer_repository.get_active_by_name(session, "𠀫") is None
+    found = await customer_repository.get_active_by_name(session, "𠀪")
+    assert found is not None
+    assert found.id == customer.id
+
+
 async def _create_scratch_customer_table(
     engine: AsyncEngine,
     table: sa.Table,
@@ -504,7 +571,11 @@ async def test_migration_blocks_duplicate_active_names_without_names() -> None:
         table_name,
         metadata,
         sa.Column("id", sa.BigInteger(), primary_key=True),
-        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column(
+            "name",
+            sa.String(length=255, collation="utf8mb4_unicode_ci"),
+            nullable=False,
+        ),
         sa.Column("status", sa.String(length=16), nullable=False),
     )
 
@@ -519,6 +590,8 @@ async def test_migration_blocks_duplicate_active_names_without_names() -> None:
                     {"id": 3, "name": "客户乙", "status": "ACTIVE"},
                     {"id": 4, "name": "客户乙", "status": "DELETED"},
                     {"id": 5, "name": "客户丙", "status": "ACTIVE"},
+                    {"id": 6, "name": "𠀪", "status": "ACTIVE"},
+                    {"id": 7, "name": "𠀫", "status": "ACTIVE"},
                 ],
             )
             with pytest.raises(RuntimeError) as exc:
@@ -546,7 +619,11 @@ async def test_script_lists_trimmed_duplicate_groups_with_ids() -> None:
         table_name,
         metadata,
         sa.Column("id", sa.BigInteger(), primary_key=True),
-        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column(
+            "name",
+            sa.String(length=255, collation="utf8mb4_unicode_ci"),
+            nullable=False,
+        ),
         sa.Column("status", sa.String(length=16), nullable=False),
     )
 
@@ -576,7 +653,7 @@ async def test_script_lists_trimmed_duplicate_groups_with_ids() -> None:
         await engine.dispose()
 
 
-async def test_script_groups_names_under_column_collation() -> None:
+async def test_script_groups_names_under_required_collation() -> None:
     engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
     table_name = f"customer_duplicates_{uuid4().hex[:12]}"
     metadata = sa.MetaData()
@@ -584,7 +661,11 @@ async def test_script_groups_names_under_column_collation() -> None:
         table_name,
         metadata,
         sa.Column("id", sa.BigInteger(), primary_key=True),
-        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column(
+            "name",
+            sa.String(length=255, collation="utf8mb4_unicode_ci"),
+            nullable=False,
+        ),
         sa.Column("status", sa.String(length=16), nullable=False),
     )
 
@@ -597,6 +678,8 @@ async def test_script_groups_names_under_column_collation() -> None:
                     {"id": 1, "name": "ACME 客户", "status": "ACTIVE"},
                     {"id": 2, "name": "acme 客户", "status": "ACTIVE"},
                     {"id": 3, "name": "Other", "status": "ACTIVE"},
+                    {"id": 4, "name": "𠀪", "status": "ACTIVE"},
+                    {"id": 5, "name": "𠀫", "status": "ACTIVE"},
                 ],
             )
         async with AsyncSession(engine) as check_session:
@@ -604,7 +687,7 @@ async def test_script_groups_names_under_column_collation() -> None:
                 check_session,
                 table_name=table_name,
             )
-        # 大小写差异沿用列排序规则算同名，脚本必须能看到这组冲突。
+        # 名称列故意使用旧排序规则；检查必须显式采用 0900 规则。
         assert [sorted(ids) for ids in groups.values()] == [[1, 2]]
     finally:
         async with engine.begin() as connection:
@@ -660,3 +743,44 @@ def test_report_prints_to_stdout_without_output_path(capsys) -> None:
     emit_report("客户甲\n", None)
 
     assert capsys.readouterr().out == "客户甲\n"
+
+
+def test_report_preserves_write_failure_without_double_closing(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "duplicates.txt"
+    real_close = duplicate_name_script.os.close
+    closed_descriptors: list[int] = []
+
+    def tracking_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        real_close(descriptor)
+
+    class FailingWriter:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def __enter__(self) -> FailingWriter:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            tracking_close(self.descriptor)
+
+        def write(self, _report: str) -> None:
+            raise RuntimeError("simulated write failure")
+
+    def failing_fdopen(
+        descriptor: int,
+        *_args: object,
+        **_kwargs: object,
+    ) -> FailingWriter:
+        return FailingWriter(descriptor)
+
+    monkeypatch.setattr(duplicate_name_script.os, "close", tracking_close)
+    monkeypatch.setattr(duplicate_name_script.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        emit_report("客户甲\n", output)
+
+    assert len(closed_descriptors) == 1

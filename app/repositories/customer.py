@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import String, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -42,13 +42,15 @@ async def get_active_by_name(
 ) -> Customer | None:
     """按去首尾空白的名称查未删除客户。
 
-    名称比较沿用列的 ``utf8mb4_0900_ai_ci`` 排序规则，因此大小写与重音差异
-    视为同名。``for_update=True`` 用于唯一键冲突后的复核：MySQL REPEATABLE
-    READ 下普通 SELECT 会固定事务快照，并发事务刚提交的冲突行不可见；当前读
-    才能看到它（与 ``get_by_credit_code`` 一致）。
+    名称比较显式采用 ``utf8mb4_0900_ai_ci``，不依赖数据库、表或 ``name`` 列的
+    默认排序规则，因此大小写与重音差异视为同名，同时不会套用旧 Unicode 规则。
+    ``for_update=True`` 用于唯一键冲突后的复核：MySQL REPEATABLE READ 下普通
+    SELECT 会固定事务快照，并发事务刚提交的冲突行不可见；当前读才能看到它
+    （与 ``get_by_credit_code`` 一致）。
     """
     statement = select(Customer).where(
-        func.trim(Customer.name) == name,
+        func.trim(Customer.name).collate("utf8mb4_0900_ai_ci")
+        == literal(name, type_=String(255)).collate("utf8mb4_0900_ai_ci"),
         Customer.status == ContactStatus.ACTIVE,
     )
     if for_update:

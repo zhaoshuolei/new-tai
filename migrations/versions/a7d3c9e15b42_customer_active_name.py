@@ -30,8 +30,9 @@ def _assert_no_duplicate_active_names(
 ) -> None:
     """在 DDL 之前阻断存量活跃重名。
 
-    分组沿用名称列的 ``utf8mb4_0900_ai_ci`` 排序规则，因此大小写、重音与首尾
-    空白差异都算重名。错误消息只包含重复组数量与修复命令，不包含客户名称。
+    分组显式采用 ``utf8mb4_0900_ai_ci``，不依赖数据库、表或名称列的默认排序
+    规则，因此大小写、重音与首尾空白差异都算重名。错误消息只包含重复组数量与
+    修复命令，不包含客户名称。
     """
     if _SAFE_TABLE_NAME.fullmatch(table_name) is None:
         raise ValueError("Unexpected table name for customer name check")
@@ -41,10 +42,10 @@ def _assert_no_duplicate_active_names(
         sa.text(
             f"""
             SELECT COUNT(*) FROM (
-                SELECT TRIM(name) AS normalized_name
+                SELECT TRIM(name) COLLATE utf8mb4_0900_ai_ci AS normalized_name
                 FROM {quoted_table}
                 WHERE status = 'ACTIVE'
-                GROUP BY normalized_name
+                GROUP BY TRIM(name) COLLATE utf8mb4_0900_ai_ci
                 HAVING COUNT(*) > 1
             ) AS duplicate_names
             """
@@ -65,7 +66,7 @@ def upgrade() -> None:
         "customer",
         sa.Column(
             "active_name",
-            sa.String(length=255),
+            sa.String(length=255, collation="utf8mb4_0900_ai_ci"),
             sa.Computed(
                 "CASE WHEN status = 'ACTIVE' THEN TRIM(name) END",
                 persisted=True,

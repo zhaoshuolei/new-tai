@@ -36,7 +36,7 @@ class Customer(Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     active_name: Mapped[str | None] = mapped_column(
-        String(255),
+        String(255, collation="utf8mb4_0900_ai_ci"),
         Computed(
             "CASE WHEN status = 'ACTIVE' THEN TRIM(name) END",
             persisted=True,

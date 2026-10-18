@@ -37,7 +37,7 @@ async def _duplicate_active_name_rows(
     *,
     table_name: str = "customer",
 ) -> dict[str, list[int]]:
-    """按名称列的排序规则分组，返回 ``{规范化名称: [客户 ID, ...]}``。"""
+    """显式按 ``utf8mb4_0900_ai_ci`` 分组，返回规范化名称与客户 ID。"""
     if _SAFE_TABLE_NAME.fullmatch(table_name) is None:
         raise ValueError("Unexpected table name for customer name check")
 
@@ -49,15 +49,17 @@ async def _duplicate_active_name_rows(
                 SELECT duplicate_names.normalized_name, target.id
                 FROM {quoted_table} AS target
                 JOIN (
-                    SELECT TRIM(name) AS normalized_name
+                    SELECT TRIM(name) COLLATE utf8mb4_0900_ai_ci AS normalized_name
                     FROM {quoted_table}
                     WHERE status = 'ACTIVE'
-                    GROUP BY TRIM(name)
+                    GROUP BY TRIM(name) COLLATE utf8mb4_0900_ai_ci
                     HAVING COUNT(*) > 1
                 ) AS duplicate_names
-                  ON duplicate_names.normalized_name = TRIM(target.name)
+                  ON duplicate_names.normalized_name COLLATE utf8mb4_0900_ai_ci
+                     = TRIM(target.name) COLLATE utf8mb4_0900_ai_ci
                 WHERE target.status = 'ACTIVE'
-                ORDER BY duplicate_names.normalized_name, target.id
+                ORDER BY duplicate_names.normalized_name COLLATE utf8mb4_0900_ai_ci,
+                         target.id
                 """
             )
         )
@@ -108,11 +110,18 @@ def emit_report(report: str, output: Path | None) -> None:
     try:
         # 已存在的文件不会因 open 的 mode 收紧权限，显式再设置一次。
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(report)
     except BaseException:
         os.close(descriptor)
         raise
+
+    # fdopen 成功后由文件对象独占描述符所有权；写入失败也由 with 负责关闭。
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with handle:
+        handle.write(report)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
