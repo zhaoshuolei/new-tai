@@ -579,7 +579,10 @@ async def list_due_customers(
     total = await session.scalar(total_statement)
 
     statement = (
-        grouped_statement.order_by(earliest_next_follow_up_at.asc())
+        grouped_statement.order_by(
+            earliest_next_follow_up_at.asc(),
+            Customer.id.asc(),
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -592,14 +595,13 @@ async def list_due_customers(
         overdue_count,
         earliest,
     ) in result.all():
-        assert earliest is not None
         rows.append(
             DueCustomerRow(
                 customer_id=int(customer_id),
                 customer_name=customer_name,
                 due_count=int(due_count),
                 overdue_count=int(overdue_count),
-                earliest_next_follow_up_at=earliest,
+                earliest_next_follow_up_at=cast(datetime, earliest),
             )
         )
     return rows, int(total or 0)

@@ -92,11 +92,9 @@ class Settings(BaseSettings):
     media_root: str = Field(default="media", validate_default=True)
     media_url_path: str = Field(default="/media", validate_default=True)
     system_asset_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
-    follow_up_attachment_root: str = Field(
-        default="attachments", validate_default=True
-    )
-    follow_up_attachment_max_bytes: int = 10485760
-    follow_up_attachment_max_per_record: int = 5
+    follow_up_attachment_root: str = Field(default="attachments", validate_default=True)
+    follow_up_attachment_max_bytes: int = Field(default=10485760, ge=1)
+    follow_up_attachment_max_per_record: int = Field(default=5, ge=1)
 
     @field_validator("media_root")
     @classmethod
