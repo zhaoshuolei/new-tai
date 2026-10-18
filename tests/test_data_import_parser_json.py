@@ -2,7 +2,7 @@
 
 import copy
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, ValuesView
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +29,7 @@ from app.schemas.data_import import (
     DataImportJsonRequest,
     DataImportRead,
     JsonImportRow,
+    parse_data_import_json_request,
 )
 from app.services.customer_name import customer_name_lookup_key
 from app.services.data_import_parser import (
@@ -195,6 +196,16 @@ def make_customer_index() -> dict[str, CustomerIdentity]:
     return {customer_name_lookup_key(item.name): item for item in identities}
 
 
+class CountingCustomerIndex(dict[str, CustomerIdentity]):
+    def __init__(self, values: Mapping[str, CustomerIdentity]) -> None:
+        super().__init__(values)
+        self.values_calls = 0
+
+    def values(self) -> ValuesView[CustomerIdentity]:
+        self.values_calls += 1
+        return super().values()
+
+
 def valid_json_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "business_date": "2026-10-18",
@@ -220,32 +231,85 @@ def issues_for(result: ValidatedImportRow | list[RowIssue]) -> list[RowIssue]:
     return result
 
 
-def test_json_schema_preserves_decimal_numbers_and_enforces_row_limit() -> None:
-    payload = DataImportJsonRequest.model_validate_json(
-        json.dumps(
-            {
-                "rows": [
-                    {
-                        "business_date": "2026-10-18",
-                        "upstream_customer_id": 101,
-                        "downstream_customer_id": 202,
-                        "revenue": 0.1,
-                        "cost": 2,
-                        "custom_values": {"22": 1.25},
-                    }
-                ]
-            }
-        )
+def test_api_json_parser_preserves_decimal_numbers_exactly() -> None:
+    body = (
+        b'{"rows":[{"business_date":"2026-10-18",'
+        b'"upstream_customer_id":101,"downstream_customer_id":202,'
+        b'"revenue":1234567890.12345678,'
+        b'"cost":12345678901234567.89,'
+        b'"custom_values":{"22":1.230000000000}}]}'
     )
 
-    assert payload.rows[0].revenue == Decimal("0.1")
-    assert type(payload.rows[0].revenue) is Decimal
-    assert payload.rows[0].cost == Decimal(2)
-    assert payload.rows[0].custom_values["22"] == Decimal("1.25")
-    assert type(payload.rows[0].custom_values["22"]) is Decimal
+    payload = parse_data_import_json_request(body)
+
+    row = payload.rows[0]
+    assert row.revenue.as_tuple() == Decimal("1234567890.12345678").as_tuple()
+    assert row.cost.as_tuple() == Decimal("12345678901234567.89").as_tuple()
+    custom_decimal = row.custom_values["22"]
+    assert isinstance(custom_decimal, Decimal)
+    assert custom_decimal.as_tuple() == Decimal("1.230000000000").as_tuple()
+
+
+def test_api_json_parser_preserves_exponent_and_negative_zero() -> None:
+    body = (
+        b'{"rows":[{"business_date":"2026-10-18",'
+        b'"upstream_customer_id":101,"downstream_customer_id":202,'
+        b'"revenue":-0.00000000,"cost":1e-2,"custom_values":{}}]}'
+    )
+
+    row = parse_data_import_json_request(body).rows[0]
+
+    assert row.revenue.is_zero()
+    assert row.revenue.is_signed()
+    assert row.revenue.as_tuple().exponent == -8
+    assert row.cost == Decimal("0.01")
+    assert row.cost.as_tuple().exponent == -2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revenue", 0.1),
+        ("cost", 1.25),
+    ],
+)
+def test_json_schema_rejects_actual_binary_float(field: str, value: float) -> None:
+    row = valid_json_row(**{field: value})
+
+    with pytest.raises(ValidationError):
+        JsonImportRow.model_validate(row)
+    with pytest.raises(ValidationError):
+        DataImportJsonRequest.model_validate_json(
+            json.dumps({"rows": [row]}),
+        )
+
+
+@pytest.mark.parametrize("value", [0.1, 1.0])
+def test_json_schema_rejects_binary_float_custom_value(value: float) -> None:
+    row = valid_json_row(custom_values={"22": value})
+
+    with pytest.raises(ValidationError):
+        JsonImportRow.model_validate(row)
+
+
+def test_json_schema_enforces_exact_row_limit() -> None:
     row = JsonImportRow.model_validate(valid_json_row())
+    assert len(DataImportJsonRequest(rows=[row] * 100_000).rows) == 100_000
     with pytest.raises(ValidationError):
         DataImportJsonRequest(rows=[row] * 100_001)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 101.0, "101", " 101 ", "1_01", 0, -1],
+)
+def test_json_schema_customer_ids_are_strict_positive_integers(
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        JsonImportRow.model_validate(valid_json_row(upstream_customer_id=value))
+    with pytest.raises(ValidationError):
+        JsonImportRow.model_validate(valid_json_row(downstream_customer_id=value))
 
 
 def test_json_schema_forbids_extra_row_and_root_structure() -> None:
@@ -389,6 +453,76 @@ def test_integer_rejects_out_of_range_and_non_integer_values(value: object) -> N
     ]
 
 
+@pytest.mark.parametrize("value", ["2٠", "٢٠"])
+def test_integer_rejects_unicode_digits(value: str) -> None:
+    row = valid_json_row()
+    custom_values = copy.deepcopy(row["custom_values"])
+    assert isinstance(custom_values, dict)
+    custom_values["21"] = value
+    row["custom_values"] = custom_values
+
+    issues = issues_for(
+        validate_raw_row(
+            row,
+            make_definition(),
+            make_customer_index(),
+            allowed_customer_ids=None,
+        )
+    )
+
+    assert [(issue.error_code, issue.field_id) for issue in issues] == [
+        ("invalid_integer", 21)
+    ]
+
+
+@pytest.mark.parametrize("field_id", ["2٠", "٢٠"])
+def test_custom_field_ids_require_ascii_digits(field_id: str) -> None:
+    row = valid_json_row()
+    custom_values = copy.deepcopy(row["custom_values"])
+    assert isinstance(custom_values, dict)
+    custom_values[field_id] = "value"
+    row["custom_values"] = custom_values
+
+    issues = issues_for(
+        validate_raw_row(
+            row,
+            make_definition(),
+            make_customer_index(),
+            allowed_customer_ids=None,
+        )
+    )
+
+    assert [(issue.error_code, issue.field_id) for issue in issues] == [
+        ("unknown_custom_field", None)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("revenue", "١.٢", ("invalid_decimal", 13)),
+        ("business_date", "٢٠٢٦-١٠-١٨", ("invalid_date", 10)),
+    ],
+)
+def test_numeric_and_date_syntax_require_ascii_digits(
+    field: str,
+    value: str,
+    expected: tuple[str, int],
+) -> None:
+    row = valid_json_row(**{field: value})
+
+    issues = issues_for(
+        validate_raw_row(
+            row,
+            make_definition(),
+            make_customer_index(),
+            allowed_customer_ids=None,
+        )
+    )
+
+    assert [(issue.error_code, issue.field_id) for issue in issues] == [expected]
+
+
 @pytest.mark.parametrize("value", ["true", "false", 1, 0, None, "是"])
 def test_boolean_requires_json_boolean(value: object) -> None:
     row = valid_json_row()
@@ -476,6 +610,23 @@ def test_enum_rejects_case_or_label_mismatch() -> None:
     assert [(issue.error_code, issue.field_id) for issue in issues] == [
         ("invalid_enum", 25)
     ]
+
+
+def test_missing_resolved_system_role_is_a_domain_error() -> None:
+    definition = make_definition()
+    del definition.fields_by_system_key[DataFieldRole.REVENUE]
+
+    with pytest.raises(BusinessError) as error:
+        validate_raw_row(
+            valid_json_row(),
+            definition,
+            make_customer_index(),
+            allowed_customer_ids=None,
+        )
+
+    assert error.value.code == ErrorCode.DATA_TABLE_INVALID
+    assert error.value.http_status == 422
+    assert "Revenue" not in error.value.message
 
 
 def test_required_system_and_custom_fields_are_reported_by_field() -> None:
@@ -589,6 +740,22 @@ def test_customer_ids_must_be_active_visible_and_authorized() -> None:
         assert [(issue.error_code, issue.field_id) for issue in issues] == [expected]
 
 
+def test_empty_allowed_customer_scope_is_out_of_scope_not_invalid() -> None:
+    issues = issues_for(
+        validate_raw_row(
+            valid_json_row(),
+            make_definition(),
+            make_customer_index(),
+            allowed_customer_ids=set(),
+        )
+    )
+
+    assert [(issue.error_code, issue.field_id) for issue in issues] == [
+        ("customer_out_of_scope", 11),
+        ("customer_out_of_scope", 12),
+    ]
+
+
 def test_customer_scope_allows_both_visible_customer_ids() -> None:
     result = validate_raw_row(
         valid_json_row(),
@@ -636,11 +803,26 @@ def test_issue_messages_do_not_include_raw_values_or_customer_names() -> None:
         assert secret not in rendered
 
 
-def test_json_iterator_decodes_decimal_without_float(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ("0.1", Decimal("0.1")),
+        ("12345678901234567.89", Decimal("12345678901234567.89")),
+        ("1e-2", Decimal("0.01")),
+        ("-0.00000000", Decimal("-0.00000000")),
+    ],
+)
+def test_json_iterator_decodes_decimal_without_float(
+    tmp_path: Path,
+    literal: str,
+    expected: Decimal,
+) -> None:
     row = valid_json_row()
     row["revenue"] = "__REVENUE_NUMBER__"
     path = tmp_path / "rows.json"
-    path.write_text(json.dumps({"rows": [row]}).replace('"__REVENUE_NUMBER__"', "0.1"))
+    path.write_text(
+        json.dumps({"rows": [row]}).replace('"__REVENUE_NUMBER__"', literal)
+    )
 
     parsed = list(
         iter_json_rows(
@@ -656,8 +838,53 @@ def test_json_iterator_decodes_decimal_without_float(tmp_path: Path) -> None:
     assert parsed[0].row_number == 1
     assert parsed[0].issues == ()
     assert parsed[0].row is not None
-    assert parsed[0].row.revenue == Decimal("0.1")
+    assert parsed[0].row.revenue.as_tuple() == expected.as_tuple()
     assert type(parsed[0].row.revenue) is Decimal
+
+
+def test_json_trailing_zero_scale_reaches_validation(tmp_path: Path) -> None:
+    row = valid_json_row()
+    row["revenue"] = "__REVENUE_NUMBER__"
+    path = tmp_path / "trailing-scale.json"
+    path.write_text(
+        json.dumps({"rows": [row]}).replace(
+            '"__REVENUE_NUMBER__"',
+            "1.230000000000",
+        )
+    )
+
+    parsed = list(
+        iter_json_rows(
+            path,
+            make_definition(),
+            make_customer_index(),
+            allowed_customer_ids=None,
+        )
+    )
+
+    assert parsed[0].row is None
+    assert [(issue.error_code, issue.field_id) for issue in parsed[0].issues] == [
+        ("too_many_decimal_places", 13)
+    ]
+
+
+def test_json_iteration_builds_customer_id_index_once(tmp_path: Path) -> None:
+    customer_index = CountingCustomerIndex(make_customer_index())
+    path = tmp_path / "two-rows.json"
+    path.write_text(json.dumps({"rows": [valid_json_row(), valid_json_row()]}))
+
+    parsed = list(
+        iter_json_rows(
+            path,
+            make_definition(),
+            customer_index,
+            allowed_customer_ids=None,
+        )
+    )
+
+    assert len(parsed) == 2
+    assert all(item.issues == () for item in parsed)
+    assert customer_index.values_calls == 1
 
 
 def test_json_iterator_returns_row_scoped_issues(tmp_path: Path) -> None:
@@ -758,10 +985,66 @@ def test_json_root_must_be_one_object_with_rows_list(
         assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
 
 
-def test_json_row_count_enforces_maximum(tmp_path: Path) -> None:
+def test_json_duplicate_root_key_is_invalid_without_leaking_input(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicate-root.json"
+    path.write_text('{"rows":[],"rows":[{"raw_secret":"RAW-ROOT-DUPLICATE-SECRET"}]}')
+
+    with pytest.raises(BusinessError) as error:
+        json_import_row_count(path)
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert error.value.http_status == 422
+    assert "RAW-ROOT-DUPLICATE-SECRET" not in error.value.message
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_json_nonstandard_nonfinite_constants_are_invalid(
+    constant: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nonfinite.json"
+    path.write_text('{"rows":[{"revenue":' + constant + "}]}")
+
+    with pytest.raises(BusinessError) as error:
+        json_import_row_count(path)
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert error.value.http_status == 422
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"rows":[' + "9" * 4_301 + "]}",
+        '{"rows":' + "[" * 100_000 + "0" + "]" * 100_000 + "}",
+        '{"rows":[{"revenue":1e' + "9" * 30 + "}]}",
+    ],
+    ids=["4301-digit-int", "deep-nesting", "extreme-exponent"],
+)
+def test_json_decoder_errors_become_invalid_import(
+    content: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "decoder-limit.json"
+    path.write_text(content)
+
+    with pytest.raises(BusinessError) as error:
+        json_import_row_count(path)
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert error.value.http_status == 422
+
+
+def test_json_row_count_enforces_exact_maximum(tmp_path: Path) -> None:
     one_row = tmp_path / "one.json"
     one_row.write_text(json.dumps({"rows": [valid_json_row()]}))
     assert json_import_row_count(one_row) == 1
+
+    max_rows = tmp_path / "max.json"
+    max_rows.write_text('{"rows":[' + ",".join("{}" for _ in range(100_000)) + "]}")
+    assert json_import_row_count(max_rows) == 100_000
 
     too_many = tmp_path / "too-many.json"
     too_many.write_text('{"rows":[' + ",".join("{}" for _ in range(100_001)) + "]}")

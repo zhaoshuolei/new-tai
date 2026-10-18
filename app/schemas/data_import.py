@@ -1,11 +1,65 @@
 """Data import request and response schemas."""
 
-from datetime import UTC, date, datetime
-from decimal import Decimal
+from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+import json
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
+from typing import Annotated, Never
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
 
 from app.models.data_management import DataImportSource, DataImportStatus
+
+
+def _reject_binary_float(value: object) -> object:
+    if isinstance(value, float):
+        raise ValueError("JSON decimals must not pass through binary float")
+    return value
+
+
+def _exact_decimal_input(value: object) -> object:
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise ValueError("Decimal value must be a string, integer, or Decimal")
+    return value
+
+
+JsonDecimal = Annotated[Decimal, BeforeValidator(_exact_decimal_input)]
+JsonCustomValue = Annotated[
+    str | int | JsonDecimal | bool | None,
+    BeforeValidator(_reject_binary_float),
+]
+StrictCustomerId = Annotated[int, Field(strict=True, gt=0)]
+
+
+def _reject_json_constant(constant: str) -> Never:
+    raise ValueError(f"Non-standard JSON constant: {constant}")
+
+
+def parse_data_import_json_request(content: bytes) -> DataImportJsonRequest:
+    """Parse raw API JSON without allowing decimal numbers through binary float.
+
+    Task 10 MUST call this with the original request bytes instead of binding
+    DataImportJsonRequest directly as a FastAPI body. FastAPI's default JSON
+    decoder creates ``float`` values before Pydantic can preserve their decimal
+    representation. The original bytes must also be persisted unchanged; never
+    persist ``model_dump()`` or ``model_dump_json()`` output from this parsed
+    request.
+    """
+    try:
+        decoded = json.loads(
+            content.decode("utf-8"),
+            parse_float=Decimal,
+            parse_constant=_reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        InvalidOperation,
+        RecursionError,
+    ) as error:
+        raise ValueError("Data import JSON must be valid UTF-8 JSON") from error
+    return DataImportJsonRequest.model_validate(decoded)
 
 
 def _serialize_utc(value: datetime | None) -> str | None:
@@ -21,13 +75,11 @@ class JsonImportRow(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     business_date: date
-    upstream_customer_id: int
-    downstream_customer_id: int
-    revenue: Decimal
-    cost: Decimal
-    custom_values: dict[str, str | int | Decimal | bool | None] = Field(
-        default_factory=dict
-    )
+    upstream_customer_id: StrictCustomerId
+    downstream_customer_id: StrictCustomerId
+    revenue: JsonDecimal
+    cost: JsonDecimal
+    custom_values: dict[str, JsonCustomValue] = Field(default_factory=dict)
 
 
 class DataImportJsonRequest(BaseModel):
@@ -103,4 +155,5 @@ __all__: tuple[str, ...] = (
     "DataImportJsonRequest",
     "DataImportRead",
     "JsonImportRow",
+    "parse_data_import_json_request",
 )

@@ -34,10 +34,12 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 _MAX_DECIMAL_INTEGER_DIGITS = 22
 _MAX_DECIMAL_PLACES = 8
-_ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_INTEGER_PATTERN = re.compile(r"^-?\d+$")
-_DECIMAL_PATTERN = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
-_FIELD_ID_PATTERN = re.compile(r"^[1-9]\d{0,18}$")
+_ISO_DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_INTEGER_PATTERN = re.compile(r"^-?[0-9]+$")
+_DECIMAL_PATTERN = re.compile(
+    r"^-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
+_FIELD_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,18}$")
 
 _FIXED_JSON_KEYS: dict[DataFieldRole, str] = {
     DataFieldRole.BUSINESS_DATE: "business_date",
@@ -202,15 +204,27 @@ def _invalid_json() -> BusinessError:
     )
 
 
+def _reject_json_constant(constant: str) -> object:
+    raise ValueError(f"Non-standard JSON constant: {constant}")
+
+
 def _load_json(path: Path) -> object:
     try:
         with path.open(encoding="utf-8") as source:
             value = json.load(
                 source,
                 parse_float=Decimal,
+                parse_constant=_reject_json_constant,
                 object_pairs_hook=_JsonObject,
             )
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        OSError,
+        RecursionError,
+        ValueError,
+        InvalidOperation,
+    ) as error:
         raise _invalid_json() from error
     return cast(object, value)
 
@@ -241,6 +255,7 @@ def iter_json_rows(
     allowed_customer_ids: set[int] | None,
 ) -> Iterator[ParsedImportRow]:
     """Yield one validated or issue-carrying result per JSON row."""
+    customers_by_id = _customer_index_by_id(customer_index)
     for row_number, raw in enumerate(_load_json_rows(path), start=1):
         if not isinstance(raw, Mapping):
             yield ParsedImportRow(
@@ -250,10 +265,10 @@ def iter_json_rows(
             continue
 
         duplicate_issues = _duplicate_issue_rows(raw, definition, row_number)
-        validation = validate_raw_row(
+        validation = _validate_raw_row(
             raw,
             definition,
-            customer_index,
+            customers_by_id,
             allowed_customer_ids,
         )
         if isinstance(validation, ValidatedImportRow) and not duplicate_issues:
@@ -300,6 +315,12 @@ async def load_customer_name_index(
     }
 
 
+def _customer_index_by_id(
+    customer_index: Mapping[str, CustomerIdentity],
+) -> dict[int, CustomerIdentity]:
+    return {identity.id: identity for identity in customer_index.values()}
+
+
 def validate_raw_row(
     raw: Mapping[str, object],
     definition: ResolvedDataDefinition,
@@ -307,8 +328,22 @@ def validate_raw_row(
     allowed_customer_ids: set[int] | None,
 ) -> ValidatedImportRow | list[RowIssue]:
     """Validate one transport-neutral row against a resolved definition."""
+    return _validate_raw_row(
+        raw,
+        definition,
+        _customer_index_by_id(customer_index),
+        allowed_customer_ids,
+    )
+
+
+def _validate_raw_row(
+    raw: Mapping[str, object],
+    definition: ResolvedDataDefinition,
+    customers_by_id: Mapping[int, CustomerIdentity],
+    allowed_customer_ids: set[int] | None,
+) -> ValidatedImportRow | list[RowIssue]:
+    """Validate a row against an already-built customer-ID index."""
     issues: list[RowIssue] = []
-    customers_by_id = {identity.id: identity for identity in customer_index.values()}
     system_values: dict[DataFieldRole, object] = {}
 
     for role, raw_key in _FIXED_JSON_KEYS.items():
@@ -391,7 +426,11 @@ def _required_system_field(
 ) -> DataFieldDefinition:
     field = definition.field_for(role)
     if field is None:
-        raise RuntimeError(f"Resolved data definition is missing {role.value}")
+        raise BusinessError(
+            ErrorCode.DATA_TABLE_INVALID,
+            "Resolved data definition is invalid",
+            http_status=422,
+        )
     return field
 
 
