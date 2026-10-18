@@ -50,14 +50,9 @@ async def create_data_table(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         payload,
-        context=context,
-    )
-    definition = await data_table_service.get_table(
-        session,
-        table.id,
         context=context,
     )
     return success(
@@ -95,15 +90,10 @@ async def replace_data_table(
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    await data_table_service.replace_table(
+    definition = await data_table_service.replace_table(
         session,
         table_id,
         payload,
-        context=context,
-    )
-    definition = await data_table_service.get_table(
-        session,
-        table_id,
         context=context,
     )
     return success(DataTableDefinitionRead.from_resolved(definition))

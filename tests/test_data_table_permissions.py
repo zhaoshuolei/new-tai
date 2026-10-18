@@ -24,8 +24,8 @@ from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
 from app.models.audit_log import AuditLog
-from app.models.data_management import DataTableDefinition
 from app.models.user import User
+from app.repositories.data_table import ResolvedDataDefinition
 from app.schemas.data_table import DataTableCreate
 from app.services import audit as audit_service
 from app.services import data_table as data_table_service
@@ -163,7 +163,7 @@ async def _create_table(
     caller: User,
     *,
     name: str | None = None,
-) -> DataTableDefinition:
+) -> ResolvedDataDefinition:
     context = make_context(caller, permission_codes=_ALL_DATA_PERMISSIONS)
     return await data_table_service.create_table(
         session,

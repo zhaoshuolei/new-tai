@@ -107,6 +107,11 @@ class ResolvedDataDefinition:
     )
 
     @property
+    def id(self) -> int:
+        """Expose the table ID to service audit decorators."""
+        return self.table.id
+
+    @property
     def labels(self) -> tuple[str, ...]:
         """按展示顺序返回全部字段标签，用于 Excel 表头与模板。"""
         return tuple(item.label for item in self.fields)

@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
-from app.models.audit_log import AuditLog
+from app.models.audit_log import AuditLog, AuditResult
 from app.models.data_management import (
     DataCurrentSnapshot,
     DataEnumOption,
@@ -385,17 +385,16 @@ async def test_create_table_persists_five_fixed_required_fields(
     session: AsyncSession,
     context: AuthContext,
 ) -> None:
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(),
         context=context,
     )
 
-    assert isinstance(table, DataTableDefinition)
-    assert table.status == DataTableStatus.DRAFT
-    assert table.created_by == context.user_id
-    assert table.locked_at is None
-    definition = await resolved(session, table.id)
+    assert isinstance(definition, ResolvedDataDefinition)
+    assert definition.table.status == DataTableStatus.DRAFT
+    assert definition.table.created_by == context.user_id
+    assert definition.table.locked_at is None
     assert len(definition.fields_by_system_key) == 5
     expected_types = {
         DataFieldRole.BUSINESS_DATE: DataFieldType.DATE,
@@ -437,15 +436,14 @@ async def test_definition_inputs_are_trimmed(
         ],
     )
 
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         payload,
         context=context,
     )
 
-    definition = await resolved(session, table.id)
-    assert table.name == "季度明细"
-    assert table.description == "按季度汇总"
+    assert definition.table.name == "季度明细"
+    assert definition.table.description == "按季度汇总"
     assert definition.labels == (
         "业务日期",
         "上游客户",
@@ -460,13 +458,13 @@ async def test_blank_description_becomes_null(
     session: AsyncSession,
     context: AuthContext,
 ) -> None:
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(description="   "),
         context=context,
     )
 
-    assert table.description is None
+    assert definition.table.description is None
 
 
 @pytest.mark.parametrize(
@@ -565,13 +563,12 @@ async def test_fixed_fields_are_always_required_regardless_of_input(
         field.model_copy(update={"required": False}) for field in fixed_field_inputs()
     ]
 
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(fields=fields),
         context=context,
     )
 
-    definition = await resolved(session, table.id)
     assert all(field.required is True for field in definition.fields)
     assert len(definition.fields_by_system_key) == 5
 
@@ -599,7 +596,7 @@ async def test_custom_required_flag_is_honored(
     session: AsyncSession,
     context: AuthContext,
 ) -> None:
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(
             fields=[
@@ -611,7 +608,6 @@ async def test_custom_required_flag_is_honored(
         context=context,
     )
 
-    definition = await resolved(session, table.id)
     required_by_label = {
         field.label: field.required for field in definition.custom_fields
     }
@@ -701,7 +697,7 @@ async def test_enum_options_are_persisted_in_sort_order(
     session: AsyncSession,
     context: AuthContext,
 ) -> None:
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(
             fields=[
@@ -718,7 +714,6 @@ async def test_enum_options_are_persisted_in_sort_order(
         context=context,
     )
 
-    definition = await resolved(session, table.id)
     enum_field_row = definition.custom_fields[0]
     options = definition.options_for(enum_field_row.id)
     assert [option.label for option in options] == ["付费流量", "自然流量"]
@@ -798,7 +793,7 @@ async def test_enum_field_allows_exactly_one_thousand_options(
         for index in range(1000)
     ]
 
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(
             fields=[*fixed_field_inputs(), enum_field("渠道", options=options)],
@@ -806,7 +801,6 @@ async def test_enum_field_allows_exactly_one_thousand_options(
         context=context,
     )
 
-    definition = await resolved(session, table.id)
     assert len(definition.options_for(definition.custom_fields[0].id)) == 1000
 
 
@@ -857,13 +851,12 @@ async def test_one_hundred_custom_fields_are_allowed(
         ),
     ]
 
-    table = await data_table_service.create_table(
+    definition = await data_table_service.create_table(
         session,
         make_table_payload(fields=fields),
         context=context,
     )
 
-    definition = await resolved(session, table.id)
     assert len(definition.custom_fields) == 100
 
 
@@ -1039,7 +1032,11 @@ async def test_replace_fully_recreates_draft_definition(
     )
 
     after = await resolved(session, table.id)
+    assert isinstance(replaced, ResolvedDataDefinition)
     assert replaced.id == table.id
+    assert replaced.table.name == "替换后的名称"
+    assert replaced.table.description == "替换后的描述"
+    assert replaced.table.status == DataTableStatus.DRAFT
     assert after.table.name == "替换后的名称"
     assert after.table.description == "替换后的描述"
     assert after.table.status == DataTableStatus.DRAFT
@@ -1065,8 +1062,8 @@ async def test_locked_table_rejects_any_definition_change(
         make_table_payload(),
         context=context,
     )
-    table.status = DataTableStatus.LOCKED
-    table.locked_at = datetime.now(UTC)
+    table.table.status = DataTableStatus.LOCKED
+    table.table.locked_at = datetime.now(UTC)
     await session.flush()
 
     with pytest.raises(BusinessError) as exc:
@@ -1090,8 +1087,8 @@ async def test_locked_table_cannot_be_deleted(
         make_table_payload(),
         context=context,
     )
-    table.status = DataTableStatus.LOCKED
-    table.locked_at = datetime.now(UTC)
+    table.table.status = DataTableStatus.LOCKED
+    table.table.locked_at = datetime.now(UTC)
     await session.flush()
 
     with pytest.raises(BusinessError) as exc:
@@ -1125,7 +1122,7 @@ async def test_unfinished_import_blocks_definition_change(
     )
     await add_import(
         session,
-        table,
+        table.table,
         status=status,
         owner_id=context.user_id,
     )
@@ -1161,7 +1158,7 @@ async def test_failed_import_does_not_block_definition_change(
     )
     await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
@@ -1173,7 +1170,7 @@ async def test_failed_import_does_not_block_definition_change(
         context=context,
     )
 
-    assert replaced.name == "终态后改名"
+    assert replaced.table.name == "终态后改名"
 
 
 async def test_successful_import_on_draft_table_blocks_mutation(
@@ -1192,7 +1189,7 @@ async def test_successful_import_on_draft_table_blocks_mutation(
     )
     job = await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.SUCCEEDED,
         owner_id=context.user_id,
     )
@@ -1254,7 +1251,7 @@ async def test_successful_snapshot_history_survives_replace_and_delete_attempts(
     option = definition.options_for(enum_row.id)[0]
     job = await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
@@ -1338,7 +1335,7 @@ async def test_replace_keeps_failed_import_diagnostics_but_clears_field_ids(
     custom = definition.custom_fields[0]
     job = await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
@@ -1394,7 +1391,7 @@ async def test_delete_physically_removes_draft_table_and_history(
     option = definition.options_for(enum_row.id)[0]
     job = await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
@@ -1485,7 +1482,7 @@ async def test_delete_removes_current_snapshot_pointers(
     )
     job = await add_import(
         session,
-        table,
+        table.table,
         status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
@@ -1806,6 +1803,11 @@ async def test_create_writes_success_audit_entry(
         table_id,
         table_id,
     ]
+    assert [entry["result"] for entry in recorded] == [
+        AuditResult.SUCCESS,
+        AuditResult.SUCCESS,
+        AuditResult.SUCCESS,
+    ]
     assert all(
         entry["actor"] is not None and entry["actor"].user_id == context.user_id
         for entry in recorded
@@ -1882,7 +1884,7 @@ async def test_create_accepts_data_table_create_payload(
     )
 
     assert table.id > 0
-    assert table.description is None
+    assert table.table.description is None
 
 
 async def test_replace_accepts_data_table_create_payload(
@@ -1908,7 +1910,7 @@ async def test_replace_accepts_data_table_create_payload(
         context=context,
     )
 
-    assert replaced.name == payload.name
+    assert replaced.table.name == payload.name
 
 
 async def test_replace_accepts_data_table_replace_payload(
@@ -1933,4 +1935,4 @@ async def test_replace_accepts_data_table_replace_payload(
         context=context,
     )
 
-    assert replaced.name == payload.name
+    assert replaced.table.name == payload.name

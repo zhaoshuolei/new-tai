@@ -289,6 +289,20 @@ async def _require_writable_table(
     return table
 
 
+async def _load_written_definition(
+    session: AsyncSession,
+    table_id: int,
+) -> ResolvedDataDefinition:
+    """Resolve a just-flushed write inside its still-open transaction."""
+    definition = await data_table_repository.load_resolved_definition(
+        session,
+        table_id,
+    )
+    if definition is None:
+        raise RuntimeError(f"Written data table {table_id} could not be resolved")
+    return definition
+
+
 @audited(
     action="data_table:create",
     resource_type="custom_data_table",
@@ -299,8 +313,8 @@ async def create_table(
     payload: DataTableCreate,
     *,
     context: AuthContext,
-) -> DataTableDefinition:
-    """创建完整 DRAFT 定义并提交。"""
+) -> ResolvedDataDefinition:
+    """创建完整 DRAFT 定义，提交并返回事务内解析结果。"""
     name = _normalize_name(payload.name)
     description = _normalize_description(payload.description)
     fields = build_field_specs(payload)
@@ -311,8 +325,9 @@ async def create_table(
         fields=fields,
         created_by=context.user_id,
     )
+    definition = await _load_written_definition(session, table.id)
     await session.commit()
-    return table
+    return definition
 
 
 async def get_table(
@@ -351,8 +366,8 @@ async def replace_table(
     payload: DataTableCreate,
     *,
     context: AuthContext,
-) -> DataTableDefinition:
-    """整体替换 DRAFT 表定义并提交；字段 ID 可能变化。"""
+) -> ResolvedDataDefinition:
+    """整体替换 DRAFT 表定义，提交并返回事务内解析结果。"""
     table = await _require_writable_table(session, table_id)
     name = _normalize_name(payload.name)
     description = _normalize_description(payload.description)
@@ -365,8 +380,9 @@ async def replace_table(
         fields=fields,
         updated_by=context.user_id,
     )
+    definition = await _load_written_definition(session, replaced.id)
     await session.commit()
-    return replaced
+    return definition
 
 
 @audited(

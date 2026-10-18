@@ -8,7 +8,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -22,9 +22,10 @@ from app.core.errors import ErrorCode
 from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import create_app
-from app.models.audit_log import AuditLog
+from app.models.audit_log import AuditLog, AuditResult
 from app.models.user import User
 from app.services import audit as audit_service
+from app.services import data_table as data_table_service
 from tests.conftest import FakeRedis
 from tests.customer_helpers import TEST_DATABASE_URL, make_context, make_user
 
@@ -200,7 +201,13 @@ async def create_definition(
 async def test_create_definition_returns_complete_envelope(
     session: AsyncSession,
     caller: User,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    async def unexpected_get_table(*args: object, **kwargs: object) -> None:
+        raise AssertionError("create must serialize the service write result")
+
+    monkeypatch.setattr(data_table_service, "get_table", unexpected_get_table)
+
     async with api_client(session, _context(caller)) as client:
         response = await client.post(
             "/api/v1/data-tables",
@@ -265,9 +272,15 @@ async def test_list_and_detail_return_resolved_definitions(
 async def test_replace_definition_returns_replaced_fields(
     session: AsyncSession,
     caller: User,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with api_client(session, _context(caller)) as client:
         created = await create_definition(client)
+
+        async def unexpected_get_table(*args: object, **kwargs: object) -> None:
+            raise AssertionError("replace must serialize the service write result")
+
+        monkeypatch.setattr(data_table_service, "get_table", unexpected_get_table)
         response = await client.put(
             f"/api/v1/data-tables/{created['id']}",
             json=make_table_payload(
@@ -286,6 +299,48 @@ async def test_replace_definition_returns_replaced_fields(
     assert data["fields"][-1]["label"] == "备注"
     assert data["fields"][-1]["field_type"] == "TEXT"
     assert data["fields"][-1]["options"] == []
+
+
+async def test_pre_service_permission_denial_writes_one_denied_audit_row(
+    session: AsyncSession,
+    caller: User,
+    audit_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with api_client(session, _context(caller)) as client:
+        created = await create_definition(client)
+
+    async with audit_session_factory() as cleanup_session:
+        await cleanup_session.execute(
+            delete(AuditLog).where(AuditLog.action.in_(_AUDIT_ACTIONS))
+        )
+        await cleanup_session.commit()
+
+    denied_context = make_context(caller)
+    async with api_client(session, denied_context) as client:
+        response = await client.put(
+            f"/api/v1/data-tables/{created['id']}",
+            json=make_table_payload(name="无权替换"),
+        )
+
+    assert response.status_code == 403, response.text
+    async with audit_session_factory() as audit_session:
+        rows = list(
+            (
+                await audit_session.scalars(
+                    select(AuditLog)
+                    .where(AuditLog.action == "data_table:update")
+                    .order_by(AuditLog.id)
+                )
+            ).all()
+        )
+
+    assert len(rows) == 1
+    assert rows[0].result is AuditResult.DENIED
+    assert rows[0].action == "data_table:update"
+    assert rows[0].resource_type == "custom_data_table"
+    assert rows[0].resource_id == created["id"]
+    assert rows[0].reason == "FORBIDDEN"
+    assert rows[0].user_id == caller.id
 
 
 async def test_delete_definition_returns_null_and_detail_becomes_not_found(
@@ -343,7 +398,10 @@ def test_definition_routes_are_registered_for_audit() -> None:
 
 
 def test_definition_routes_use_data_management_openapi_tag() -> None:
-    paths = create_app().openapi()["paths"]
+    document = create_app().openapi()
+    paths = document["paths"]
+    data_tag = next(tag for tag in document["tags"] if tag["name"] == "数据管理")
+    assert data_tag["description"] == "自定义数据表定义管理"
     expected = [
         ("get", "/api/v1/data-tables"),
         ("post", "/api/v1/data-tables"),
