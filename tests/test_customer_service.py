@@ -864,6 +864,70 @@ async def test_update_visible_customer_changes_fields(session: AsyncSession) -> 
     assert updated.remark == "备注"
 
 
+async def test_create_duplicate_active_name_is_rejected(
+    session: AsyncSession,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    await create_customer(session, CustomerCreate(name="名称重复客户"), context=context)
+
+    with pytest.raises(BusinessError) as exc:
+        await create_customer(
+            session,
+            CustomerCreate(name=" 名称重复客户 "),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
+    assert exc.value.http_status == 409
+
+
+async def test_import_duplicate_active_name_is_rejected(
+    session: AsyncSession,
+    fake_client: FakeTianyanchaClient,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    fake_client.registration = replace(fake_client.registration, name="同名回填客户")
+    await import_from_tianyancha(
+        session,
+        fake_client.registration.credit_code,
+        None,
+        context=context,
+    )
+    fake_client.calls.clear()
+
+    other_code = "91110000000000003X"
+    fake_client.registration_credit_code = other_code
+    with pytest.raises(BusinessError) as exc:
+        await import_from_tianyancha(session, other_code, None, context=context)
+
+    assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
+    assert exc.value.http_status == 409
+    # 名称冲突在拉取变更历史前就应拒绝，不再多打一次上游接口。
+    assert fake_client.calls == ["registration"]
+
+
+async def test_update_duplicate_active_name_is_rejected(
+    session: AsyncSession,
+) -> None:
+    caller = await make_user(session)
+    context = make_context(caller)
+    await create_customer(session, CustomerCreate(name="更新目标名称"), context=context)
+    customer = await make_customer_row(session, owner=caller)
+
+    with pytest.raises(BusinessError) as exc:
+        await update_customer(
+            session,
+            customer.id,
+            CustomerUpdate(name="更新目标名称"),
+            context=context,
+        )
+
+    assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
+    assert exc.value.http_status == 409
+
+
 async def test_update_complete_business_scope_clears_truncated_flag(
     session: AsyncSession,
 ) -> None:

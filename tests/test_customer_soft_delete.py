@@ -95,6 +95,35 @@ async def test_restore_active_customer_returns_7012(session: AsyncSession) -> No
     assert exc.value.code == ErrorCode.RECORD_NOT_DELETED
 
 
+async def test_restore_conflicts_when_active_customer_reuses_name(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    deleted = await make_customer_row(session, owner=owner, name="恢复重名客户")
+    await delete_customer(session, deleted.id, context=ctx)
+    active = await make_customer_row(session, owner=owner, name=" 恢复重名客户 ")
+
+    with pytest.raises(BusinessError) as exc:
+        await restore_customer(session, deleted.id, context=ctx)
+    assert exc.value.code == ErrorCode.CUSTOMER_NAME_EXISTS
+    assert exc.value.http_status == 409
+    assert active.active_name == "恢复重名客户"
+
+
+async def test_delete_releases_name_for_new_customer(session: AsyncSession) -> None:
+    owner = await make_user(session)
+    ctx = make_context(owner)
+    first = await make_customer_row(session, owner=owner, name="释放名称客户")
+    await delete_customer(session, first.id, context=ctx)
+
+    replacement = await make_customer_row(session, owner=owner, name="释放名称客户")
+    await session.refresh(replacement)
+
+    assert replacement.id != first.id
+    assert replacement.active_name == "释放名称客户"
+
+
 async def test_restore_conflicts_when_active_customer_reuses_code(
     session: AsyncSession,
 ) -> None:

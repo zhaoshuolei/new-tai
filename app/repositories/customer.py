@@ -34,6 +34,28 @@ async def get_by_credit_code(
     return await session.scalar(statement)
 
 
+async def get_active_by_name(
+    session: AsyncSession,
+    name: str,
+    *,
+    for_update: bool = False,
+) -> Customer | None:
+    """按去首尾空白的名称查未删除客户。
+
+    名称比较沿用列的 ``utf8mb4_0900_ai_ci`` 排序规则，因此大小写与重音差异
+    视为同名。``for_update=True`` 用于唯一键冲突后的复核：MySQL REPEATABLE
+    READ 下普通 SELECT 会固定事务快照，并发事务刚提交的冲突行不可见；当前读
+    才能看到它（与 ``get_by_credit_code`` 一致）。
+    """
+    statement = select(Customer).where(
+        func.trim(Customer.name) == name,
+        Customer.status == ContactStatus.ACTIVE,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return await session.scalar(statement)
+
+
 async def get_by_credit_code_any_status(
     session: AsyncSession,
     credit_code: str,
@@ -155,6 +177,7 @@ async def credit_codes_existing(
 __all__: tuple[str, ...] = (
     "add",
     "credit_codes_existing",
+    "get_active_by_name",
     "get_by_credit_code",
     "get_by_credit_code_any_status",
     "get_by_id",

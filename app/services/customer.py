@@ -20,6 +20,7 @@ from app.repositories import customer as customer_repository
 from app.repositories import user as user_repository
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.services.audit import audited
+from app.services.customer_name import normalize_customer_name
 from app.services.customer_scope_text import (
     TRUNCATION_MARKERS,
     resolve_full_business_scope,
@@ -87,6 +88,14 @@ def _deleted_credit_code_error() -> BusinessError:
     return BusinessError(
         ErrorCode.CUSTOMER_DELETED_CREDIT_CODE_EXISTS,
         "Unified social credit code belongs to a deleted customer",
+        http_status=409,
+    )
+
+
+def _name_exists_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.CUSTOMER_NAME_EXISTS,
+        "Customer name already exists",
         http_status=409,
     )
 
@@ -228,6 +237,7 @@ async def _insert_customer(
     session: AsyncSession,
     customer: Customer,
     *,
+    name: str,
     credit_code: str | None,
     context: AuthContext,
 ) -> None:
@@ -244,6 +254,13 @@ async def _insert_customer(
             if existing is not None:
                 duplicate = await _duplicate_error(session, existing, context)
                 raise duplicate from error
+        existing_name = await customer_repository.get_active_by_name(
+            session,
+            name,
+            for_update=True,
+        )
+        if existing_name is not None:
+            raise _name_exists_error() from error
         raise
 
 
@@ -338,6 +355,12 @@ async def import_from_tianyancha(
             http_status=502,
         )
 
+    # 名称查重放在可能触发额外上游调用（变更历史）之前，冲突时不再多打一次接口。
+    name = normalize_customer_name(registration.name)
+    existing_name = await customer_repository.get_active_by_name(session, name)
+    if existing_name is not None:
+        raise _name_exists_error()
+
     if _needs_history(registration.business_scope):
         historical_text = await client.fetch_historical_registration_text(code)
         records = parse_change_scope_records(historical_text)
@@ -349,7 +372,7 @@ async def import_from_tianyancha(
     )
 
     customer = Customer(
-        name=registration.name,
+        name=name,
         short_name=_clean_optional(short_name),
         credit_code=code,
         legal_person=registration.legal_person,
@@ -367,6 +390,7 @@ async def import_from_tianyancha(
     await _insert_customer(
         session,
         customer,
+        name=name,
         credit_code=code,
         context=context,
     )
@@ -386,9 +410,7 @@ async def create_customer(
     *,
     context: AuthContext,
 ) -> Customer:
-    name = payload.name.strip()
-    if not name:
-        raise _invalid_field_error("Customer name is required")
+    name = normalize_customer_name(payload.name)
 
     code = _normalize_optional_credit_code(payload.credit_code)
     if code is not None:
@@ -398,6 +420,10 @@ async def create_customer(
         if existing is not None:
             duplicate = await _credit_code_conflict_error(session, existing, context)
             raise duplicate
+
+    existing_name = await customer_repository.get_active_by_name(session, name)
+    if existing_name is not None:
+        raise _name_exists_error()
 
     business_scope = _clean_optional(payload.business_scope)
     customer = Customer(
@@ -419,6 +445,7 @@ async def create_customer(
     await _insert_customer(
         session,
         customer,
+        name=name,
         credit_code=code,
         context=context,
     )
@@ -450,11 +477,14 @@ async def update_customer(
     customer = await _require_scoped_customer(session, customer_id, context)
     changes = payload.model_dump(exclude_unset=True)
 
+    updated_name: str | None = None
     if "name" in changes:
-        name = (changes["name"] or "").strip()
-        if not name:
-            raise _invalid_field_error("Customer name is required")
+        name = normalize_customer_name(changes["name"] or "")
         changes["name"] = name
+        existing_name = await customer_repository.get_active_by_name(session, name)
+        if existing_name is not None and existing_name.id != customer.id:
+            raise _name_exists_error()
+        updated_name = name
 
     updated_credit_code: str | None = None
     if "credit_code" in changes:
@@ -478,25 +508,35 @@ async def update_customer(
     if "business_scope" in changes:
         changes["business_scope_truncated"] = _needs_history(changes["business_scope"])
 
-    if updated_credit_code is not None:
+    if updated_credit_code is not None or updated_name is not None:
         # 主动查重与写入之间可能有并发提交；用 SAVEPOINT 把唯一约束冲突
-        # 转为 7002，避免裸 IntegrityError 冒泡为 500（与 _insert_customer 对齐）。
-        # 赋值与 flush 同在 SAVEPOINT 内，回滚后对象恢复旧值，不会在随后的
-        # 冲突查重中再次 autoflush 触发同一异常。
+        # 转为 7002/7022，避免裸 IntegrityError 冒泡为 500（与 _insert_customer
+        # 对齐）。赋值与 flush 同在 SAVEPOINT 内，回滚后对象恢复旧值，不会在
+        # 随后的冲突查重中再次 autoflush 触发同一异常。
         try:
             async with session.begin_nested():
                 for field_name, value in changes.items():
                     setattr(customer, field_name, value)
                 await session.flush()
         except IntegrityError as error:
-            conflicting = await customer_repository.get_by_credit_code(
-                session,
-                updated_credit_code,
-                for_update=True,
-            )
-            if conflicting is not None:
-                duplicate = await _duplicate_error(session, conflicting, context)
-                raise duplicate from error
+            if updated_credit_code is not None:
+                conflicting = await customer_repository.get_by_credit_code(
+                    session,
+                    updated_credit_code,
+                    for_update=True,
+                )
+                if conflicting is not None:
+                    duplicate = await _duplicate_error(session, conflicting, context)
+                    raise duplicate from error
+            if updated_name is not None:
+                conflicting_name = await customer_repository.get_active_by_name(
+                    session,
+                    updated_name,
+                    for_update=True,
+                )
+                # 保存点回滚已使对象过期，用入参 ID 比较，避免异步懒加载。
+                if conflicting_name is not None and conflicting_name.id != customer_id:
+                    raise _name_exists_error() from error
             raise
     else:
         for field_name, value in changes.items():
@@ -562,9 +602,17 @@ async def restore_customer(
             duplicate = await _duplicate_error(session, existing, context)
             raise duplicate
 
+    # 恢复会把行重新计入活跃名称；与同名活跃客户冲突时拒绝。
+    name = normalize_customer_name(customer.name)
+    existing_name = await customer_repository.get_active_by_name(session, name)
+    if existing_name is not None and existing_name.id != customer.id:
+        raise _name_exists_error()
+
     credit_code = customer.credit_code
     try:
         async with session.begin_nested():
+            # 与创建/更新路径一致：恢复时同样落库去空白后的名称。
+            customer.name = name
             await customer_repository.restore(session, customer)
             await session.flush()
     except IntegrityError as error:
@@ -577,6 +625,14 @@ async def restore_customer(
             if conflicting is not None:
                 duplicate = await _duplicate_error(session, conflicting, context)
                 raise duplicate from error
+        conflicting_name = await customer_repository.get_active_by_name(
+            session,
+            name,
+            for_update=True,
+        )
+        # 保存点回滚已使对象过期，用入参 ID 比较，避免异步懒加载。
+        if conflicting_name is not None and conflicting_name.id != customer_id:
+            raise _name_exists_error() from error
         raise
     await session.refresh(customer)
     await session.commit()

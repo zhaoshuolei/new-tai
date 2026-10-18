@@ -27,11 +27,23 @@ class CustomerSource(StrEnum):
 
 
 class Customer(Base):
-    """客户档案。未删除客户的信用代码全局唯一（见 active_credit_code）。"""
+    """客户档案。未删除客户的信用代码与名称全局唯一。
+
+    见 active_credit_code 与 active_name 两个生成列。
+    """
 
     __tablename__ = "customer"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    active_name: Mapped[str | None] = mapped_column(
+        String(255),
+        Computed(
+            "CASE WHEN status = 'ACTIVE' THEN TRIM(name) END",
+            persisted=True,
+        ),
+        index=True,
+        unique=True,
+    )
     short_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     credit_code: Mapped[str | None] = mapped_column(
         String(18),
