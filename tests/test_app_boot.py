@@ -64,9 +64,11 @@ def test_openapi_declares_business_domain_tags() -> None:
         "角色",
         "菜单",
         "部门",
+        "通讯录",
         "客户",
         "集成",
         "系统设置",
+        "个人资料",
         "健康",
     }
 

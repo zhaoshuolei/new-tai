@@ -318,7 +318,7 @@ async def test_admin_edited_nickname_is_not_overwritten(
     assert logged_in.email == "admin-edited@example.com"
 
 
-async def test_avatar_and_last_login_always_refreshed(
+async def test_avatar_is_only_backfilled_when_empty(
     session: AsyncSession,
     fake_redis: Any,
     configured_feishu: IntegrationConfig,
@@ -344,11 +344,38 @@ async def test_avatar_and_last_login_always_refreshed(
     logged_in = result.user
 
     assert logged_in.id == user.id
-    assert logged_in.avatar == "https://example.com/new.png"
+    assert logged_in.avatar == "https://example.com/old.png"
     assert logged_in.last_login_at is not None
     assert logged_in.last_login_at > previous_login
     assert logged_in.last_login_at.tzinfo is None
     assert logged_in.last_login_at <= datetime.now(UTC).replace(tzinfo=None)
+
+
+async def test_avatar_is_backfilled_when_locally_empty(
+    session: AsyncSession,
+    fake_redis: Any,
+    configured_feishu: IntegrationConfig,
+) -> None:
+    user = await _add_existing_user(
+        session,
+        open_id="ou-avatar-backfill",
+        avatar=None,
+    )
+
+    result = await auth_service.login_with_feishu(
+        session,
+        fake_redis,
+        "valid-code",
+        client_ip="203.0.113.10",
+        client=FakeFeishuClient(
+            open_id="ou-avatar-backfill",
+            avatar_url="https://example.com/first.png",
+        ),
+    )
+    logged_in = result.user
+
+    assert logged_in.id == user.id
+    assert logged_in.avatar == "https://example.com/first.png"
 
 
 @pytest.mark.parametrize("empty_avatar", [None, ""])

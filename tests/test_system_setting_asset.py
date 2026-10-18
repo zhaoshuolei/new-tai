@@ -20,6 +20,7 @@ from app.services import audit as audit_service
 from app.services.system_setting_asset import (
     SystemAssetType,
     remove_system_asset,
+    remove_user_avatar,
     upload_system_asset,
 )
 
@@ -245,6 +246,27 @@ async def test_remove_system_asset_deletes_only_managed_files(
     assert traversal_removed is False
     assert outside.exists() is True
     assert external_removed is False
+
+
+async def test_asset_removal_is_scoped_to_its_own_directory(
+    media_root: Path,
+) -> None:
+    logo = media_root / "system" / "logo" / f"{UUID(int=2)}.png"
+    logo.parent.mkdir(parents=True)
+    logo.write_bytes(PNG)
+    avatar = media_root / "user" / "avatar" / f"{UUID(int=3)}.png"
+    avatar.parent.mkdir(parents=True)
+    avatar.write_bytes(PNG)
+
+    system_removed_avatar = await remove_system_asset(
+        f"/media/user/avatar/{avatar.name}"
+    )
+    user_removed_logo = await remove_user_avatar(f"/media/system/logo/{logo.name}")
+
+    assert system_removed_avatar is False
+    assert user_removed_logo is False
+    assert avatar.exists() is True
+    assert logo.exists() is True
 
 
 async def test_directory_fsync_failure_removes_published_file(

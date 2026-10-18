@@ -13,6 +13,8 @@ SEARCH_WINDOW_SECONDS = 60
 SEARCH_MAX_REQUESTS = 20
 IMPORT_WINDOW_SECONDS = 3600
 IMPORT_MAX_REQUESTS = 10
+AVATAR_UPLOAD_WINDOW_SECONDS = 3600
+AVATAR_UPLOAD_MAX_REQUESTS = 10
 
 # 与登录限流同源的 Lua 脚本：逐个 INCR，首次自增时设置过期时间，
 # 任一键超过阈值则返回 1。整个脚本在 Redis 内原子执行。
@@ -34,6 +36,11 @@ return exceeded
 def tianyancha_rate_limit_key(*parts: str) -> str:
     """构造天眼查限流键，遵循 ``{app}:{env}:{domain}:{ident}`` 约定。"""
     return key("tianyancha", *parts)
+
+
+def avatar_upload_rate_limit_key(user_id: int) -> str:
+    """构造当前用户头像上传限流键。"""
+    return key("user_profile", "avatar_upload", str(user_id))
 
 
 async def enforce_rate_limit(
@@ -61,10 +68,13 @@ async def enforce_rate_limit(
 
 
 __all__: tuple[str, ...] = (
+    "AVATAR_UPLOAD_MAX_REQUESTS",
+    "AVATAR_UPLOAD_WINDOW_SECONDS",
     "IMPORT_MAX_REQUESTS",
     "IMPORT_WINDOW_SECONDS",
     "SEARCH_MAX_REQUESTS",
     "SEARCH_WINDOW_SECONDS",
+    "avatar_upload_rate_limit_key",
     "enforce_rate_limit",
     "tianyancha_rate_limit_key",
 )

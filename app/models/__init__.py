@@ -23,6 +23,7 @@ from app.models.role_department import RoleDepartment
 from app.models.system_metric import SystemMetric
 from app.models.system_setting import SystemSetting
 from app.models.user import User, UserStatus
+from app.models.user_profile import PUBLIC_PROFILE_FIELD_KEYS, UserProfile
 
 __all__: tuple[str, ...] = (
     "AuditLog",
@@ -45,6 +46,7 @@ __all__: tuple[str, ...] = (
     "Menu",
     "MenuStatus",
     "MenuType",
+    "PUBLIC_PROFILE_FIELD_KEYS",
     "Role",
     "RoleDepartment",
     "RoleMenu",
@@ -52,5 +54,6 @@ __all__: tuple[str, ...] = (
     "SystemMetric",
     "SystemSetting",
     "User",
+    "UserProfile",
     "UserStatus",
 )
