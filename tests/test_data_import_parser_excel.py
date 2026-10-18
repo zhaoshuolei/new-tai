@@ -1521,6 +1521,34 @@ def forbid_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(zipfile.ZipFile, "open", explode)
 
 
+def forbid_member_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+    members: Sequence[str],
+) -> None:
+    """Allow preflight metadata reads but reject materializing selected members."""
+    from app.services import data_import_parser as parser
+
+    original_read = zipfile.ZipFile.read
+    forbidden = frozenset(members)
+
+    def guarded_read(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *args: object,
+        **kwargs: object,
+    ) -> bytes:
+        member = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member in forbidden:
+            raise AssertionError("archive member was expanded before rejection")
+        return original_read(archive, name, *args, **kwargs)
+
+    def explode_workbook(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("openpyxl was reached before rejection")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", guarded_read)
+    monkeypatch.setattr(parser, "load_workbook", explode_workbook)
+
+
 def test_xlsx_limits_are_named_and_cover_the_import_envelope() -> None:
     """Pin the chosen limits to the measured 100,000-row x 105-column envelope.
 
@@ -1573,6 +1601,82 @@ def test_excel_rejects_decompression_bomb_before_any_expansion(
     assert_invalid_excel(path, "Import Excel file is invalid")
 
 
+@pytest.mark.parametrize(
+    "member",
+    [
+        pytest.param("xl/sharedStrings.xml", id="normal-name"),
+        pytest.param("xl/sharedStrings/", id="shared-strings-directory-name"),
+        pytest.param("xl/worksheets/", id="worksheets-directory-name"),
+    ],
+)
+def test_excel_budgets_32_mib_bomb_under_any_member_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member: str,
+) -> None:
+    """Directory-looking names do not change a member's expansion budget."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    entries[member] = b"\x00" * (32 * 1024 * 1024)
+    repack_entries(path, entries)
+
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member)
+        assert info.is_dir() is member.endswith("/")
+        assert info.file_size / info.compress_size >= 1025
+
+    forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        pytest.param(("xl/sharedStrings/",), id="shared-strings-directory-name"),
+        pytest.param(("xl/worksheets/",), id="worksheets-directory-name"),
+    ],
+)
+def test_excel_budgets_member_under_directory_style_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    members: tuple[str, ...],
+) -> None:
+    """The metadata cap applies to content under trailing-slash names too."""
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    for member in members:
+        entries[member] = b"x" * 64
+    repack_entries(path, entries)
+    monkeypatch.setattr(parser, "_XLSX_MAX_METADATA_BYTES", 32)
+    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 1 << 30)
+
+    forbid_member_expansion(monkeypatch, members)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_aggregate_bypass_through_directory_style_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trailing-slash entries cannot hide their bytes from the aggregate cap."""
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    entries["xl/sharedStrings/"] = b"x" * 64
+    entries["xl/worksheets/"] = b"y" * 64
+    repack_entries(path, entries)
+    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 64)
+
+    forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
 def test_excel_rejects_aggregate_uncompressed_budget_before_expansion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1584,6 +1688,77 @@ def test_excel_rejects_aggregate_uncompressed_budget_before_expansion(
     monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 64)
 
     forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_shared_strings_alias_of_worksheet_part(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One part cannot be both the streamed worksheet and shared strings.
+
+    openpyxl resolves shared strings from ``[Content_Types].xml`` but resolves
+    the worksheet from workbook relationships. Reusing the worksheet target for
+    both roles must therefore be rejected structurally before the 900 MiB
+    logical part can be materialized as a shared-string table.
+    """
+    from app.services import data_import_parser as parser
+
+    logical_size = 900 * 1024 * 1024
+    logical_compress_size = logical_size // 668
+    assert logical_size / logical_compress_size <= 700
+    assert logical_size / logical_compress_size >= 668
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    worksheet_type = (
+        b'<Override PartName="/xl/worksheets/sheet1.xml" '
+        b'ContentType="application/vnd.openxmlformats-officedocument.'
+        b'spreadsheetml.worksheet+xml" />'
+    )
+    shared_strings_type = (
+        b'<Override PartName="/xl/worksheets/sheet1.xml" '
+        b'ContentType="application/vnd.openxmlformats-officedocument.'
+        b'spreadsheetml.sharedStrings+xml" />'
+    )
+    assert worksheet_type in entries["[Content_Types].xml"]
+    entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+        worksheet_type,
+        shared_strings_type,
+        1,
+    )
+    repack_entries(path, entries)
+
+    original_infolist = zipfile.ZipFile.infolist
+
+    def inflated_infolist(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+        result = original_infolist(archive)
+        for info in result:
+            if info.filename == "xl/worksheets/sheet1.xml":
+                info.file_size = logical_size
+                info.compress_size = logical_compress_size
+        return result
+
+    original_open = zipfile.ZipFile.open
+
+    def guarded_open(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        member = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member == "xl/worksheets/sheet1.xml":
+            raise AssertionError("aliased part was expanded before rejection")
+        return original_open(archive, name, *args, **kwargs)
+
+    def explode_expansion(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("openpyxl was reached before rejection")
+
+    monkeypatch.setattr(zipfile.ZipFile, "infolist", inflated_infolist)
+    monkeypatch.setattr(zipfile.ZipFile, "open", guarded_open)
+    monkeypatch.setattr(parser, "load_workbook", explode_expansion)
 
     assert_invalid_excel(path, "Import Excel file is invalid")
 
@@ -1743,6 +1918,41 @@ def test_excel_accepts_sparse_rows_within_budget(tmp_path: Path) -> None:
     assert [result.row_number for result in parse(path)] == [2]
 
 
+def test_excel_rejects_millions_of_coordinate_less_cells_before_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Implicit cell columns are bounded exactly as openpyxl assigns them."""
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    worksheet_name = "xl/worksheets/sheet1.xml"
+    worksheet_xml = entries[worksheet_name].replace(
+        b"<sheetData>",
+        b'<sheetData><row r="2">' + b"<c/>" * 2_000_000 + b"</row>",
+        1,
+    )
+    entries[worksheet_name] = worksheet_xml
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for name, content in entries.items():
+            method = (
+                zipfile.ZIP_STORED if name == worksheet_name else zipfile.ZIP_DEFLATED
+            )
+            target.writestr(name, content, compress_type=method)
+    path.write_bytes(buffer.getvalue())
+    assert path.stat().st_size < 50 * 1024 * 1024
+
+    def explode_workbook(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("openpyxl was reached before rejection")
+
+    monkeypatch.setattr(parser, "load_workbook", explode_workbook)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
 def _patch_worksheet_crc(path: Path) -> Path:
     """Flip the worksheet CRC in both the local header and central directory."""
     raw = bytearray(path.read_bytes())
@@ -1789,6 +1999,49 @@ def test_excel_rejects_crc_corrupted_worksheet(tmp_path: Path) -> None:
     assert error.value.message == "Import Excel file is invalid"
     assert "CRC" not in error.value.message
     assert "sheet1" not in error.value.message
+
+
+def test_excel_maps_corrupt_shared_string_index_to_static_error(tmp_path: Path) -> None:
+    """A lazy shared-string table integrity failure cannot escape raw."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    entries["xl/sharedStrings.xml"] = (
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        b'count="1" uniqueCount="1"><si><t>safe</t></si></sst>'
+    )
+    entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+        b"</Types>",
+        b'<Override PartName="/xl/sharedStrings.xml" '
+        b'ContentType="application/vnd.openxmlformats-officedocument.'
+        b'spreadsheetml.sharedStrings+xml" /></Types>',
+        1,
+    )
+    entries["xl/_rels/workbook.xml.rels"] = entries[
+        "xl/_rels/workbook.xml.rels"
+    ].replace(
+        b"</Relationships>",
+        b'<Relationship Type="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships/sharedStrings" Target="sharedStrings.xml" '
+        b'Id="rId99" /></Relationships>',
+        1,
+    )
+    worksheet_xml = entries["xl/worksheets/sheet1.xml"]
+    old_cell = b'<c r="F2" t="inlineStr"><is><t>004047806</t></is></c>'
+    assert old_cell in worksheet_xml
+    entries["xl/worksheets/sheet1.xml"] = worksheet_xml.replace(
+        old_cell,
+        b'<c r="F2" t="s"><v>999999</v></c>',
+        1,
+    )
+    repack_entries(path, entries)
+
+    with pytest.raises(BusinessError) as error:
+        parse(path)
+
+    assert error.value.code == EXCEL_INVALID
+    assert error.value.message == "Import Excel file is invalid"
+    assert "999999" not in error.value.message
+    assert "sharedStrings" not in error.value.message
 
 
 @pytest.mark.parametrize(
@@ -1933,6 +2186,86 @@ def test_excel_rejects_vba_content_type_extended_properties(tmp_path: Path) -> N
         )
 
     path = write_macro_variant(tmp_path, "vba-signature.xlsx", add_override)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+XLM_MACROSHEET_CONTENT_TYPE = b"application/vnd.ms-excel.macrosheet+xml"
+XLM_MACROSHEET_RELATIONSHIP = (
+    b"http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet"
+)
+
+
+def test_excel_rejects_raw_xlm_macrosheet_package(tmp_path: Path) -> None:
+    """A complete macrosheet package remains macro content even without VBA."""
+
+    def add_macrosheet(entries: dict[str, bytes]) -> None:
+        entries["xl/macrosheets/sheet1.xml"] = (
+            b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+            b'spreadsheetml/2006/main"><sheetData /></worksheet>'
+        )
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"</Types>",
+            b'<Override PartName="/xl/macrosheets/sheet1.xml" ContentType="'
+            + XLM_MACROSHEET_CONTENT_TYPE
+            + b'" /></Types>',
+            1,
+        )
+        entries["xl/_rels/workbook.xml.rels"] = entries[
+            "xl/_rels/workbook.xml.rels"
+        ].replace(
+            b"</Relationships>",
+            b'<Relationship Type="'
+            + XLM_MACROSHEET_RELATIONSHIP
+            + b'" Target="macrosheets/sheet1.xml" Id="rId99" /></Relationships>',
+            1,
+        )
+
+    path = write_macro_variant(tmp_path, "xlm-macrosheet.xlsx", add_macrosheet)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_macrosheet_content_type_without_part(tmp_path: Path) -> None:
+    """The content-type declaration alone identifies executable macro content."""
+
+    def declare_content_type(entries: dict[str, bytes]) -> None:
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"</Types>",
+            b'<Override PartName="/xl/missing/xlm.xml" ContentType="'
+            + XLM_MACROSHEET_CONTENT_TYPE
+            + b'" /></Types>',
+            1,
+        )
+
+    path = write_macro_variant(
+        tmp_path,
+        "xlm-content-type.xlsx",
+        declare_content_type,
+    )
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_macrosheet_relationship_without_part(tmp_path: Path) -> None:
+    """The xlMacrosheet relationship alone is enough to reject the workbook."""
+
+    def declare_relationship(entries: dict[str, bytes]) -> None:
+        entries["xl/_rels/workbook.xml.rels"] = entries[
+            "xl/_rels/workbook.xml.rels"
+        ].replace(
+            b"</Relationships>",
+            b'<Relationship Type="'
+            + XLM_MACROSHEET_RELATIONSHIP
+            + b'" Target="missing-xlm.xml" Id="rId99" /></Relationships>',
+            1,
+        )
+
+    path = write_macro_variant(
+        tmp_path,
+        "xlm-relationship.xlsx",
+        declare_relationship,
+    )
 
     assert_invalid_excel(path, "Import Excel file is invalid")
 

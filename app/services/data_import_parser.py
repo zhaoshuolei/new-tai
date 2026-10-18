@@ -120,13 +120,28 @@ _WORKBOOK_PART = "xl/workbook.xml"
 _WORKBOOK_RELS_PART = "xl/_rels/workbook.xml.rels"
 _CONTENT_TYPES_PART = "[Content_Types].xml"
 _CHARTSHEET_PREFIX = "xl/chartsheets/"
+_WORKSHEET_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+)
+_SHARED_STRINGS_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+)
 _WORKSHEET_RELATIONSHIP_SUFFIX = "/worksheet"
+_SHARED_STRINGS_RELATIONSHIP_SUFFIX = "/sharedstrings"
 _CHARTSHEET_RELATIONSHIP_SUFFIX = "/chartsheet"
-# VBA is rejected by content type, relationship type, and member name so an
-# arbitrary filename or a relationship-only variant cannot smuggle a macro.
+_PART_ROLE_WORKSHEET = "worksheet"
+_PART_ROLE_SHARED_STRINGS = "sharedStrings"
+_PART_ROLE_WORKBOOK_METADATA = "workbookMetadata"
+# Executable macro formats are rejected by declaration rather than path: VBA
+# by content type, relationship, and member name; Excel 4.0 XLM by content type
+# and relationship. A high-level ``.xlsx`` extension is not trusted.
 _VBA_MEMBER_MARKER = "vbaproject"
-_VBA_CONTENT_TYPE_MARKERS = (b"vbaproject", b"macroenabled")
-_VBA_RELATIONSHIP_MARKERS = (b"vbaproject",)
+_EXECUTABLE_MACRO_CONTENT_TYPE_MARKERS = (
+    b"vbaproject",
+    b"macroenabled",
+    b"macrosheet",
+)
+_EXECUTABLE_MACRO_RELATIONSHIP_MARKERS = (b"vbaproject", b"xlmacrosheet")
 _EXCEL_SHEET_COUNT_MESSAGE = "Excel file must contain exactly one visible worksheet"
 _EXCEL_HEADER_MESSAGE = "Excel header row is invalid"
 _EXCEL_INVALID_MESSAGE = "Import Excel file is invalid"
@@ -1172,8 +1187,11 @@ _CONTAINER_ERRORS: tuple[type[BaseException], ...] = (
     ElementTree.ParseError,
     expat.ExpatError,
     EOFError,
+    IndexError,
+    InvalidFileException,
     KeyError,
     OSError,
+    OverflowError,
     RuntimeError,
     TypeError,
     ValueError,
@@ -1220,8 +1238,9 @@ def _require_supported_members(infos: Sequence[zipfile.ZipInfo]) -> set[str]:
             # ambiguous, so the container is refused rather than guessed at.
             raise _excel_invalid()
         names.add(info.filename)
-        if info.is_dir():
-            continue
+        # A trailing slash is only a naming convention. The original bytes can
+        # still be opened by ZIP readers, so every member contributes to the
+        # aggregate and absolute budgets.
         total += info.file_size
         if total > _XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES:
             raise _excel_invalid()
@@ -1237,8 +1256,8 @@ def _require_ratio_gate(infos: Sequence[zipfile.ZipInfo]) -> None:
     relationship parts), so every later bounded read is already protected.
     """
     for info in infos:
-        if info.is_dir():
-            continue
+        # ``ZipInfo.is_dir`` trusts only a trailing slash. A member with that
+        # name can still carry readable compressed bytes, so it is not exempt.
         if (
             info.file_size >= _XLSX_RATIO_MIN_BYTES
             and info.compress_size > 0
@@ -1256,11 +1275,11 @@ def _require_bounded_members(
     Worksheet parts are streamed row by row, so their budget only bounds time;
     every other part is materialized in memory by openpyxl and gets the tighter
     metadata budget. ``zipfile`` truncates every member at its declared
-    ``file_size``, so these budgets really do cap expansion.
+    ``file_size``, so these budgets really do cap expansion. Directory-looking
+    names are deliberately not exempt because ZIP has no directory type bit;
+    the trailing slash is untrusted metadata.
     """
     for info in infos:
-        if info.is_dir():
-            continue
         if (
             info.filename not in streamed_parts
             and info.file_size > _XLSX_MAX_METADATA_BYTES
@@ -1274,13 +1293,12 @@ def _require_no_vba_member_name(names: Sequence[str]) -> None:
             raise _excel_invalid()
 
 
-def _require_no_vba_content_type(content_types_xml: bytes) -> None:
-    """Reject any VBA or macro-enabled content type declaration.
+def _require_no_executable_macro_content_type(content_types_xml: bytes) -> None:
+    """Reject VBA, macro-enabled, and Excel 4.0 macrosheet content types.
 
     A macro part can be stored under an arbitrary filename, so the declared
     content type is authoritative. Every ``Override``/``Default`` content type
-    is inspected for a macro marker, which catches ``vbaProject.bin`` under any
-    path and macro-enabled workbook main parts.
+    is inspected for an executable-macro marker.
     """
     root = ElementTree.fromstring(content_types_xml)
     for element in root.iter():
@@ -1288,19 +1306,41 @@ def _require_no_vba_content_type(content_types_xml: bytes) -> None:
         if local not in ("Override", "Default"):
             continue
         content_type = (element.get("ContentType") or "").casefold().encode()
-        if any(marker in content_type for marker in _VBA_CONTENT_TYPE_MARKERS):
+        if any(
+            marker in content_type for marker in _EXECUTABLE_MACRO_CONTENT_TYPE_MARKERS
+        ):
             raise _excel_invalid()
 
 
-def _require_no_vba_relationship(relationship_xml: bytes) -> None:
-    """Reject a VBA relationship even when no VBA member is present."""
+def _require_no_executable_macro_relationship(relationship_xml: bytes) -> None:
+    """Reject VBA and XLM relationship declarations without their target parts."""
     root = ElementTree.fromstring(relationship_xml)
     for element in root.iter():
         if element.tag.rsplit("}", 1)[-1] != "Relationship":
             continue
         relation_type = (element.get("Type") or "").casefold().encode()
-        if any(marker in relation_type for marker in _VBA_RELATIONSHIP_MARKERS):
+        if any(
+            marker in relation_type for marker in _EXECUTABLE_MACRO_RELATIONSHIP_MARKERS
+        ):
             raise _excel_invalid()
+
+
+def _content_type_role(content_type: str) -> str:
+    normalized = content_type.casefold()
+    if normalized == _WORKSHEET_CONTENT_TYPE.casefold():
+        return _PART_ROLE_WORKSHEET
+    if normalized == _SHARED_STRINGS_CONTENT_TYPE.casefold():
+        return _PART_ROLE_SHARED_STRINGS
+    return _PART_ROLE_WORKBOOK_METADATA
+
+
+def _relationship_role(relation_type: str) -> str:
+    normalized = relation_type.casefold()
+    if normalized.endswith(_WORKSHEET_RELATIONSHIP_SUFFIX):
+        return _PART_ROLE_WORKSHEET
+    if normalized.endswith(_SHARED_STRINGS_RELATIONSHIP_SUFFIX):
+        return _PART_ROLE_SHARED_STRINGS
+    return _PART_ROLE_WORKBOOK_METADATA
 
 
 def _column_index(letters: str) -> int:
@@ -1338,6 +1378,8 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
     """
     parser = expat.ParserCreate(namespace_separator="}")
     parser.buffer_text = True
+    implicit_row = 0
+    implicit_column = 0
 
     def reject_entities(*_args: object) -> None:
         # XLSX never uses DTD entities; refusing them blocks entity-expansion
@@ -1345,6 +1387,7 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
         raise _excel_invalid()
 
     def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal implicit_row, implicit_column
         local = name.rsplit("}", 1)[-1]
         if local == "dimension":
             reference = attributes.get("ref")
@@ -1356,16 +1399,24 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
         if local == "row":
             reference = attributes.get("r")
             if reference is None:
-                return
-            if _XLSX_ROW_PATTERN.fullmatch(reference) is None:
-                raise _excel_invalid()
-            _require_within_sparse_bounds(int(reference), 1)
+                implicit_row += 1
+            else:
+                if _XLSX_ROW_PATTERN.fullmatch(reference) is None:
+                    raise _excel_invalid()
+                implicit_row = int(reference)
+            _require_within_sparse_bounds(implicit_row, 1)
+            implicit_column = 0
             return
         if local == "c":
             reference = attributes.get("r")
             if reference is None:
+                # Match openpyxl's parser: a missing reference increments the
+                # previous column, including after an explicit ``r`` reference.
+                implicit_column += 1
+                _require_within_sparse_bounds(implicit_row, implicit_column)
                 return
-            _require_within_sparse_bounds(*_parse_cell_reference(reference))
+            cell_row, implicit_column = _parse_cell_reference(reference)
+            _require_within_sparse_bounds(cell_row, implicit_column)
 
     parser.EntityDeclHandler = reject_entities
     parser.StartElementHandler = start_element
@@ -1403,12 +1454,90 @@ def _resolve_part_target(rels_folder: str, target: str) -> str:
     return candidate
 
 
-def _require_single_worksheet_part(archive: zipfile.ZipFile, names: set[str]) -> str:
-    """Return the worksheet member named by the workbook relationships.
+def _resolve_content_type_part_name(part_name: str) -> str:
+    """Resolve a strict absolute OPC content-type part name."""
+    if not part_name.startswith("/") or "\\" in part_name:
+        raise _excel_invalid()
+    candidate = part_name[1:]
+    if _resolve_part_target("", part_name) != candidate:
+        raise _excel_invalid()
+    return candidate
 
-    Sheets are resolved through relationships rather than by part-path
-    convention, so a worksheet stored outside ``xl/worksheets/`` is still found
-    (and bounded) while chartsheets are refused by relationship type.
+
+def _content_type_part_roles(
+    content_types_xml: bytes,
+    names: set[str],
+) -> tuple[dict[str, set[str]], frozenset[str]]:
+    """Return effective part roles and content-type worksheet candidates.
+
+    Content types identify the part openpyxl materializes as shared strings and
+    provide one half of worksheet identity. Workbook relationships provide the
+    other half in ``_require_single_worksheet_part``.
+    """
+    root = ElementTree.fromstring(content_types_xml)
+    overrides: dict[str, str] = {}
+    defaults: dict[str, str] = {}
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        if local == "Override":
+            part_name = _resolve_content_type_part_name(element.get("PartName") or "")
+            if part_name in overrides:
+                raise _excel_invalid()
+            content_type = element.get("ContentType")
+            if not content_type:
+                raise _excel_invalid()
+            overrides[part_name] = content_type
+        elif local == "Default":
+            extension = (element.get("Extension") or "").lstrip(".").casefold()
+            content_type = element.get("ContentType")
+            if not extension or not content_type:
+                raise _excel_invalid()
+            previous = defaults.get(extension)
+            if previous is not None and previous.casefold() != content_type.casefold():
+                raise _excel_invalid()
+            defaults[extension] = content_type
+
+    roles_by_part: dict[str, set[str]] = {}
+    for name in names:
+        content_type = overrides.get(name)
+        if content_type is None:
+            extension = PurePosixPath(name).suffix.lstrip(".").casefold()
+            content_type = defaults.get(extension)
+        if content_type is not None:
+            roles_by_part.setdefault(name, set()).add(
+                _content_type_role(content_type),
+            )
+    worksheet_parts = frozenset(
+        name for name, roles in roles_by_part.items() if _PART_ROLE_WORKSHEET in roles
+    )
+    return roles_by_part, worksheet_parts
+
+
+def _require_compatible_part_roles(
+    content_type_roles: Mapping[str, set[str]],
+    relationship_roles: Mapping[str, set[str]],
+) -> None:
+    """Reject one ZIP part claimed as worksheet, shared strings, and metadata."""
+    for part in content_type_roles.keys() | relationship_roles.keys():
+        roles = content_type_roles.get(part, set()) | relationship_roles.get(
+            part, set()
+        )
+        if len(roles) > 1:
+            raise _excel_invalid()
+
+
+def _require_single_worksheet_part(
+    archive: zipfile.ZipFile,
+    names: set[str],
+    content_type_roles: Mapping[str, set[str]],
+    content_type_worksheet_parts: frozenset[str],
+) -> str:
+    """Return the worksheet member proven by relationships and content types.
+
+    Sheets are resolved through workbook relationships rather than by part-path
+    convention. Content types must designate the same part as the worksheet, so
+    an alias used for shared strings or another workbook role cannot receive the
+    streamed-worksheet exemption from metadata budgets.
     """
     if _WORKBOOK_PART not in names or _WORKBOOK_RELS_PART not in names:
         raise _excel_invalid()
@@ -1420,20 +1549,26 @@ def _require_single_worksheet_part(archive: zipfile.ZipFile, names: set[str]) ->
     )
     root = ElementTree.fromstring(rels_xml)
     worksheet_targets: list[str] = []
+    relationship_roles: dict[str, set[str]] = {}
     for element in root.iter():
         if element.tag.rsplit("}", 1)[-1] != "Relationship":
             continue
         relation_type = element.get("Type") or ""
-        if relation_type.endswith(_CHARTSHEET_RELATIONSHIP_SUFFIX):
+        if relation_type.casefold().endswith(_CHARTSHEET_RELATIONSHIP_SUFFIX):
             raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
         if element.get("TargetMode") == "External":
-            continue
-        if not relation_type.endswith(_WORKSHEET_RELATIONSHIP_SUFFIX):
             continue
         target = element.get("Target")
         if not target:
             raise _excel_invalid()
-        worksheet_targets.append(_resolve_part_target("xl", target))
+        resolved_target = _resolve_part_target("xl", target)
+        relationship_roles.setdefault(resolved_target, set()).add(
+            _relationship_role(relation_type),
+        )
+        if relation_type.casefold().endswith(_WORKSHEET_RELATIONSHIP_SUFFIX):
+            worksheet_targets.append(resolved_target)
+
+    _require_compatible_part_roles(content_type_roles, relationship_roles)
 
     if any(name.startswith(_CHARTSHEET_PREFIX) for name in names):
         raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
@@ -1441,7 +1576,9 @@ def _require_single_worksheet_part(archive: zipfile.ZipFile, names: set[str]) ->
         raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
 
     worksheet_part = worksheet_targets[0]
-    if worksheet_part not in names:
+    if worksheet_part not in names or content_type_worksheet_parts != frozenset(
+        {worksheet_part}
+    ):
         raise _excel_invalid()
     _require_single_visible_sheet(
         _read_bounded_member(
@@ -1492,23 +1629,30 @@ def _read_excel_workbook(path: Path) -> tuple[object, str]:
             if _WORKBOOK_PART not in names:
                 raise _excel_invalid()
             _require_no_vba_member_name(tuple(names))
-            _require_no_vba_content_type(
-                _read_bounded_member(
-                    archive,
-                    _CONTENT_TYPES_PART,
-                    _XLSX_MAX_CONTENT_TYPES_BYTES,
-                ),
+            content_types_xml = _read_bounded_member(
+                archive,
+                _CONTENT_TYPES_PART,
+                _XLSX_MAX_CONTENT_TYPES_BYTES,
             )
+            _require_no_executable_macro_content_type(content_types_xml)
             for name in names:
                 if name.endswith(".rels"):
-                    _require_no_vba_relationship(
+                    _require_no_executable_macro_relationship(
                         _read_bounded_member(
                             archive,
                             name,
                             _XLSX_MAX_RELATIONSHIP_BYTES,
                         ),
                     )
-            worksheet_part = _require_single_worksheet_part(archive, names)
+            content_type_roles, content_type_worksheet_parts = _content_type_part_roles(
+                content_types_xml, names
+            )
+            worksheet_part = _require_single_worksheet_part(
+                archive,
+                names,
+                content_type_roles,
+                content_type_worksheet_parts,
+            )
             _require_bounded_members(infos, frozenset({worksheet_part}))
             _scan_worksheet_bounds(archive, worksheet_part)
     except BusinessError:
@@ -1524,17 +1668,7 @@ def _read_excel_workbook(path: Path) -> tuple[object, str]:
                 data_only=False,
                 keep_links=False,
             )
-    except (
-        ElementTree.ParseError,
-        InvalidFileException,
-        KeyError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-        zipfile.BadZipFile,
-        zlib.error,
-    ) as error:
+    except _CONTAINER_ERRORS as error:
         raise _excel_invalid() from error
     return cast(object, workbook), worksheet_part
 
@@ -1654,19 +1788,10 @@ def _worksheet_rows(worksheet: object) -> Iterator[tuple[int, tuple[object, ...]
             close = getattr(rows, "close", None)
             if callable(close):
                 close()
-    except (
-        ElementTree.ParseError,
-        KeyError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-        zipfile.BadZipFile,
-        zlib.error,
-    ) as error:
-        # A CRC mismatch, truncated member, or corrupt worksheet XML can surface
-        # at any point during lazy iteration; it must become the static 9006
-        # error rather than escape as a raw zipfile/zlib exception.
+    except _CONTAINER_ERRORS as error:
+        # A CRC mismatch, truncated member, corrupt worksheet XML, or invalid
+        # shared-string index can surface at any point during lazy iteration. It
+        # must become the static 9006 error instead of escaping raw.
         raise _excel_invalid() from error
 
 
