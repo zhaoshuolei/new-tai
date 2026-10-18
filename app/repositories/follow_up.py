@@ -30,7 +30,7 @@ class FollowUpRow:
 
     @property
     def id(self) -> int:
-        """Expose the record id for audit resource attribution."""
+        """暴露记录 ID，供审计采集资源标识使用。"""
         return self.follow_up.id
 
 

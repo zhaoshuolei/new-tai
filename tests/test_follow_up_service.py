@@ -379,3 +379,101 @@ async def test_record_of_soft_deleted_user_stays_readable_but_read_only(  # noqa
             context=ctx,
         )
     assert error.value.code == ErrorCode.FOLLOW_UP_NOT_OWNER
+
+
+async def test_invisible_customer_rejects_write(session) -> None:  # noqa: F811
+    owner, customer, contact, method, _ = await _fixture(session)
+    other_owner = await make_user(session)
+    other_customer = await make_customer_row(session, owner=other_owner)
+    # SELF 范围只能看到自己名下的客户，他人客户不可见 → 7001
+    hidden = make_context(
+        owner,
+        permission_codes={"customer:read", "customer:update", "customer:delete"},
+        data_scope=DataScope.SELF,
+    )
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.create_follow_up(
+            session,
+            other_customer.id,
+            contact.id,
+            FollowUpCreate(method_id=method.id, content="越权"),
+            context=hidden,
+        )
+    assert error.value.code == ErrorCode.CUSTOMER_NOT_FOUND
+
+
+async def test_missing_or_foreign_follow_up_rejects_update(session) -> None:  # noqa: F811
+    owner, customer, contact, method, ctx = await _fixture(session)
+
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.update_follow_up(
+            session,
+            customer.id,
+            contact.id,
+            99999999,
+            FollowUpUpdate(content="记录不存在"),
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.FOLLOW_UP_NOT_FOUND
+
+    # 记录存在，但属于同一客户下的另一个联系人 → 同样视为不存在
+    other_function = await add_function(session, name="技术", customer_id=None)
+    other_contact = await add_contact(session, customer, other_function)
+    foreign = await add_follow_up(
+        session,
+        other_contact,
+        method,
+        follow_up_user=owner,
+    )
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.update_follow_up(
+            session,
+            customer.id,
+            contact.id,
+            foreign.id,
+            FollowUpUpdate(content="跨联系人"),
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.FOLLOW_UP_NOT_FOUND
+
+
+async def test_update_rejects_deleted_method(session) -> None:  # noqa: F811
+    owner, customer, contact, method, ctx = await _fixture(session)
+    created = await add_follow_up(session, contact, method, follow_up_user=owner)
+    deleted = await add_method(session, name="旧方式", status=ContactStatus.DELETED)
+
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.update_follow_up(
+            session,
+            customer.id,
+            contact.id,
+            created.id,
+            FollowUpUpdate(method_id=deleted.id),
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.FOLLOW_UP_METHOD_NOT_FOUND
+
+
+async def test_update_next_follow_up_uses_effective_follow_up_at(  # noqa: F811
+    session,
+) -> None:
+    owner, customer, contact, method, ctx = await _fixture(session)
+    created = await add_follow_up(
+        session,
+        contact,
+        method,
+        follow_up_user=owner,
+        follow_up_at=datetime(2026, 10, 1, 2, 0),
+    )
+
+    # 未更新 follow_up_at 时，用记录现值作为有效跟进时间比较 → 7003
+    with pytest.raises(BusinessError) as error:
+        await follow_up_service.update_follow_up(
+            session,
+            customer.id,
+            contact.id,
+            created.id,
+            FollowUpUpdate(next_follow_up_at=datetime(2026, 10, 1, 1, 0)),
+            context=ctx,
+        )
+    assert error.value.code == ErrorCode.CUSTOMER_INVALID_FIELD
