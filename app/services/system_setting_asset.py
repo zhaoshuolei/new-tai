@@ -48,7 +48,9 @@ _ALLOWED_DECLARED_CONTENT_TYPES = {
     "image/x-icon": frozenset({"image/x-icon", "image/vnd.microsoft.icon"}),
 }
 
-_ASSET_DIRECTORIES = ("system/logo", "system/favicon", "user/avatar")
+_SYSTEM_ASSET_DIRECTORIES = ("system/logo", "system/favicon")
+_USER_AVATAR_DIRECTORIES = ("user/avatar",)
+_ASSET_DIRECTORIES = (*_SYSTEM_ASSET_DIRECTORIES, *_USER_AVATAR_DIRECTORIES)
 
 _INVALID_IMAGE_MESSAGE = "Image must be a valid PNG, JPEG, WebP, or ICO file"
 
@@ -152,7 +154,11 @@ def _asset_url(directory: str, filename: str) -> str:
     return f"{base_path}/{directory}/{filename}"
 
 
-def _managed_asset_path(url: str | None) -> Path | None:
+def _managed_asset_path(
+    url: str | None,
+    *,
+    directories: tuple[str, ...],
+) -> Path | None:
     if url is None or not url.startswith("/"):
         return None
 
@@ -165,7 +171,7 @@ def _managed_asset_path(url: str | None) -> Path | None:
         return None
     relative_path = parsed.path.removeprefix(media_prefix)
 
-    for asset_directory in _ASSET_DIRECTORIES:
+    for asset_directory in directories:
         directory_prefix = f"{asset_directory}/"
         if not relative_path.startswith(directory_prefix):
             continue
@@ -197,7 +203,7 @@ def _unlink(path: Path) -> None:
 
 async def remove_system_asset(url: str | None) -> bool:
     """删除由系统生成且路径安全的本地资源文件。"""
-    path = _managed_asset_path(url)
+    path = _managed_asset_path(url, directories=_SYSTEM_ASSET_DIRECTORIES)
     if path is None:
         return False
     await asyncio.to_thread(_unlink, path)
@@ -206,7 +212,7 @@ async def remove_system_asset(url: str | None) -> bool:
 
 async def remove_user_avatar(url: str | None) -> bool:
     """删除由用户头像上传生成且路径安全的本地资源文件。"""
-    path = _managed_asset_path(url)
+    path = _managed_asset_path(url, directories=_USER_AVATAR_DIRECTORIES)
     if path is None:
         return False
     await asyncio.to_thread(_unlink, path)

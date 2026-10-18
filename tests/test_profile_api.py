@@ -348,6 +348,54 @@ async def test_patch_nickname_changes_user_without_bumping_token_version(
     assert profile.seat == "A1"
 
 
+async def test_patch_cannot_clear_nickname_when_account_has_no_username(
+    session: AsyncSession,
+) -> None:
+    user = User(
+        feishu_open_id=f"ou_{uuid4().hex}",
+        username=None,
+        nickname="飞书员工",
+        email=None,
+        avatar=None,
+        department_id=None,
+        status=UserStatus.ACTIVE,
+        token_version=0,
+    )
+    session.add(user)
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.patch(
+            "/api/v1/me/profile",
+            json={"nickname": None},
+        )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == 1006
+    await session.refresh(user)
+    assert user.nickname == "飞书员工"
+
+
+async def test_patch_can_clear_nickname_when_account_has_username(
+    session: AsyncSession,
+) -> None:
+    user = await _make_user(session)
+    session.add(UserProfile(user_id=user.id))
+    await session.flush()
+
+    async with api_client(session, _context(user.id)) as client:
+        response = await client.patch(
+            "/api/v1/me/profile",
+            json={"nickname": None},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["nickname"] is None
+    await session.refresh(user)
+    assert user.nickname is None
+    assert user.username
+
+
 async def test_patch_explicit_null_clears_and_absent_field_is_unchanged(
     session: AsyncSession,
 ) -> None:
