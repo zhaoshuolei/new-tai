@@ -544,9 +544,9 @@ async def list_due_customers(
         tomorrow_start=tomorrow_start,
         follow_up_user_id=follow_up_user_id,
     )
-    earliest_next_follow_up_at = func.min(
-        candidate.c.next_follow_up_at
-    ).label("earliest_next_follow_up_at")
+    earliest_next_follow_up_at = func.min(candidate.c.next_follow_up_at).label(
+        "earliest_next_follow_up_at"
+    )
     grouped_statement = (
         select(
             Customer.id.label("customer_id"),

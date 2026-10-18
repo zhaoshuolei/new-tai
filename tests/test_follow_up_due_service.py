@@ -156,8 +156,7 @@ async def test_due_filter_and_summary_counts(session, monkeypatch) -> None:  # n
     )
     assert total == 2
     assert [
-        (row.customer_name, row.due_count, row.overdue_count)
-        for row in customer_rows
+        (row.customer_name, row.due_count, row.overdue_count) for row in customer_rows
     ] == [
         ("逾期客户", 1, 1),
         ("今日客户", 1, 0),

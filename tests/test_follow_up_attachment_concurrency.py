@@ -139,9 +139,7 @@ async def test_concurrent_uploads_cannot_exceed_attachment_limit(
             "error",
             "success",
         ], results
-        error_code = next(
-            code for status, _, code in results if status == "error"
-        )
+        error_code = next(code for status, _, code in results if status == "error")
         assert error_code == ErrorCode.FOLLOW_UP_ATTACHMENT_LIMIT
 
         async with factory() as check:
@@ -172,9 +170,7 @@ async def test_concurrent_uploads_cannot_exceed_attachment_limit(
                     )
                 if contact_id is not None:
                     await cleanup.execute(
-                        delete(CustomerContact).where(
-                            CustomerContact.id == contact_id
-                        )
+                        delete(CustomerContact).where(CustomerContact.id == contact_id)
                     )
                 if method_id is not None:
                     await cleanup.execute(
@@ -184,9 +180,7 @@ async def test_concurrent_uploads_cannot_exceed_attachment_limit(
                     )
                 if function_id is not None:
                     await cleanup.execute(
-                        delete(ContactFunction).where(
-                            ContactFunction.id == function_id
-                        )
+                        delete(ContactFunction).where(ContactFunction.id == function_id)
                     )
                 if customer_id is not None:
                     await cleanup.execute(

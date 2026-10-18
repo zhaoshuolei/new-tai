@@ -125,8 +125,7 @@ async def test_routes_require_permissions(session) -> None:  # noqa: F811
         for method_name, url in (
             (
                 "DELETE",
-                f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
-                "/follow-ups/1",
+                f"/api/v1/customers/{customer.id}/contacts/{contact.id}/follow-ups/1",
             ),
             (
                 "GET",
@@ -325,16 +324,14 @@ async def test_attachment_download_fallback_preserves_detected_extension(
         ),
         (
             "PATCH",
-            "/customers/{customer_id}/contacts/{contact_id}"
-            "/follow-ups/{follow_up_id}",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}",
             "contact_follow_up:update",
             "contact_follow_up",
             "follow_up_id",
         ),
         (
             "DELETE",
-            "/customers/{customer_id}/contacts/{contact_id}"
-            "/follow-ups/{follow_up_id}",
+            "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}",
             "contact_follow_up:delete",
             "contact_follow_up",
             "follow_up_id",

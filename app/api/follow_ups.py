@@ -83,9 +83,7 @@ def _follow_up_read(
         follow_up_at=follow_up.follow_up_at,
         content=follow_up.content,
         next_follow_up_at=follow_up.next_follow_up_at,
-        attachments=[
-            _attachment_read(attachment) for attachment in attachments
-        ],
+        attachments=[_attachment_read(attachment) for attachment in attachments],
         created_at=follow_up.created_at,
         updated_at=follow_up.updated_at,
     )
@@ -384,8 +382,7 @@ async def delete_follow_up(
 
 
 @router.post(
-    "/customers/{customer_id}/contacts/{contact_id}"
-    "/follow-ups/{follow_up_id}/restore",
+    "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/restore",
     response_model=SuccessEnvelope[FollowUpRead],
     dependencies=[Depends(require_permission("customer:delete"))],
 )
@@ -486,9 +483,7 @@ async def due_summary(
         context=context,
         follow_up_user_id=follow_up_user_id,
     )
-    return success(
-        DueSummaryRead(today=today_count, overdue=overdue_count)
-    )
+    return success(DueSummaryRead(today=today_count, overdue=overdue_count))
 
 
 # 跟进附件。
@@ -511,7 +506,7 @@ async def upload_attachment(
     encoded_name = request.headers.get("x-file-name")
     try:
         original_name = unquote(encoded_name) if encoded_name else None
-    except (TypeError, ValueError, UnicodeError):
+    except TypeError, ValueError, UnicodeError:
         original_name = None
     attachment = await attachment_service.upload_attachment(
         session,
@@ -631,8 +626,7 @@ register_audit_route(
 )
 register_audit_route(
     "POST",
-    "/customers/{customer_id}/contacts/{contact_id}"
-    "/follow-ups/{follow_up_id}/restore",
+    "/customers/{customer_id}/contacts/{contact_id}/follow-ups/{follow_up_id}/restore",
     action="contact_follow_up:restore",
     resource_type="contact_follow_up",
     resource_id_param="follow_up_id",

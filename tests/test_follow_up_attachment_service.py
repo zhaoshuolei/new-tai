@@ -86,9 +86,7 @@ async def test_non_owner_cannot_upload_or_delete(
     owner, customer, contact, follow_up, owner_ctx = await _fixture(
         session, tmp_path, monkeypatch
     )
-    attachment = await _upload_pdf(
-        session, customer, contact, follow_up, owner_ctx
-    )
+    attachment = await _upload_pdf(session, customer, contact, follow_up, owner_ctx)
     outsider = await make_user(session)
     ctx = make_context(
         outsider,
@@ -129,9 +127,7 @@ async def test_non_owner_with_customer_read_can_download(
     owner, customer, contact, follow_up, owner_ctx = await _fixture(
         session, tmp_path, monkeypatch
     )
-    attachment = await _upload_pdf(
-        session, customer, contact, follow_up, owner_ctx
-    )
+    attachment = await _upload_pdf(session, customer, contact, follow_up, owner_ctx)
     reader = await make_user(session)
     reader_ctx = make_context(reader, permission_codes={"customer:read"})
 

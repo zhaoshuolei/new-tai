@@ -36,10 +36,6 @@ async def test_deleted_method_is_not_restored_by_seed(session) -> None:  # noqa:
     rows = (await session.scalars(select(ContactFollowUpMethod))).all()
     method_rows = [row for row in rows if row.name == "电话"]
     assert len(method_rows) == 2
-    assert len(
-        [row for row in method_rows if row.status == ContactStatus.ACTIVE]
-    ) == 1
-    assert len(
-        [row for row in method_rows if row.status == ContactStatus.DELETED]
-    ) == 1
+    assert len([row for row in method_rows if row.status == ContactStatus.ACTIVE]) == 1
+    assert len([row for row in method_rows if row.status == ContactStatus.DELETED]) == 1
     assert len([row for row in rows if row.status == ContactStatus.ACTIVE]) == 4

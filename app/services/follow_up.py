@@ -93,8 +93,7 @@ def _normalize_method_name(name: str) -> str:
         raise _invalid_name_error("Follow-up method name is required")
     if len(value) > _NAME_MAX_LENGTH:
         raise _invalid_name_error(
-            "Follow-up method name must not exceed "
-            f"{_NAME_MAX_LENGTH} characters"
+            f"Follow-up method name must not exceed {_NAME_MAX_LENGTH} characters"
         )
     return value
 
