@@ -236,6 +236,136 @@ async def resolved(
     return definition
 
 
+async def definition_state(
+    session: AsyncSession,
+    table_id: int,
+) -> tuple[object, ...]:
+    """Read definition rows from the database, bypassing ORM identity state."""
+    table_row = (
+        await session.execute(
+            select(
+                DataTableDefinition.name,
+                DataTableDefinition.description,
+                DataTableDefinition.status,
+                DataTableDefinition.locked_at,
+                DataTableDefinition.created_by,
+                DataTableDefinition.updated_by,
+            )
+            .where(DataTableDefinition.id == table_id)
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+    field_rows = tuple(
+        (
+            await session.execute(
+                select(
+                    DataFieldDefinition.id,
+                    DataFieldDefinition.label,
+                    DataFieldDefinition.field_type,
+                    DataFieldDefinition.system_key,
+                    DataFieldDefinition.required,
+                    DataFieldDefinition.sort_order,
+                )
+                .where(DataFieldDefinition.table_id == table_id)
+                .order_by(DataFieldDefinition.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    option_rows = tuple(
+        (
+            await session.execute(
+                select(
+                    DataEnumOption.id,
+                    DataEnumOption.field_id,
+                    DataEnumOption.label,
+                    DataEnumOption.sort_order,
+                )
+                .where(
+                    DataEnumOption.field_id.in_(
+                        select(DataFieldDefinition.id).where(
+                            DataFieldDefinition.table_id == table_id
+                        )
+                    )
+                )
+                .order_by(DataEnumOption.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    return (table_row, field_rows, option_rows)
+
+
+async def snapshot_history_state(
+    session: AsyncSession,
+    snapshot_id: int,
+) -> tuple[object, ...]:
+    """Read snapshot history and its current pointer from the database."""
+    snapshot = (
+        await session.execute(
+            select(
+                DataSnapshot.id,
+                DataSnapshot.status,
+                DataSnapshot.business_date,
+                DataSnapshot.version,
+                DataSnapshot.import_id,
+            )
+            .where(DataSnapshot.id == snapshot_id)
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+    record_rows = tuple(
+        (
+            await session.execute(
+                select(
+                    DataRecord.id,
+                    DataRecord.snapshot_id,
+                    DataRecord.revenue,
+                    DataRecord.cost,
+                )
+                .where(DataRecord.snapshot_id == snapshot_id)
+                .order_by(DataRecord.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    value_rows = tuple(
+        (
+            await session.execute(
+                select(
+                    DataRecordValue.id,
+                    DataRecordValue.record_id,
+                    DataRecordValue.field_id,
+                    DataRecordValue.enum_option_id,
+                )
+                .where(
+                    DataRecordValue.record_id.in_(
+                        select(DataRecord.id).where(
+                            DataRecord.snapshot_id == snapshot_id
+                        )
+                    )
+                )
+                .order_by(DataRecordValue.id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    pointer_rows = tuple(
+        (
+            await session.execute(
+                select(
+                    DataCurrentSnapshot.c.table_id,
+                    DataCurrentSnapshot.c.business_date,
+                    DataCurrentSnapshot.c.snapshot_id,
+                )
+                .where(DataCurrentSnapshot.c.snapshot_id == snapshot_id)
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    return (snapshot, record_rows, value_rows, pointer_rows)
+
+
 def test_error_codes_are_exact() -> None:
     assert ErrorCode.DATA_TABLE_NOT_FOUND == 9001
     assert ErrorCode.DATA_TABLE_NAME_EXISTS == 9002
@@ -1020,14 +1150,9 @@ async def test_unfinished_import_blocks_definition_change(
     assert await session.get(DataTableDefinition, table.id) is not None
 
 
-@pytest.mark.parametrize(
-    "status",
-    [DataImportStatus.SUCCEEDED, DataImportStatus.FAILED],
-)
-async def test_terminal_import_does_not_block_definition_change(
+async def test_failed_import_does_not_block_definition_change(
     session: AsyncSession,
     context: AuthContext,
-    status: DataImportStatus,
 ) -> None:
     table = await data_table_service.create_table(
         session,
@@ -1037,7 +1162,7 @@ async def test_terminal_import_does_not_block_definition_change(
     await add_import(
         session,
         table,
-        status=status,
+        status=DataImportStatus.FAILED,
         owner_id=context.user_id,
     )
 
@@ -1049,6 +1174,153 @@ async def test_terminal_import_does_not_block_definition_change(
     )
 
     assert replaced.name == "终态后改名"
+
+
+async def test_successful_import_on_draft_table_blocks_mutation(
+    session: AsyncSession,
+    context: AuthContext,
+) -> None:
+    """DRAFT 表若带着 SUCCEEDED 导入（恢复残留/状态缺陷），必须按冻结拒绝。
+
+    正常流程下成功导入与 LOCKED 在同一事务内写入，但状态一旦不一致，
+    也不能让替换撞上外键 RESTRICT（500），更不能让删除清空成功历史。
+    """
+    table = await data_table_service.create_table(
+        session,
+        make_table_payload(),
+        context=context,
+    )
+    job = await add_import(
+        session,
+        table,
+        status=DataImportStatus.SUCCEEDED,
+        owner_id=context.user_id,
+    )
+    before = await resolved(session, table.id)
+
+    with pytest.raises(BusinessError) as exc:
+        await data_table_service.replace_table(
+            session,
+            table.id,
+            make_table_payload(name="成功数据后改名"),
+            context=context,
+        )
+    assert exc.value.code == ErrorCode.DATA_TABLE_LOCKED
+    assert exc.value.http_status == 409
+
+    with pytest.raises(BusinessError) as exc:
+        await data_table_service.delete_table(
+            session,
+            table.id,
+            context=context,
+        )
+    assert exc.value.code == ErrorCode.DATA_TABLE_LOCKED
+    assert exc.value.http_status == 409
+
+    after = await resolved(session, table.id)
+    assert after.table.name == before.table.name
+    assert [field.id for field in after.fields] == [field.id for field in before.fields]
+    assert await session.get(DataImportJob, job.id) is not None
+    assert await session.get(DataTableDefinition, table.id) is not None
+
+
+@pytest.mark.parametrize(
+    "snapshot_status",
+    [DataSnapshotStatus.ACTIVE, DataSnapshotStatus.SUPERSEDED],
+)
+async def test_successful_snapshot_history_survives_replace_and_delete_attempts(
+    session: AsyncSession,
+    context: AuthContext,
+    snapshot_status: DataSnapshotStatus,
+) -> None:
+    """ACTIVE/SUPERSEDED 历史在替换与删除被拒后必须逐行保持不变。"""
+    owner = await make_user(session)
+    customer = await make_customer_row(session, owner=owner)
+    table = await data_table_service.create_table(
+        session,
+        make_table_payload(
+            fields=[
+                *fixed_field_inputs(),
+                enum_field(
+                    "渠道",
+                    options=[DataEnumOptionInput(label="A", sort_order=0)],
+                ),
+            ],
+        ),
+        context=context,
+    )
+    definition = await resolved(session, table.id)
+    enum_row = definition.custom_fields[0]
+    option = definition.options_for(enum_row.id)[0]
+    job = await add_import(
+        session,
+        table,
+        status=DataImportStatus.FAILED,
+        owner_id=context.user_id,
+    )
+    snapshot = DataSnapshot(
+        table_id=table.id,
+        business_date=date(2026, 10, 18),
+        import_id=job.id,
+        version=1,
+        status=snapshot_status,
+    )
+    session.add(snapshot)
+    await session.flush()
+    record = DataRecord(
+        snapshot_id=snapshot.id,
+        table_id=table.id,
+        business_date=date(2026, 10, 18),
+        upstream_customer_id=customer.id,
+        downstream_customer_id=customer.id,
+        upstream_customer_name_source="上游来源名称",
+        downstream_customer_name_source="下游来源名称",
+        revenue=Decimal("1942.51000000"),
+        cost=Decimal("1155.14000000"),
+    )
+    session.add(record)
+    await session.flush()
+    session.add(
+        DataRecordValue(
+            record_id=record.id,
+            field_id=enum_row.id,
+            enum_option_id=option.id,
+        )
+    )
+    await session.execute(
+        DataCurrentSnapshot.insert().values(
+            table_id=table.id,
+            business_date=date(2026, 10, 18),
+            snapshot_id=snapshot.id,
+        )
+    )
+    await session.flush()
+    before_definition = await definition_state(session, table.id)
+    before_history = await snapshot_history_state(session, snapshot.id)
+
+    with pytest.raises(BusinessError) as exc:
+        await data_table_service.replace_table(
+            session,
+            table.id,
+            make_table_payload(name="成功历史后改名"),
+            context=context,
+        )
+    assert exc.value.code == ErrorCode.DATA_TABLE_LOCKED
+    assert await definition_state(session, table.id) == before_definition
+    assert await snapshot_history_state(session, snapshot.id) == before_history
+
+    with pytest.raises(BusinessError) as exc:
+        await data_table_service.delete_table(
+            session,
+            table.id,
+            context=context,
+        )
+    assert exc.value.code == ErrorCode.DATA_TABLE_LOCKED
+    assert await definition_state(session, table.id) == before_definition
+    assert await snapshot_history_state(session, snapshot.id) == before_history
+    assert await session.get(DataSnapshot, snapshot.id) is not None
+    assert await session.get(DataRecord, record.id) is not None
+    assert await session.get(DataImportJob, job.id) is not None
 
 
 async def test_replace_keeps_failed_import_diagnostics_but_clears_field_ids(
@@ -1431,7 +1703,8 @@ async def test_definition_mutation_locks_table_before_import_check(
     )
     events: list[str] = []
     original_lock = data_table_repository.get_table_for_update
-    original_check = data_table_repository.has_unfinished_import
+    original_import_check = data_table_repository.has_unfinished_import
+    original_data_check = data_table_repository.has_successful_data
 
     async def recording_lock(
         lock_session: AsyncSession,
@@ -1440,12 +1713,19 @@ async def test_definition_mutation_locks_table_before_import_check(
         events.append("lock")
         return await original_lock(lock_session, table_id)
 
-    async def recording_check(
+    async def recording_import_check(
         check_session: AsyncSession,
         table_id: int,
     ) -> bool:
         events.append("imports")
-        return await original_check(check_session, table_id)
+        return await original_import_check(check_session, table_id)
+
+    async def recording_data_check(
+        check_session: AsyncSession,
+        table_id: int,
+    ) -> bool:
+        events.append("successful")
+        return await original_data_check(check_session, table_id)
 
     monkeypatch.setattr(
         data_table_repository,
@@ -1455,7 +1735,12 @@ async def test_definition_mutation_locks_table_before_import_check(
     monkeypatch.setattr(
         data_table_repository,
         "has_unfinished_import",
-        recording_check,
+        recording_import_check,
+    )
+    monkeypatch.setattr(
+        data_table_repository,
+        "has_successful_data",
+        recording_data_check,
     )
 
     await data_table_service.replace_table(
@@ -1470,7 +1755,10 @@ async def test_definition_mutation_locks_table_before_import_check(
         context=context,
     )
 
-    assert events == ["lock", "imports", "lock", "imports"]
+    service_guard = ["lock", "imports", "successful"]
+    repository_guard = ["imports", "successful"]
+    mutation_guard = [*service_guard, *repository_guard]
+    assert events == [*mutation_guard, *mutation_guard]
 
 
 async def test_create_writes_success_audit_entry(

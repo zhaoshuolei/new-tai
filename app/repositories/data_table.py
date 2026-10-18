@@ -4,8 +4,9 @@
 删除依赖顺序。写入只做 flush，事务边界由服务层控制。
 
 加锁约定：任何定义变更或删除都必须先取得 ``custom_data_table`` 行锁
-（``get_table_for_update``），再检查未完成导入；导入入队同样先锁该行，
-因此“检查—写入”之间不会插入新任务（见设计 6.4、8.1）。
+（``get_table_for_update``），再依次检查未完成导入与成功数据；导入入队
+同样先锁该行，因此“检查—写入”之间不会插入新任务（见设计 6.4、8.1）。
+锁顺序固定为表行 → 导入行 → 快照行，避免与 worker 互相死锁。
 """
 
 from collections.abc import Sequence
@@ -38,6 +39,13 @@ _UNFINISHED_IMPORT_STATUSES: tuple[DataImportStatus, ...] = (
     DataImportStatus.QUEUED,
     DataImportStatus.VALIDATING,
     DataImportStatus.APPLYING,
+)
+
+# 成功数据：已成功完成的导入，或任何已生效/被替换的历史快照。
+# 设计 8.1/8.2：只有“没有成功生效导入”的 DRAFT 表才能改结构或物理删除。
+_SUCCESSFUL_SNAPSHOT_STATUSES: tuple[DataSnapshotStatus, ...] = (
+    DataSnapshotStatus.ACTIVE,
+    DataSnapshotStatus.SUPERSEDED,
 )
 
 _NAME_UNIQUE_INDEX = "uq_custom_data_table_name"
@@ -227,6 +235,75 @@ async def has_unfinished_import(session: AsyncSession, table_id: int) -> bool:
         .with_for_update()
     )
     return await session.scalar(statement) is not None
+
+
+async def has_successful_data(session: AsyncSession, table_id: int) -> bool:
+    """判断表上是否已经存在成功生效的数据。
+
+    条件取“至少满足其一”：存在 ``SUCCEEDED`` 导入，或存在任何
+    ``ACTIVE``/``SUPERSEDED`` 快照。``STAGED`` 快照与 ``FAILED`` 导入
+    不算成功数据（设计 8.1：只有 SQL 意义上的失败/暂存数据可随表删除）。
+
+    使用 ``FOR UPDATE`` 强制当前读，原因与 ``has_unfinished_import`` 相同：
+    调用方的 REPEATABLE READ 快照可能建立于 worker 提交激活之前。
+
+    锁顺序约定：调用方必须先锁 ``custom_data_table`` 行，再调用本函数；
+    ``activate_import`` 同样先锁表行，再写导入与快照。固定“表行 → 导入行
+    → 快照行”，不会与定义变更或 worker 形成反向等待。
+    """
+    successful_import_statement = (
+        select(DataImportJob.id)
+        .where(
+            DataImportJob.table_id == table_id,
+            DataImportJob.status == DataImportStatus.SUCCEEDED,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if await session.scalar(successful_import_statement) is not None:
+        return True
+
+    snapshot_statement = (
+        select(DataSnapshot.id)
+        .where(
+            DataSnapshot.table_id == table_id,
+            DataSnapshot.status.in_(_SUCCESSFUL_SNAPSHOT_STATUSES),
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    return await session.scalar(snapshot_statement) is not None
+
+
+async def constrain_table_mutation(
+    session: AsyncSession,
+    table: DataTableDefinition,
+) -> DataTableDefinition:
+    """仓储层的变异前置守卫：DRAFT + 无未完成导入 + 无成功数据。
+
+    服务层已在本函数的同一事务里锁定并检查过表状态，这里再做一次校验，
+    使得直接调用 ``replace_table``/``delete_table`` 的调用方（worker、
+    脚本、未来代码）也无法绕过数据保护：DRAFT 表若因恢复残留或状态缺陷
+    携带成功历史，必须拒绝而不是撞上外键 RESTRICT 或静默删数据。
+
+    锁顺序：调用方必须已经持有表行锁；本函数只追加“导入行 → 快照行”
+    的当前读，不改变既有顺序。
+    """
+    if table.status != DataTableStatus.DRAFT:
+        raise table_locked_error()
+    if await has_unfinished_import(session, table.id):
+        raise unfinished_import_error()
+    if await has_successful_data(session, table.id):
+        raise table_locked_error()
+    return table
+
+
+def unfinished_import_error() -> BusinessError:
+    return BusinessError(
+        ErrorCode.DATA_IMPORT_IN_PROGRESS,
+        "Data table has an unfinished import",
+        http_status=409,
+    )
 
 
 async def load_resolved_definitions(
@@ -502,13 +579,13 @@ async def replace_table(
 ) -> DataTableDefinition:
     """整体替换 DRAFT 定义的字段与选项，字段 ID 会随之变化。
 
-    调用方必须先锁表行并确认没有未完成导入（见 ``has_unfinished_import``）。
-    旧字段与旧选项被物理删除，因此这里会先清掉遗留的 STAGED 快照；
-    ACTIVE/SUPERSEDED 快照不可能出现在 DRAFT 表上——成功激活会在同一
-    事务内把表置为 LOCKED，所以此处不做静默的数据删除。
+    调用方必须先锁表行；本函数自己确认没有未完成导入、也没有成功数据
+    （``constrain_table_mutation``），因此不会撞上外键 RESTRICT，也不会
+    删除任何已被成功快照引用的字段。旧字段与旧选项被物理删除，所以这里
+    会先清掉崩溃 worker 遗留的 STAGED 快照；ACTIVE/SUPERSEDED 属于成功
+    历史，只可能出现在“损坏的 DRAFT”上，必须直接拒绝。
     """
-    if table.status != DataTableStatus.DRAFT:
-        raise table_locked_error()
+    await constrain_table_mutation(session, table)
 
     table_id = table.id
     try:
@@ -564,9 +641,12 @@ async def delete_table(
     session: AsyncSession,
     table: DataTableDefinition,
 ) -> None:
-    """物理删除 DRAFT 表及其失败导入、快照和记录。"""
-    if table.status != DataTableStatus.DRAFT:
-        raise table_locked_error()
+    """物理删除 DRAFT 表及其失败导入、快照和记录。
+
+    只允许删除“没有成功数据”的 DRAFT 表：成功历史是未来的对账依据，
+    即便表状态因残留或缺陷仍是 DRAFT，也必须拒绝而不是级联删除。
+    """
+    await constrain_table_mutation(session, table)
 
     table_id = table.id
     await _delete_snapshot_rows(session, table_id)
@@ -583,10 +663,12 @@ __all__: tuple[str, ...] = (
     "FieldSpec",
     "ResolvedDataDefinition",
     "build_table_for_update_statement",
+    "constrain_table_mutation",
     "create_table",
     "delete_table",
     "get_table",
     "get_table_for_update",
+    "has_successful_data",
     "has_unfinished_import",
     "list_tables",
     "load_resolved_definition",
@@ -594,4 +676,5 @@ __all__: tuple[str, ...] = (
     "name_exists_error",
     "replace_table",
     "table_locked_error",
+    "unfinished_import_error",
 )

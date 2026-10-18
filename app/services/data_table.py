@@ -88,6 +88,21 @@ def _import_in_progress_error() -> BusinessError:
     )
 
 
+def _data_exists_error() -> BusinessError:
+    """已经有成功数据时的定义保护错误。
+
+    错误码复用 9003：设计 8.2 把“成功生效后不可修改”定义为冻结语义，
+    9003 的对外含义正是“数据表已冻结，不能修改”。正常流程下成功数据
+    必然伴随 LOCKED，因此不需要新错误码；这里只为恢复残留或状态缺陷
+    补一条防御性拒绝，语义与冻结完全一致。
+    """
+    return BusinessError(
+        ErrorCode.DATA_TABLE_LOCKED,
+        "Data table already contains successful data and is locked",
+        http_status=409,
+    )
+
+
 def _normalize_label(label: str, *, kind: str) -> str:
     value = label.strip()
     if not value:
@@ -258,7 +273,9 @@ async def _require_writable_table(
     """加锁读取表并校验它仍可修改。
 
     必须先取表行锁再检查导入，否则并发导入可能在检查之后入队，
-    导致任务按过期定义执行（见设计 6.4）。
+    导致任务按过期定义执行（见设计 6.4）。检查顺序固定为
+    “表行锁 → 未完成导入 → 成功数据”，与仓储层守卫保持一致：
+    有排队任务时报 9008，有成功数据时报 9003。
     """
     table = await data_table_repository.get_table_for_update(session, table_id)
     if table is None:
@@ -267,6 +284,8 @@ async def _require_writable_table(
         raise _locked_error()
     if await data_table_repository.has_unfinished_import(session, table_id):
         raise _import_in_progress_error()
+    if await data_table_repository.has_successful_data(session, table_id):
+        raise _data_exists_error()
     return table
 
 
