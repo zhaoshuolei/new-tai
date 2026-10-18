@@ -522,6 +522,8 @@ async def _grant_baseline_menus(
     )
     for role_id in role_ids:
         for menu in targets:
+            # This guard handles sequential reruns; the composite PK is the
+            # concurrency backstop.
             assigned = await session.scalar(
                 select(RoleMenu.c.menu_id).where(
                     RoleMenu.c.role_id == role_id,

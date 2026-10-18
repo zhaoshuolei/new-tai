@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.config import settings
@@ -162,47 +162,137 @@ async def test_default_role_is_scoped_to_self(session: AsyncSession) -> None:
 async def test_directory_menu_is_seeded_once_and_granted_to_existing_roles(
     session: AsyncSession,
 ) -> None:
-    await init_data(
-        session,
-        superadmin_username="superadmin",
-        superadmin_password="test-password1",
-    )
-    await init_data(
-        session,
-        superadmin_username="superadmin",
-        superadmin_password="test-password1",
-    )
-
-    menus = list(
+    # The first-creation grant only fires when the baseline menus are absent, so
+    # start from a known state even if an earlier run committed seed data.
+    baseline_ids = list(
         (
             await session.scalars(
-                select(Menu).where(
-                    Menu.name == "通讯录",
+                select(Menu.id).where(
                     Menu.parent_id.is_(None),
+                    Menu.name.in_(("个人资料", "通讯录")),
                 )
             )
         ).all()
     )
-    default = await session.scalar(select(Role).where(Role.code == "default"))
-    menu_names = set(
-        list(
+    if baseline_ids:
+        await session.execute(
+            delete(RoleMenu).where(RoleMenu.c.menu_id.in_(baseline_ids))
+        )
+        await session.execute(delete(Menu).where(Menu.id.in_(baseline_ids)))
+        await session.flush()
+
+    existing_role = Role(
+        code="directory-existing-role",
+        name="Existing Directory Role",
+        description=None,
+        data_scope=DataScope.SELF,
+        data_scope_include_children=True,
+        is_system=False,
+        status=RoleStatus.ACTIVE,
+    )
+    session.add(existing_role)
+    await session.flush()
+
+    try:
+        await init_data(
+            session,
+            superadmin_username="superadmin",
+            superadmin_password="test-password1",
+        )
+
+        super_admin = await session.scalar(
+            select(Role).where(Role.code == "super_admin")
+        )
+        default = await session.scalar(select(Role).where(Role.code == "default"))
+        assert super_admin is not None
+        assert default is not None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(RoleMenu)
+                .where(RoleMenu.c.role_id == super_admin.id)
+            )
+            == 0
+        )
+        existing_role_menu_names = set(
+            list(
+                (
+                    await session.scalars(
+                        select(Menu.name)
+                        .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                        .where(RoleMenu.c.role_id == existing_role.id)
+                    )
+                ).all()
+            )
+        )
+        assert existing_role_menu_names == {"个人资料", "通讯录"}
+
+        menu_names = set(
+            list(
+                (
+                    await session.scalars(
+                        select(Menu.name)
+                        .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
+                        .where(RoleMenu.c.role_id == default.id)
+                    )
+                ).all()
+            )
+        )
+        assert menu_names == {"个人资料", "通讯录"}
+
+        directory = await session.scalar(
+            select(Menu).where(
+                Menu.name == "通讯录",
+                Menu.parent_id.is_(None),
+            )
+        )
+        assert directory is not None
+        await session.execute(
+            delete(RoleMenu).where(
+                RoleMenu.c.role_id == default.id,
+                RoleMenu.c.menu_id == directory.id,
+            )
+        )
+        await session.flush()
+
+        await init_data(
+            session,
+            superadmin_username="superadmin",
+            superadmin_password="test-password1",
+        )
+
+        menus = list(
             (
                 await session.scalars(
-                    select(Menu.name)
-                    .join(RoleMenu, RoleMenu.c.menu_id == Menu.id)
-                    .where(RoleMenu.c.role_id == default.id)
+                    select(Menu).where(
+                        Menu.name == "通讯录",
+                        Menu.parent_id.is_(None),
+                    )
                 )
             ).all()
         )
-    )
 
-    assert len(menus) == 1
-    directory = menus[0]
-    assert directory.type == MenuType.MENU
-    assert directory.path == "/directory"
-    assert directory.permission_code is None
-    assert directory.sort_order == 5
-    assert menu_names == {"个人资料", "通讯录"}
+        assert len(menus) == 1
+        directory = menus[0]
+        assert directory.type == MenuType.MENU
+        assert directory.path == "/directory"
+        assert directory.permission_code is None
+        assert directory.sort_order == 5
+        assert (
+            await session.scalar(
+                select(RoleMenu.c.menu_id).where(
+                    RoleMenu.c.role_id == default.id,
+                    RoleMenu.c.menu_id == directory.id,
+                )
+            )
+            is None
+        )
+    finally:
+        await session.execute(
+            delete(RoleMenu).where(RoleMenu.c.role_id == existing_role.id)
+        )
+        await session.delete(existing_role)
+        await session.flush()
 
 
 async def test_init_creates_baseline_menu_tree(session: AsyncSession) -> None:
