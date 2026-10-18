@@ -1,8 +1,26 @@
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _resolve_follow_up_attachment_root_path(value: str) -> Path:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("follow_up_attachment_root must not be empty")
+
+    attachment_root = Path(stripped).expanduser().resolve()
+    working_directory = Path.cwd().resolve()
+    if (
+        attachment_root == working_directory
+        or attachment_root in working_directory.parents
+    ):
+        raise ValueError(
+            "follow_up_attachment_root must not be the current working directory "
+            "or an ancestor"
+        )
+    return attachment_root
 
 
 def resolve_media_root(value: str) -> Path:
@@ -17,6 +35,16 @@ def resolve_media_root(value: str) -> Path:
             "media_root must not be the current working directory or an ancestor"
         )
     return media_root
+
+
+def resolve_follow_up_attachment_root(value: str, media_root: str) -> Path:
+    attachment_root = _resolve_follow_up_attachment_root_path(value)
+    resolved_media_root = Path(media_root).expanduser().resolve()
+    if attachment_root.is_relative_to(
+        resolved_media_root
+    ) or resolved_media_root.is_relative_to(attachment_root):
+        raise ValueError("follow_up_attachment_root must not overlap media_root")
+    return attachment_root
 
 
 def normalize_media_url_path(value: str) -> str:
@@ -64,6 +92,11 @@ class Settings(BaseSettings):
     media_root: str = Field(default="media", validate_default=True)
     media_url_path: str = Field(default="/media", validate_default=True)
     system_asset_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
+    follow_up_attachment_root: str = Field(
+        default="attachments", validate_default=True
+    )
+    follow_up_attachment_max_bytes: int = 10485760
+    follow_up_attachment_max_per_record: int = 5
 
     @field_validator("media_root")
     @classmethod
@@ -74,6 +107,19 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_media_url_path(cls, value: str) -> str:
         return normalize_media_url_path(value)
+
+    @field_validator("follow_up_attachment_root")
+    @classmethod
+    def _validate_follow_up_attachment_root(cls, value: str) -> str:
+        return str(_resolve_follow_up_attachment_root_path(value))
+
+    @model_validator(mode="after")
+    def _validate_follow_up_attachment_root_does_not_overlap_media(self) -> Self:
+        resolve_follow_up_attachment_root(
+            self.follow_up_attachment_root,
+            self.media_root,
+        )
+        return self
 
 
 settings = Settings()

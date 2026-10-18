@@ -61,3 +61,46 @@ def test_monitor_sample_interval_must_be_positive(interval: int) -> None:
             monitor_sample_interval_seconds=interval,
             _env_file=None,
         )
+
+
+def _settings(**overrides: object) -> Settings:
+    values = {
+        "database_url": "mysql+asyncmy://u:p@localhost:3306/db",
+        "redis_url": "redis://localhost:6379/15",
+        "jwt_secret": "secret",
+        "config_encryption_key": Fernet.generate_key().decode(),
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def test_attachment_root_defaults_below_working_directory(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    settings = _settings(media_root=str(tmp_path / "media"))
+    assert settings.follow_up_attachment_root.startswith(str(tmp_path))
+    assert settings.follow_up_attachment_max_bytes == 10485760
+    assert settings.follow_up_attachment_max_per_record == 5
+
+
+@pytest.mark.parametrize("suffix", ["", "/nested", "/../media/nested"])
+def test_attachment_root_must_not_overlap_media_root(
+    tmp_path, monkeypatch, suffix
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    media_root = tmp_path / "media"
+    with pytest.raises(ValidationError):
+        _settings(
+            media_root=str(media_root),
+            follow_up_attachment_root=str(media_root) + suffix,
+        )
+
+
+def test_media_root_inside_attachment_root_is_rejected(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValidationError):
+        _settings(
+            media_root=str(tmp_path / "files" / "media"),
+            follow_up_attachment_root=str(tmp_path / "files"),
+        )
