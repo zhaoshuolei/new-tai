@@ -1,13 +1,17 @@
 """跟进方式、跟进记录与附件的数据访问。"""
 
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import Subquery
 
-from app.models.contact import ContactStatus, CustomerContact
+from app.models.contact import ContactFunction, ContactStatus, CustomerContact
+from app.models.customer import Customer
 from app.models.follow_up import (
     ContactFollowUp,
     ContactFollowUpAttachment,
@@ -336,17 +340,332 @@ async def delete_attachment_row(
     await session.flush()
 
 
+# 待跟进查询：当前计划候选、列表、客户聚合与状态计数。
+
+DueState = Literal["today", "overdue", "all"]
+
+
+@dataclass(frozen=True)
+class DueFollowUpRow:
+    """当前待跟进计划及其联系人、客户和跟进人展示字段。"""
+
+    follow_up: ContactFollowUp
+    contact: CustomerContact
+    function_name: str
+    customer: Customer
+    follow_up_user_nickname: str | None
+    follow_up_user_username: str | None
+    due_state: Literal["today", "overdue"]
+
+
+@dataclass(frozen=True)
+class DueCustomerRow:
+    """客户维度的待跟进聚合。"""
+
+    customer_id: int
+    customer_name: str
+    due_count: int
+    overdue_count: int
+    earliest_next_follow_up_at: datetime
+
+
+def _current_plan_candidates() -> Subquery:
+    """为每个对接人选出全部未删除记录中最新的一条。"""
+    return (
+        select(
+            ContactFollowUp.id.label("follow_up_id"),
+            ContactFollowUp.contact_id.label("contact_id"),
+            ContactFollowUp.follow_up_user_id.label("follow_up_user_id"),
+            ContactFollowUp.next_follow_up_at.label("next_follow_up_at"),
+            func.row_number()
+            .over(
+                partition_by=ContactFollowUp.contact_id,
+                order_by=(
+                    ContactFollowUp.follow_up_at.desc(),
+                    ContactFollowUp.id.desc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(ContactFollowUp.status == ContactStatus.ACTIVE)
+        .subquery("current_plan_candidates")
+    )
+
+
+def _due_conditions(
+    candidate: Subquery,
+    *,
+    scope_filter: ColumnElement[bool],
+    due_state: DueState,
+    today_start: datetime,
+    tomorrow_start: datetime,
+    follow_up_user_id: int | None,
+) -> list[ColumnElement[bool]]:
+    """构造待跟进候选的共享过滤条件。"""
+    next_follow_up_at = candidate.c.next_follow_up_at
+    conditions: list[ColumnElement[bool]] = [
+        candidate.c.row_number == 1,
+        next_follow_up_at.is_not(None),
+        CustomerContact.status == ContactStatus.ACTIVE,
+        Customer.status == ContactStatus.ACTIVE,
+        scope_filter,
+    ]
+
+    if due_state == "overdue":
+        conditions.append(next_follow_up_at < today_start)
+    elif due_state == "today":
+        conditions.extend(
+            (
+                next_follow_up_at >= today_start,
+                next_follow_up_at < tomorrow_start,
+            )
+        )
+    else:
+        conditions.append(next_follow_up_at < tomorrow_start)
+
+    if follow_up_user_id is not None:
+        conditions.append(candidate.c.follow_up_user_id == follow_up_user_id)
+    return conditions
+
+
+async def list_due_follow_ups(
+    session: AsyncSession,
+    *,
+    scope_filter: ColumnElement[bool],
+    due_state: DueState,
+    today_start: datetime,
+    tomorrow_start: datetime,
+    follow_up_user_id: int | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[DueFollowUpRow], int]:
+    """分页列出当前计划已到期或今日到期的对接人。"""
+    candidate = _current_plan_candidates()
+    conditions = _due_conditions(
+        candidate,
+        scope_filter=scope_filter,
+        due_state=due_state,
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+    )
+
+    total_statement = (
+        select(func.count())
+        .select_from(candidate)
+        .join(
+            CustomerContact,
+            candidate.c.contact_id == CustomerContact.id,
+        )
+        .join(Customer, CustomerContact.customer_id == Customer.id)
+        .where(*conditions)
+    )
+    total = await session.scalar(total_statement)
+
+    statement = (
+        select(
+            ContactFollowUp,
+            CustomerContact,
+            ContactFunction.name,
+            Customer,
+            User.nickname,
+            User.username,
+            case(
+                (candidate.c.next_follow_up_at < today_start, "overdue"),
+                else_="today",
+            ).label("due_state"),
+        )
+        .select_from(candidate)
+        .join(ContactFollowUp, candidate.c.follow_up_id == ContactFollowUp.id)
+        .join(CustomerContact, candidate.c.contact_id == CustomerContact.id)
+        .join(Customer, CustomerContact.customer_id == Customer.id)
+        .join(
+            ContactFunction,
+            CustomerContact.function_id == ContactFunction.id,
+        )
+        .join(User, candidate.c.follow_up_user_id == User.id)
+        .where(*conditions)
+        .order_by(
+            candidate.c.next_follow_up_at.asc(),
+            candidate.c.follow_up_id.asc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    result = await session.execute(statement)
+    rows = [
+        DueFollowUpRow(
+            follow_up=follow_up,
+            contact=contact,
+            function_name=function_name,
+            customer=customer,
+            follow_up_user_nickname=nickname,
+            follow_up_user_username=username,
+            due_state=cast(Literal["today", "overdue"], row_due_state),
+        )
+        for (
+            follow_up,
+            contact,
+            function_name,
+            customer,
+            nickname,
+            username,
+            row_due_state,
+        ) in result.all()
+    ]
+    return rows, int(total or 0)
+
+
+async def list_due_customers(
+    session: AsyncSession,
+    *,
+    scope_filter: ColumnElement[bool],
+    due_state: DueState,
+    today_start: datetime,
+    tomorrow_start: datetime,
+    follow_up_user_id: int | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[DueCustomerRow], int]:
+    """按客户聚合分页列出待跟进对接人数。"""
+    candidate = _current_plan_candidates()
+    conditions = _due_conditions(
+        candidate,
+        scope_filter=scope_filter,
+        due_state=due_state,
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+    )
+    earliest_next_follow_up_at = func.min(
+        candidate.c.next_follow_up_at
+    ).label("earliest_next_follow_up_at")
+    grouped_statement = (
+        select(
+            Customer.id.label("customer_id"),
+            Customer.name.label("customer_name"),
+            func.count(func.distinct(candidate.c.contact_id)).label("due_count"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (candidate.c.next_follow_up_at < today_start, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("overdue_count"),
+            earliest_next_follow_up_at,
+        )
+        .select_from(candidate)
+        .join(
+            CustomerContact,
+            candidate.c.contact_id == CustomerContact.id,
+        )
+        .join(Customer, CustomerContact.customer_id == Customer.id)
+        .where(*conditions)
+        .group_by(Customer.id, Customer.name)
+    )
+
+    total_statement = select(func.count()).select_from(
+        grouped_statement.subquery("due_customer_groups")
+    )
+    total = await session.scalar(total_statement)
+
+    statement = (
+        grouped_statement.order_by(earliest_next_follow_up_at.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    result = await session.execute(statement)
+    rows: list[DueCustomerRow] = []
+    for (
+        customer_id,
+        customer_name,
+        due_count,
+        overdue_count,
+        earliest,
+    ) in result.all():
+        assert earliest is not None
+        rows.append(
+            DueCustomerRow(
+                customer_id=int(customer_id),
+                customer_name=customer_name,
+                due_count=int(due_count),
+                overdue_count=int(overdue_count),
+                earliest_next_follow_up_at=earliest,
+            )
+        )
+    return rows, int(total or 0)
+
+
+async def count_due_states(
+    session: AsyncSession,
+    *,
+    scope_filter: ColumnElement[bool],
+    today_start: datetime,
+    tomorrow_start: datetime,
+    follow_up_user_id: int | None,
+) -> tuple[int, int]:
+    """统计待跟进对接人数，返回今日数与逾期数。"""
+    candidate = _current_plan_candidates()
+    conditions = _due_conditions(
+        candidate,
+        scope_filter=scope_filter,
+        due_state="all",
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+    )
+    statement = (
+        select(
+            func.coalesce(
+                func.sum(
+                    case(
+                        (candidate.c.next_follow_up_at >= today_start, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("today_count"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (candidate.c.next_follow_up_at < today_start, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("overdue_count"),
+        )
+        .select_from(candidate)
+        .join(
+            CustomerContact,
+            candidate.c.contact_id == CustomerContact.id,
+        )
+        .join(Customer, CustomerContact.customer_id == Customer.id)
+        .where(*conditions)
+    )
+    result = await session.execute(statement)
+    today_count, overdue_count = result.one()
+    return int(today_count or 0), int(overdue_count or 0)
+
+
 __all__: tuple[str, ...] = (
+    "DueCustomerRow",
+    "DueFollowUpRow",
     "FollowUpRow",
     "add_attachment",
     "add_follow_up",
     "count_attachments",
+    "count_due_states",
     "delete_attachment_row",
     "get_attachment",
     "get_follow_up",
     "get_follow_up_row",
     "get_method",
     "list_attachments",
+    "list_due_customers",
+    "list_due_follow_ups",
     "list_follow_ups",
     "list_methods",
     "lock_follow_up_for_update",

@@ -1,17 +1,18 @@
-"""跟进方式与跟进记录的业务逻辑。
+"""跟进方式、跟进记录与待跟进查询的业务逻辑。
 
-本模块实现跟进方式的维护，以及跟进记录的查询、新增、部分更新、删除与
-恢复。待跟进查询由后续任务追加到同一模块。
+本模块实现跟进方式的维护，以及跟进记录的查询、新增、部分更新、删除、
+恢复和今日/逾期待跟进查询。
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
-from app.core.datetime_utils import to_utc_naive
+from app.core.datetime_utils import business_day_bounds_utc, to_utc_naive
 from app.core.errors import BusinessError, ErrorCode
 from app.models.contact import ContactStatus, CustomerContact
 from app.models.customer import Customer
@@ -19,10 +20,14 @@ from app.models.follow_up import ContactFollowUp, ContactFollowUpMethod
 from app.models.user import User, UserStatus
 from app.repositories import contact as contact_repository
 from app.repositories import follow_up as follow_up_repository
-from app.repositories.follow_up import FollowUpRow
+from app.repositories.follow_up import DueCustomerRow, DueFollowUpRow, FollowUpRow
 from app.schemas.follow_up import FollowUpCreate, FollowUpUpdate
 from app.services.audit import audited
-from app.services.data_scope import apply_customer_scope, apply_user_scope
+from app.services.data_scope import (
+    apply_customer_scope,
+    apply_user_scope,
+    build_customer_scope_filter,
+)
 
 _NAME_MAX_LENGTH = 64
 _CONTENT_MAX_LENGTH = 5000
@@ -736,13 +741,82 @@ async def restore_follow_up(
     return await _follow_up_row(session, follow_up.id)
 
 
+# 待跟进查询：业务日边界、可见范围与分页。
+
+
+async def list_due_follow_ups(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+    due: Literal["today", "overdue", "all"],
+    follow_up_user_id: int | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[DueFollowUpRow], int]:
+    """分页列出当前用户数据范围内今日或逾期待跟进的对接人。"""
+    today_start, tomorrow_start = business_day_bounds_utc(_now_naive())
+    return await follow_up_repository.list_due_follow_ups(
+        session,
+        scope_filter=build_customer_scope_filter(context),
+        due_state=due,
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+async def list_due_customers(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+    due: Literal["today", "overdue", "all"],
+    follow_up_user_id: int | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[DueCustomerRow], int]:
+    """分页列出客户维度的待跟进对接人数与最早计划时间。"""
+    today_start, tomorrow_start = business_day_bounds_utc(_now_naive())
+    return await follow_up_repository.list_due_customers(
+        session,
+        scope_filter=build_customer_scope_filter(context),
+        due_state=due,
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+async def due_summary(
+    session: AsyncSession,
+    *,
+    context: AuthContext,
+    follow_up_user_id: int | None,
+) -> tuple[int, int]:
+    """统计今日与逾期待跟进对接人数。"""
+    today_start, tomorrow_start = business_day_bounds_utc(_now_naive())
+    return await follow_up_repository.count_due_states(
+        session,
+        scope_filter=build_customer_scope_filter(context),
+        today_start=today_start,
+        tomorrow_start=tomorrow_start,
+        follow_up_user_id=follow_up_user_id,
+    )
+
+
 __all__: tuple[str, ...] = (
     "create_follow_up",
     "create_method",
     "delete_follow_up",
     "delete_method",
+    "due_summary",
     "list_deleted_follow_ups",
     "list_deleted_methods",
+    "list_due_customers",
+    "list_due_follow_ups",
     "list_follow_ups",
     "list_methods",
     "require_active_contact",
