@@ -14,16 +14,21 @@ Parsing is synchronous; the worker (Task 9) runs it in a thread.
 """
 
 import json
+import math
 import re
+import warnings
 import zipfile
+import zlib
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 from xml.etree import ElementTree
+from xml.parsers import expat
 
 from openpyxl import Workbook, load_workbook  # type: ignore[import-untyped]
 from openpyxl.styles import Font  # type: ignore[import-untyped]
@@ -59,11 +64,69 @@ _FIELD_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,18}$")
 
 _XLSX_SIGNATURE = b"PK\x03\x04"
 _XLSX_MAX_BYTES = 50 * 1024 * 1024
+# --- XLSX decompression and sparse-coordinate budgets -----------------------
+# Only the 50 MiB *compressed* size is observable from the filesystem, so every
+# structural read (metadata, shared strings, worksheet streaming) is bounded by
+# the ZIP central directory before any member is expanded. The central
+# directory is attacker-controlled, but ``zipfile`` truncates every member at
+# its declared ``file_size``, so these budgets really do cap expansion. All
+# limits are centralized here so Task 13 can benchmark them.
+#
+# Worksheet parts are streamed row by row (constant memory), so their cap only
+# bounds time. 2 GiB is roughly 3.4x the measured 100,000-row x 105-column
+# envelope (578 MiB for varying short text) and still admits long text: 100,000
+# rows x 105 columns x 200 bytes per cell is about 2 GiB.
+_XLSX_MAX_WORKSHEET_BYTES = 2 * 1024 * 1024 * 1024
+# Every other part is materialized in memory by openpyxl. Shared strings
+# dominate: 100,000 rows x 100 text fields of unique 20-character values is
+# about 460 MiB of ``<si>`` XML, so 768 MiB leaves headroom for that envelope.
+_XLSX_MAX_METADATA_BYTES = 768 * 1024 * 1024
+_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES = 3 * 1024 * 1024 * 1024
+# Small XML parts read eagerly by this module during preflight. Each is
+# dominated by relationship and manifest entries, so a few MiB is already far
+# beyond anything a legitimate workbook declares.
+_XLSX_MAX_RELATIONSHIP_BYTES = 4 * 1024 * 1024
+_XLSX_MAX_WORKBOOK_XML_BYTES = 8 * 1024 * 1024
+_XLSX_MAX_CONTENT_TYPES_BYTES = 4 * 1024 * 1024
+_XLSX_MAX_MEMBERS = 4096
+# Structured spreadsheet content never compresses anywhere near this: the
+# measured worst case inside the envelope is 424.5 (cells filled with 4,000
+# identical characters, the maximum allowed text length), and 700 leaves 65%
+# headroom above it. A payload of all-zero bytes measures ~1,028:1, which is
+# essentially deflate's physical ceiling (1,032:1 per 32 KiB window), so a bomb
+# is rejected while legitimate workbooks are not. The gate only applies to
+# members of at least 1 MiB: ratio is meaningless for small parts (a 200-byte
+# core.xml is stored at ratio ~1.8).
+_XLSX_MAX_COMPRESSION_RATIO = 700
+_XLSX_RATIO_MIN_BYTES = 1024 * 1024
+# XLSX hard limits (ECMA-376): 1,048,576 rows and 16,384 columns (XFD).
+_XLSX_ROW_LIMIT = 1_048_576
+_XLSX_COLUMN_LIMIT = 16_384
+# Bounded sparse range. openpyxl's read-only iterator expands every missing row
+# between two present rows, so one cell at row 1,048,576 costs a million padded
+# rows even though the file is tiny. Data rows may be interleaved with blank
+# rows (which imports skip), so the row bound is twice the data-row budget.
+# Columns beyond the widest configured label must still be readable so a stray
+# value can be rejected as 9006; 256 covers the 105-label maximum with slack
+# while keeping padded iteration bounded. Both bounds are structural 9006.
+_XLSX_SPARSE_ROW_SLACK = 2
+_XLSX_MAX_SPARSE_ROW = _MAX_ROWS * _XLSX_SPARSE_ROW_SLACK
+_XLSX_MAX_SPARSE_COLUMN = 256
+_XLSX_SCAN_CHUNK_BYTES = 1 << 20
+_XLSX_ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+_XLSX_ROW_PATTERN = re.compile(r"^[1-9][0-9]{0,6}$")
+_XLSX_CELL_PATTERN = re.compile(r"^([A-Z]{1,3})([1-9][0-9]{0,6})$")
 _WORKBOOK_PART = "xl/workbook.xml"
 _WORKBOOK_RELS_PART = "xl/_rels/workbook.xml.rels"
-_MACRO_CONTENT_TYPE = b"macroEnabled"
-_MACRO_PART = "xl/vbaProject.bin"
+_CONTENT_TYPES_PART = "[Content_Types].xml"
 _CHARTSHEET_PREFIX = "xl/chartsheets/"
+_WORKSHEET_RELATIONSHIP_SUFFIX = "/worksheet"
+_CHARTSHEET_RELATIONSHIP_SUFFIX = "/chartsheet"
+# VBA is rejected by content type, relationship type, and member name so an
+# arbitrary filename or a relationship-only variant cannot smuggle a macro.
+_VBA_MEMBER_MARKER = "vbaproject"
+_VBA_CONTENT_TYPE_MARKERS = (b"vbaproject", b"macroenabled")
+_VBA_RELATIONSHIP_MARKERS = (b"vbaproject",)
 _EXCEL_SHEET_COUNT_MESSAGE = "Excel file must contain exactly one visible worksheet"
 _EXCEL_HEADER_MESSAGE = "Excel header row is invalid"
 _EXCEL_INVALID_MESSAGE = "Import Excel file is invalid"
@@ -1004,6 +1067,14 @@ class _ExcelCellCodec:
             if _COMPACT_DATE_PATTERN.fullmatch(candidate):
                 return _parse_compact_date(candidate)
             return _coerce_date(candidate)
+        if isinstance(value, float) and math.isfinite(value):
+            # Raw XML stores an eight-digit compact date as ``<v>20261018.0</v>``
+            # because ``_cast_number`` promotes any value containing "." to a
+            # float. Excel numbers are doubles, so an integral float is the same
+            # cell as the integer form; a fractional float is not a date.
+            if value.is_integer():
+                return _parse_compact_date(str(int(value)))
+            raise _ConversionError("invalid_date", "Value must be a valid date")
         if isinstance(value, int) and not isinstance(value, bool):
             return _parse_compact_date(str(value))
         return _coerce_date(value)
@@ -1018,6 +1089,10 @@ class _ExcelCellCodec:
             if candidate in _EXCEL_BOOLEAN_FALSE:
                 return False
             raise _ConversionError("invalid_boolean", "Value must be a boolean")
+        if isinstance(value, float) and math.isfinite(value) and value in (0.0, 1.0):
+            # ``<v>1.0</v>`` in a numeric cell reads back as ``1.0``; Excel's
+            # numeric representation of a boolean is exactly 0 or 1.
+            return value == 1.0
         if isinstance(value, int) and value in (0, 1):
             return value == 1
         raise _ConversionError("invalid_boolean", "Value must be a boolean")
@@ -1074,14 +1149,321 @@ def _excel_invalid() -> BusinessError:
     return _excel_error(_EXCEL_INVALID_MESSAGE)
 
 
-def _read_excel_workbook(path: Path) -> object:
+@contextmanager
+def _suppress_openpyxl_warnings() -> Iterator[None]:
+    """Silence warnings raised from openpyxl modules, and only those.
+
+    openpyxl warns with the offending cell coordinate and raw serial value (for
+    example when a date-styled cell is outside its supported range), which must
+    never reach application logs. The filter is scoped to the ``openpyxl``
+    module hierarchy inside one ``catch_warnings`` block, so unrelated
+    application warnings keep their normal behaviour and no warning text is
+    captured anywhere.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            module=r"openpyxl(\..*)?",
+        )
+        yield
+
+
+_CONTAINER_ERRORS: tuple[type[BaseException], ...] = (
+    ElementTree.ParseError,
+    expat.ExpatError,
+    EOFError,
+    KeyError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+    zipfile.BadZipFile,
+    zlib.error,
+)
+
+
+def _read_bounded_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    limit: int,
+) -> bytes:
+    """Read one ZIP member only after checking its declared uncompressed size."""
+    try:
+        info = archive.getinfo(name)
+    except KeyError as error:
+        raise _excel_invalid() from error
+    if info.file_size > limit:
+        raise _excel_invalid()
+    return archive.read(info)
+
+
+def _require_supported_members(infos: Sequence[zipfile.ZipInfo]) -> set[str]:
+    """Reject unsupported containers and duplicate names, and bound the total.
+
+    This runs before any member is expanded, so the cheap structural checks
+    (encryption, compression method, negative sizes, aggregate budget) cannot
+    themselves allocate proportional to attacker input.
+    """
+    names: set[str] = set()
+    total = 0
+    for info in infos:
+        if info.flag_bits & 0x1:
+            # Encrypted members cannot be read, and refusing them early avoids
+            # a password-prompt path.
+            raise _excel_invalid()
+        if info.compress_type not in _XLSX_ALLOWED_COMPRESSION:
+            raise _excel_invalid()
+        if info.file_size < 0 or info.compress_size < 0:
+            raise _excel_invalid()
+        if info.filename in names:
+            # A duplicated part makes "which bytes did the reader use?"
+            # ambiguous, so the container is refused rather than guessed at.
+            raise _excel_invalid()
+        names.add(info.filename)
+        if info.is_dir():
+            continue
+        total += info.file_size
+        if total > _XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise _excel_invalid()
+        if info.file_size > _XLSX_MAX_WORKSHEET_BYTES:
+            raise _excel_invalid()
+    return names
+
+
+def _require_ratio_gate(infos: Sequence[zipfile.ZipInfo]) -> None:
+    """Reject members whose declared expansion profile looks like a bomb.
+
+    Runs first, before *any* member is read (including manifests and
+    relationship parts), so every later bounded read is already protected.
+    """
+    for info in infos:
+        if info.is_dir():
+            continue
+        if (
+            info.file_size >= _XLSX_RATIO_MIN_BYTES
+            and info.compress_size > 0
+            and info.file_size / info.compress_size > _XLSX_MAX_COMPRESSION_RATIO
+        ):
+            raise _excel_invalid()
+
+
+def _require_bounded_members(
+    infos: Sequence[zipfile.ZipInfo],
+    streamed_parts: frozenset[str],
+) -> None:
+    """Apply per-member uncompressed budgets once the worksheet part is known.
+
+    Worksheet parts are streamed row by row, so their budget only bounds time;
+    every other part is materialized in memory by openpyxl and gets the tighter
+    metadata budget. ``zipfile`` truncates every member at its declared
+    ``file_size``, so these budgets really do cap expansion.
+    """
+    for info in infos:
+        if info.is_dir():
+            continue
+        if (
+            info.filename not in streamed_parts
+            and info.file_size > _XLSX_MAX_METADATA_BYTES
+        ):
+            raise _excel_invalid()
+
+
+def _require_no_vba_member_name(names: Sequence[str]) -> None:
+    for name in names:
+        if _VBA_MEMBER_MARKER in name.casefold():
+            raise _excel_invalid()
+
+
+def _require_no_vba_content_type(content_types_xml: bytes) -> None:
+    """Reject any VBA or macro-enabled content type declaration.
+
+    A macro part can be stored under an arbitrary filename, so the declared
+    content type is authoritative. Every ``Override``/``Default`` content type
+    is inspected for a macro marker, which catches ``vbaProject.bin`` under any
+    path and macro-enabled workbook main parts.
+    """
+    root = ElementTree.fromstring(content_types_xml)
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        if local not in ("Override", "Default"):
+            continue
+        content_type = (element.get("ContentType") or "").casefold().encode()
+        if any(marker in content_type for marker in _VBA_CONTENT_TYPE_MARKERS):
+            raise _excel_invalid()
+
+
+def _require_no_vba_relationship(relationship_xml: bytes) -> None:
+    """Reject a VBA relationship even when no VBA member is present."""
+    root = ElementTree.fromstring(relationship_xml)
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "Relationship":
+            continue
+        relation_type = (element.get("Type") or "").casefold().encode()
+        if any(marker in relation_type for marker in _VBA_RELATIONSHIP_MARKERS):
+            raise _excel_invalid()
+
+
+def _column_index(letters: str) -> int:
+    index = 0
+    for character in letters:
+        index = index * 26 + (ord(character) - 64)
+    return index
+
+
+def _parse_cell_reference(reference: str) -> tuple[int, int]:
+    """Return ``(row, column)`` from a strict ``A1``-style reference."""
+    match = _XLSX_CELL_PATTERN.fullmatch(reference)
+    if match is None:
+        raise _excel_invalid()
+    column = _column_index(match.group(1))
+    row = int(match.group(2))
+    return row, column
+
+
+def _require_within_sparse_bounds(row: int, column: int) -> None:
+    if row > _XLSX_MAX_SPARSE_ROW or row > _XLSX_ROW_LIMIT:
+        raise _excel_invalid()
+    if column > _XLSX_MAX_SPARSE_COLUMN or column > _XLSX_COLUMN_LIMIT:
+        raise _excel_invalid()
+
+
+def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
+    """Stream one worksheet and reject out-of-range coordinates *before* openpyxl.
+
+    openpyxl's read-only iterator pads every missing row between two present
+    rows, so a single ``<c r="XFD1048576">`` would cost a million padded rows
+    from a tiny file. Streaming element scan keeps memory constant; the byte
+    budget (metadata/worksheet limits) bounds the work, and every declared
+    dimension, row number, and cell reference is checked as it is seen.
+    """
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.buffer_text = True
+
+    def reject_entities(*_args: object) -> None:
+        # XLSX never uses DTD entities; refusing them blocks entity-expansion
+        # payloads that would otherwise grow inside the parser.
+        raise _excel_invalid()
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        local = name.rsplit("}", 1)[-1]
+        if local == "dimension":
+            reference = attributes.get("ref")
+            if not reference:
+                return
+            for endpoint in reference.split(":"):
+                _require_within_sparse_bounds(*_parse_cell_reference(endpoint))
+            return
+        if local == "row":
+            reference = attributes.get("r")
+            if reference is None:
+                return
+            if _XLSX_ROW_PATTERN.fullmatch(reference) is None:
+                raise _excel_invalid()
+            _require_within_sparse_bounds(int(reference), 1)
+            return
+        if local == "c":
+            reference = attributes.get("r")
+            if reference is None:
+                return
+            _require_within_sparse_bounds(*_parse_cell_reference(reference))
+
+    parser.EntityDeclHandler = reject_entities
+    parser.StartElementHandler = start_element
+    try:
+        with archive.open(name) as source:
+            while True:
+                chunk = source.read(_XLSX_SCAN_CHUNK_BYTES)
+                if not chunk:
+                    break
+                parser.Parse(chunk, False)
+            parser.Parse(b"", True)
+    except expat.ExpatError as error:
+        raise _excel_invalid() from error
+
+
+def _resolve_part_target(rels_folder: str, target: str) -> str:
+    """Resolve a relationship target to an absolute ZIP member name."""
+    normalized = target.replace("\\", "/")
+    if normalized.startswith("/"):
+        candidate = normalized[1:]
+    else:
+        parts = [part for part in rels_folder.split("/") if part]
+        for part in normalized.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not parts:
+                    raise _excel_invalid()
+                parts.pop()
+                continue
+            parts.append(part)
+        candidate = "/".join(parts)
+    if not candidate or PurePosixPath(candidate).is_absolute():
+        raise _excel_invalid()
+    return candidate
+
+
+def _require_single_worksheet_part(archive: zipfile.ZipFile, names: set[str]) -> str:
+    """Return the worksheet member named by the workbook relationships.
+
+    Sheets are resolved through relationships rather than by part-path
+    convention, so a worksheet stored outside ``xl/worksheets/`` is still found
+    (and bounded) while chartsheets are refused by relationship type.
+    """
+    if _WORKBOOK_PART not in names or _WORKBOOK_RELS_PART not in names:
+        raise _excel_invalid()
+
+    rels_xml = _read_bounded_member(
+        archive,
+        _WORKBOOK_RELS_PART,
+        _XLSX_MAX_RELATIONSHIP_BYTES,
+    )
+    root = ElementTree.fromstring(rels_xml)
+    worksheet_targets: list[str] = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "Relationship":
+            continue
+        relation_type = element.get("Type") or ""
+        if relation_type.endswith(_CHARTSHEET_RELATIONSHIP_SUFFIX):
+            raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
+        if element.get("TargetMode") == "External":
+            continue
+        if not relation_type.endswith(_WORKSHEET_RELATIONSHIP_SUFFIX):
+            continue
+        target = element.get("Target")
+        if not target:
+            raise _excel_invalid()
+        worksheet_targets.append(_resolve_part_target("xl", target))
+
+    if any(name.startswith(_CHARTSHEET_PREFIX) for name in names):
+        raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
+    if len(worksheet_targets) != 1:
+        raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
+
+    worksheet_part = worksheet_targets[0]
+    if worksheet_part not in names:
+        raise _excel_invalid()
+    _require_single_visible_sheet(
+        _read_bounded_member(
+            archive,
+            _WORKBOOK_PART,
+            _XLSX_MAX_WORKBOOK_XML_BYTES,
+        ),
+    )
+    return worksheet_part
+
+
+def _read_excel_workbook(path: Path) -> tuple[object, str]:
     """Validate the XLSX container, then return a read-only workbook.
 
     Rejection happens before any cell is converted: size, Zip signature, ZIP
-    container, workbook part, macro part/content type, and later worksheet
-    counts. The workbook is opened with ``read_only=True`` and
-    ``data_only=False`` so formulas stay visible as formula cells and cached
-    results are never read.
+    member budgets, macro parts/content types/relationships, sheet count,
+    worksheet coordinates, and worksheet part identity. The workbook is opened
+    with ``read_only=True`` and ``data_only=False`` so formulas stay visible as
+    formula cells and cached results are never read.
+
+    The returned worksheet part name is the one this preflight validated, and
+    ``_import_worksheet`` refuses a workbook that resolves a different member.
     """
     try:
         if not path.is_file():
@@ -1102,36 +1484,46 @@ def _read_excel_workbook(path: Path) -> object:
 
     try:
         with zipfile.ZipFile(path) as archive:
-            names = set(archive.namelist())
-            if _WORKBOOK_PART not in names or _MACRO_PART in names:
+            infos = archive.infolist()
+            if not infos or len(infos) > _XLSX_MAX_MEMBERS:
                 raise _excel_invalid()
-            if _MACRO_CONTENT_TYPE in archive.read("[Content_Types].xml"):
+            _require_ratio_gate(infos)
+            names = _require_supported_members(infos)
+            if _WORKBOOK_PART not in names:
                 raise _excel_invalid()
-            if any(name.startswith(_CHARTSHEET_PREFIX) for name in names):
-                raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
-            if _WORKBOOK_RELS_PART in names:
-                _require_no_chartsheet(archive.read(_WORKBOOK_RELS_PART))
-            _require_single_visible_sheet(archive.read(_WORKBOOK_PART))
-    except (
-        ElementTree.ParseError,
-        KeyError,
-        OSError,
-        RuntimeError,
-        ValueError,
-        zipfile.BadZipFile,
-    ) as error:
+            _require_no_vba_member_name(tuple(names))
+            _require_no_vba_content_type(
+                _read_bounded_member(
+                    archive,
+                    _CONTENT_TYPES_PART,
+                    _XLSX_MAX_CONTENT_TYPES_BYTES,
+                ),
+            )
+            for name in names:
+                if name.endswith(".rels"):
+                    _require_no_vba_relationship(
+                        _read_bounded_member(
+                            archive,
+                            name,
+                            _XLSX_MAX_RELATIONSHIP_BYTES,
+                        ),
+                    )
+            worksheet_part = _require_single_worksheet_part(archive, names)
+            _require_bounded_members(infos, frozenset({worksheet_part}))
+            _scan_worksheet_bounds(archive, worksheet_part)
+    except BusinessError:
+        raise
+    except _CONTAINER_ERRORS as error:
         raise _excel_invalid() from error
 
     try:
-        return cast(
-            object,
-            load_workbook(
+        with _suppress_openpyxl_warnings():
+            workbook = load_workbook(
                 path,
                 read_only=True,
                 data_only=False,
                 keep_links=False,
-            ),
-        )
+            )
     except (
         ElementTree.ParseError,
         InvalidFileException,
@@ -1140,23 +1532,11 @@ def _read_excel_workbook(path: Path) -> object:
         RuntimeError,
         TypeError,
         ValueError,
+        zipfile.BadZipFile,
+        zlib.error,
     ) as error:
         raise _excel_invalid() from error
-
-
-def _require_no_chartsheet(workbook_rels_xml: bytes) -> None:
-    """Reject chartsheets by relationship type, not by part path.
-
-    openpyxl 3.1 cannot attach chartsheet drawings in read-only mode, so a
-    chartsheet must be refused before ``load_workbook`` runs. Checking the
-    relationship type catches chartsheets stored outside ``xl/chartsheets/``.
-    """
-    root = ElementTree.fromstring(workbook_rels_xml)
-    for element in root.iter():
-        if element.tag.rsplit("}", 1)[-1] != "Relationship":
-            continue
-        if element.get("Type", "").endswith("/chartsheet"):
-            raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
+    return cast(object, workbook), worksheet_part
 
 
 def _require_single_visible_sheet(workbook_xml: bytes) -> None:
@@ -1177,8 +1557,13 @@ def _require_single_visible_sheet(workbook_xml: bytes) -> None:
         raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
 
 
-def _import_worksheet(workbook: object) -> object:
-    """Return the single visible worksheet or reject the whole workbook."""
+def _import_worksheet(workbook: object, worksheet_part: str) -> object:
+    """Return the single visible worksheet or reject the whole workbook.
+
+    ``worksheet_part`` is the member name validated by the ZIP preflight.
+    Requiring openpyxl to have resolved that same member closes the gap between
+    "what was checked" and "what is streamed".
+    """
     worksheets = getattr(workbook, "worksheets", None)
     chartsheets = getattr(workbook, "chartsheets", None)
     if (
@@ -1189,6 +1574,8 @@ def _import_worksheet(workbook: object) -> object:
         or getattr(worksheets[0], "sheet_state", None) != "visible"
     ):
         raise _excel_error(_EXCEL_SHEET_COUNT_MESSAGE)
+    if getattr(worksheets[0], "_worksheet_path", None) != worksheet_part:
+        raise _excel_invalid()
     return worksheets[0]
 
 
@@ -1229,6 +1616,12 @@ def _worksheet_rows(worksheet: object) -> Iterator[tuple[int, tuple[object, ...]
 
     ``reset_dimensions`` makes read-only iteration stream the real ``sheetData``
     rows, so trailing styled-but-empty rows never inflate the row count.
+
+    ``<row r="9">`` elements that are otherwise absent make openpyxl pad the
+    gap with empty tuples, so row numbers come from the iterator's position and
+    match the sheet. Every openpyxl warning raised while streaming (an
+    out-of-range date serial, for example) is suppressed here instead of being
+    logged with the offending coordinate and raw value.
     """
     reset = getattr(worksheet, "reset_dimensions", None)
     if callable(reset):
@@ -1237,10 +1630,30 @@ def _worksheet_rows(worksheet: object) -> Iterator[tuple[int, tuple[object, ...]
     if not callable(iterator):
         raise _excel_invalid()
     try:
-        yield from enumerate(
-            cast(Iterator[tuple[object, ...]], iterator(min_row=1, min_col=1)),
-            start=1,
+        rows = cast(
+            Iterator[tuple[object, ...]],
+            iterator(min_row=1, min_col=1),
         )
+        try:
+            row_number = 0
+            while True:
+                # The filter is entered only around the streaming read, which
+                # is the only place openpyxl warns. Holding it open across the
+                # ``yield`` would leave it installed while the caller validates
+                # the row.
+                with _suppress_openpyxl_warnings():
+                    try:
+                        row = next(rows)
+                    except StopIteration:
+                        return
+                row_number += 1
+                yield row_number, row
+        finally:
+            # An abandoned half-consumed read-only iterator must release its
+            # ZIP member deterministically instead of waiting for collection.
+            close = getattr(rows, "close", None)
+            if callable(close):
+                close()
     except (
         ElementTree.ParseError,
         KeyError,
@@ -1248,7 +1661,12 @@ def _worksheet_rows(worksheet: object) -> Iterator[tuple[int, tuple[object, ...]
         RuntimeError,
         TypeError,
         ValueError,
+        zipfile.BadZipFile,
+        zlib.error,
     ) as error:
+        # A CRC mismatch, truncated member, or corrupt worksheet XML can surface
+        # at any point during lazy iteration; it must become the static 9006
+        # error rather than escape as a raw zipfile/zlib exception.
         raise _excel_invalid() from error
 
 
@@ -1355,9 +1773,9 @@ def iter_excel_rows(
     The function is synchronous and builds the customer-ID index exactly once;
     Task 9 is responsible for running it in a worker thread.
     """
-    workbook = _read_excel_workbook(path)
+    workbook, worksheet_part = _read_excel_workbook(path)
     try:
-        worksheet = _import_worksheet(workbook)
+        worksheet = _import_worksheet(workbook, worksheet_part)
         sheet_name = getattr(worksheet, "title", None)
         if not isinstance(sheet_name, str):
             sheet_name = None
@@ -1455,14 +1873,23 @@ def build_excel_template(definition: ResolvedDataDefinition) -> bytes:
     The template contains exactly ``definition.labels`` in field order and no
     example data, so an operator fills data from row two and submits the file
     unchanged.
+
+    Every header is written as a literal string cell. Assigning a label that
+    starts with ``=`` to a cell makes openpyxl store it as a formula, which
+    would both inject a formula into a template we hand to operators and make
+    the file unreadable by this parser (formulas are rejected). Setting
+    ``data_type = "s"`` after assignment keeps the exact label text while the
+    stored cell type stays a string.
     """
     workbook = Workbook()
     try:
         worksheet = workbook.active
         worksheet.title = "Data"
-        worksheet.append(list(definition.labels))
-        for index in range(1, len(definition.labels) + 1):
-            worksheet.cell(row=1, column=index).font = Font(bold=True)
+        for index, label in enumerate(definition.labels, start=1):
+            cell = worksheet.cell(row=1, column=index)
+            cell.value = label
+            cell.data_type = "s"
+            cell.font = Font(bold=True)
         worksheet.freeze_panes = "A2"
 
         buffer = BytesIO()

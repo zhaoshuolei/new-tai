@@ -1,7 +1,10 @@
 """Excel workbook parsing and template generation tests."""
 
 import io
+import logging
+import warnings
 import zipfile
+import zlib
 from collections.abc import Callable, Mapping, Sequence, ValuesView
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -1479,3 +1482,774 @@ def test_template_has_no_formulas_or_example_rows() -> None:
                 assert cell.value is not None
     finally:
         workbook.close()
+
+
+# ---------------------------------------------------------------------------
+# Hardened container boundaries: decompression, coordinates, macros
+# ---------------------------------------------------------------------------
+
+
+def archive_entries(path: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(path) as source:
+        return {name: source.read(name) for name in source.namelist()}
+
+
+def repack_entries(path: Path, entries: Mapping[str, bytes]) -> Path:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, content in entries.items():
+            target.writestr(name, content)
+    path.write_bytes(buffer.getvalue())
+    return path
+
+
+def patch_worksheet_xml(path: Path, old: bytes, new: bytes) -> Path:
+    entries = archive_entries(path)
+    worksheet_xml = entries["xl/worksheets/sheet1.xml"]
+    assert old in worksheet_xml, old
+    entries["xl/worksheets/sheet1.xml"] = worksheet_xml.replace(old, new, 1)
+    return repack_entries(path, entries)
+
+
+def forbid_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if any archive member is expanded after a rejection."""
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("archive member was expanded before rejection")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", explode)
+    monkeypatch.setattr(zipfile.ZipFile, "open", explode)
+
+
+def test_xlsx_limits_are_named_and_cover_the_import_envelope() -> None:
+    """Pin the chosen limits to the measured 100,000-row x 105-column envelope.
+
+    The numbers are the contract Task 13 will benchmark, so this test states
+    why each one is at least as large as the documented workload requires.
+    """
+    from app.services import data_import_parser as parser
+
+    # 100,000 rows x 105 columns of varying short text measured 578 MiB.
+    assert parser._XLSX_MAX_WORKSHEET_BYTES >= 578 * 1024 * 1024
+    # 100,000 rows x 100 unique text fields measured about 460 MiB.
+    assert parser._XLSX_MAX_METADATA_BYTES >= 460 * 1024 * 1024
+    # The aggregate budget must not make the worksheet budget unreachable.
+    assert (
+        parser._XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES
+        >= parser._XLSX_MAX_WORKSHEET_BYTES + parser._XLSX_MAX_METADATA_BYTES
+    )
+    # A data row may be followed by at most one blank separator row.
+    assert parser._MAX_ROWS == 100_000
+    assert parser._XLSX_MAX_SPARSE_ROW == parser._MAX_ROWS * 2
+    # 100 custom fields plus five system fields are always addressable.
+    assert parser._XLSX_MAX_SPARSE_COLUMN >= 5 + 100
+    assert parser._XLSX_SPARSE_ROW_SLACK == 2
+    # 424.5:1 is the measured worst legitimate case (4,000 identical
+    # characters per cell); 1,032:1 is deflate's physical ceiling for zeros.
+    assert 424.5 < parser._XLSX_MAX_COMPRESSION_RATIO < 1_032
+    assert parser._XLSX_RATIO_MIN_BYTES >= 1024 * 1024
+    assert parser._XLSX_ROW_LIMIT == 1_048_576
+    assert parser._XLSX_COLUMN_LIMIT == 16_384
+
+
+def test_excel_rejects_decompression_bomb_before_any_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 96 MiB all-zero worksheet compresses to a few KiB; metadata rejects it.
+
+    The file stays well under the 50 MiB compressed limit, so only the
+    compression-ratio gate can see the bomb, and it must decide from the ZIP
+    central directory without decompressing a single member.
+    """
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    entries["xl/worksheets/sheet1.xml"] = b"\x00" * (96 * 1024 * 1024)
+    repack_entries(path, entries)
+    assert path.stat().st_size < 1024 * 1024
+
+    forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_aggregate_uncompressed_budget_before_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    repack_entries(path, archive_entries(path))
+    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 64)
+
+    forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_absolute_worksheet_ceiling_before_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    repack_entries(path, archive_entries(path))
+    monkeypatch.setattr(parser, "_XLSX_MAX_WORKSHEET_BYTES", 256)
+    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 1 << 30)
+
+    forbid_expansion(monkeypatch)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_oversized_metadata_part_without_leaking_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared-strings part above the metadata budget is refused, not parsed."""
+    from app.services import data_import_parser as parser
+
+    sentinel = b"secret-shared-string-value"
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    entries["xl/sharedStrings.xml"] = b"<sst><si><t>" + sentinel + b"</t></si></sst>"
+    repack_entries(path, entries)
+    monkeypatch.setattr(parser, "_XLSX_MAX_METADATA_BYTES", 32)
+
+    error = assert_invalid_excel(path, "Import Excel file is invalid")
+
+    assert sentinel.decode() not in error.message
+
+
+def test_excel_rejects_unsupported_compression_method(tmp_path: Path) -> None:
+    """Only STORED and DEFLATED members are accepted, so no other codec runs."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for name, content in entries.items():
+            method = (
+                zipfile.ZIP_BZIP2
+                if name == "xl/theme/theme1.xml"
+                else zipfile.ZIP_DEFLATED
+            )
+            target.writestr(name, content, compress_type=method)
+    path.write_bytes(buffer.getvalue())
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        pytest.param(
+            b'<dimension ref="A1:K2" />',
+            b'<dimension ref="A1:K1048576" />',
+            id="declared-max-row",
+        ),
+        pytest.param(
+            b'<dimension ref="A1:K2" />',
+            b'<dimension ref="A1:XFD2" />',
+            id="declared-max-column",
+        ),
+        pytest.param(
+            b'<dimension ref="A1:K2" />',
+            b'<dimension ref="A1:K300000" />',
+            id="declared-row-beyond-sparse-budget",
+        ),
+        pytest.param(
+            b'<dimension ref="A1:K2" />',
+            b'<dimension ref="A1:IZ2" />',
+            id="declared-column-beyond-sparse-budget",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="1048576"><c r="A1048576"><v>1</v></c></row>',
+            id="cell-at-max-row",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="2"><c r="XFD2"><v>1</v></c></row>',
+            id="cell-at-max-column",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="300000"><c r="A300000"><v>1</v></c></row>',
+            id="row-beyond-sparse-budget",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="2"><c r="IZ2"><v>1</v></c></row>',
+            id="column-beyond-sparse-budget",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="not-a-number"><c r="A2"><v>1</v></c></row>',
+            id="malformed-row-reference",
+        ),
+        pytest.param(
+            b"<sheetData>",
+            b'<sheetData><row r="2"><c r="1A"><v>1</v></c></row>',
+            id="malformed-cell-reference",
+        ),
+    ],
+)
+def test_excel_rejects_sparse_or_oversized_coordinates(
+    tmp_path: Path,
+    old: bytes,
+    new: bytes,
+) -> None:
+    """A tiny file must not force openpyxl to pad a huge coordinate gap.
+
+    One cell at the XLSX row maximum is a few dozen bytes of XML, but read-only
+    iteration would emit a million padded rows for it. The streaming
+    coordinate scan rejects it before ``load_workbook`` runs.
+    """
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(path, old, new)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_large_declared_dimension_with_little_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared dimension is bounded even when no cell reaches it."""
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(
+        path,
+        b'<dimension ref="A1:K2" />',
+        b'<dimension ref="A1:K199999" />',
+    )
+    monkeypatch.setattr(parser, "_XLSX_MAX_SPARSE_ROW", 10_000)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_accepts_sparse_rows_within_budget(tmp_path: Path) -> None:
+    """Blank separator rows a legitimate sheet declares stay accepted."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(
+        path,
+        b'<dimension ref="A1:K2" />',
+        b'<dimension ref="A1:K5000" />',
+    )
+
+    assert [result.row_number for result in parse(path)] == [2]
+
+
+def _patch_worksheet_crc(path: Path) -> Path:
+    """Flip the worksheet CRC in both the local header and central directory."""
+    raw = bytearray(path.read_bytes())
+    target = b"xl/worksheets/sheet1.xml"
+    # (signature, filename length offset, filename offset, CRC offset)
+    headers = (
+        (b"PK\x03\x04", 26, 30, 14),
+        (b"PK\x01\x02", 28, 46, 16),
+    )
+    for signature, length_offset, name_offset, crc_offset in headers:
+        position = 0
+        while True:
+            position = raw.find(signature, position)
+            assert position >= 0, f"header {signature!r} not found"
+            name_length = int.from_bytes(
+                raw[position + length_offset : position + length_offset + 2],
+                "little",
+            )
+            name = bytes(
+                raw[position + name_offset : position + name_offset + name_length]
+            )
+            if name == target:
+                current = int.from_bytes(
+                    raw[position + crc_offset : position + crc_offset + 4],
+                    "little",
+                )
+                raw[position + crc_offset : position + crc_offset + 4] = (
+                    current ^ 0xFFFFFFFF
+                ).to_bytes(4, "little")
+                break
+            position += 4
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def test_excel_rejects_crc_corrupted_worksheet(tmp_path: Path) -> None:
+    """A CRC mismatch is a corrupt workbook, not a raw zipfile exception."""
+    path = _patch_worksheet_crc(write_rows_workbook(tmp_path, [excel_row()]))
+
+    with pytest.raises(BusinessError) as error:
+        parse(path)
+
+    assert error.value.code == EXCEL_INVALID
+    assert error.value.message == "Import Excel file is invalid"
+    assert "CRC" not in error.value.message
+    assert "sheet1" not in error.value.message
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            zipfile.BadZipFile("Bad CRC-32 for file 'xl/worksheets/sheet1.xml'"),
+            id="bad-zip",
+        ),
+        pytest.param(zlib.error("incorrect data check"), id="zlib"),
+    ],
+)
+def test_excel_maps_lazy_worksheet_failure_to_static_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    """ZIP/decompression errors surfacing mid-iteration become static 9006.
+
+    The preflight passes and the header row is read; the failure is injected on
+    the second streamed row, which is exactly where a CRC check or deflate
+    error triggered by lazy ``sheetData`` reading would appear.
+    """
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    path = write_rows_workbook(tmp_path, [excel_row(), excel_row()])
+    original = ReadOnlyWorksheet._cells_by_row
+    yielded = 0
+
+    def flaky(self: object, *args: object, **kwargs: object) -> object:
+        nonlocal yielded
+        for item in original(self, *args, **kwargs):  # type: ignore[arg-type]
+            yielded += 1
+            if yielded > 1:
+                raise failure
+            yield item
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "_cells_by_row", flaky)
+
+    with pytest.raises(BusinessError) as error:
+        parse(path)
+
+    assert error.value.code == EXCEL_INVALID
+    assert error.value.message == "Import Excel file is invalid"
+    assert "CRC" not in error.value.message
+    assert "sheet1" not in error.value.message
+
+
+# ---------------------------------------------------------------------------
+# Macro detection, warning hygiene, raw numeric dates/booleans, template labels
+# ---------------------------------------------------------------------------
+
+
+def write_macro_variant(
+    tmp_path: Path,
+    filename: str,
+    mutate: Callable[[dict[str, bytes]], None],
+) -> Path:
+    path = write_rows_workbook(tmp_path, [excel_row()], filename=filename)
+    entries = archive_entries(path)
+    mutate(entries)
+    return repack_entries(path, entries)
+
+
+def test_excel_rejects_vba_part_under_arbitrary_name(tmp_path: Path) -> None:
+    """A VBA part is recognised by its content type, not its filename."""
+
+    def add_vba(entries: dict[str, bytes]) -> None:
+        entries["xl/weird/blob.dat"] = b"macro-bytes"
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"</Types>",
+            b'<Override PartName="/xl/weird/blob.dat" '
+            b'ContentType="application/vnd.ms-office.vbaProject" /></Types>',
+        )
+
+    path = write_macro_variant(tmp_path, "arbitrary-vba.xlsx", add_vba)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_vba_relationship_without_vba_part(tmp_path: Path) -> None:
+    """A relationship-only VBA declaration is refused even with no member."""
+
+    def add_relationship(entries: dict[str, bytes]) -> None:
+        entries["xl/_rels/workbook.xml.rels"] = entries[
+            "xl/_rels/workbook.xml.rels"
+        ].replace(
+            b"</Relationships>",
+            b'<Relationship Type="http://schemas.microsoft.com/office/2006/'
+            b'relationships/vbaProject" Target="vbaProject.bin" Id="rId99" />'
+            b"</Relationships>",
+        )
+
+    path = write_macro_variant(tmp_path, "relationship-vba.xlsx", add_relationship)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_macro_enabled_main_content_type(tmp_path: Path) -> None:
+    """The macroEnabled main part is refused with no vbaProject part at all."""
+
+    def convert_main(entries: dict[str, bytes]) -> None:
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"spreadsheetml.sheet.main+xml",
+            b"spreadsheetml.sheet.macroEnabled.main+xml",
+        )
+
+    path = write_macro_variant(tmp_path, "macro-main.xlsx", convert_main)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "xl/vbaProject.bin",
+        "xl/other/vbaProject.bin",
+        "xl/macros/VBAPROJECT.bin",
+        "xl/vbaProjectSignature.bin",
+    ],
+)
+def test_excel_rejects_any_vba_member_name(tmp_path: Path, member: str) -> None:
+    path = write_macro_variant(
+        tmp_path,
+        "named-vba.xlsx",
+        lambda entries: entries.__setitem__(member, b"macro"),
+    )
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_rejects_vba_content_type_extended_properties(tmp_path: Path) -> None:
+    """A non-main, non-bin VBA content type is still a macro workbook."""
+
+    def add_override(entries: dict[str, bytes]) -> None:
+        entries["xl/hidden/thing.xml"] = b"<x />"
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"</Types>",
+            b'<Override PartName="/xl/hidden/thing.xml" '
+            b'ContentType="application/vnd.ms-office.vbaProjectSignature" />'
+            b"</Types>",
+        )
+
+    path = write_macro_variant(tmp_path, "vba-signature.xlsx", add_override)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_keeps_accepting_macro_free_workbooks(tmp_path: Path) -> None:
+    """The macro checks reject only evidence of macros, not ordinary sheets."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+
+    assert single_valid(path).text_values[20] == "004047806"
+
+
+SENTINEL_DATE_SERIAL = 987654321.75
+SENTINEL_BOOLEAN_NUMBER = 42.5
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected_message"),
+    [
+        pytest.param(
+            (
+                b'<c r="A2" s="1" t="n"><v>46313</v></c>',
+                b'<c r="A2" s="1" t="n"><v>987654321.75</v></c>',
+            ),
+            "Excel error values are not supported",
+            id="out-of-range-date-serial",
+        ),
+        pytest.param(
+            (
+                b'<c r="G2" t="n"><v>42</v></c>',
+                b'<c r="G2" t="n"><v>42.5</v></c>',
+            ),
+            None,
+            id="non-integral-integer",
+        ),
+        pytest.param(
+            (
+                b'<c r="J2" t="b"><v>1</v></c>',
+                b'<c r="J2" t="n"><v>42.5</v></c>',
+            ),
+            None,
+            id="non-integral-boolean",
+        ),
+    ],
+)
+def test_excel_warnings_never_leak_raw_values(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    replacement: tuple[bytes, bytes],
+    expected_message: str | None,
+) -> None:
+    """openpyxl warnings must not reach logs, and the error must stay static.
+
+    A date-styled cell holding an out-of-range serial makes openpyxl warn with
+    the coordinate *and the raw value* while the worksheet is lazily streamed.
+    That warning must be suppressed, and neither the log record nor the raised
+    error may contain the sentinel.
+    """
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(path, *replacement)
+    sentinels = ("987654321.75", "42.5")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with caplog.at_level(logging.DEBUG):
+            try:
+                results = parse(path)
+            except BusinessError as error:
+                assert error.code == EXCEL_INVALID
+                if expected_message is not None:
+                    assert error.message == expected_message
+                messages = [error.message]
+            else:
+                messages = [
+                    issue.message for result in results for issue in result.issues
+                ]
+
+    for text in messages:
+        for sentinel in sentinels:
+            assert sentinel not in text
+    for record in caplog.records:
+        for sentinel in sentinels:
+            assert sentinel not in record.getMessage()
+    for warning in caught:
+        for sentinel in sentinels:
+            assert sentinel not in str(warning.message)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            b'<c r="I2" s="1" t="n"><v>46313</v></c>',
+            b'<c r="I2" t="n"><v>20261018.0</v></c>',
+            date(2026, 10, 18),
+            id="date-integral-double",
+        ),
+        pytest.param(
+            b'<c r="I2" s="1" t="n"><v>46313</v></c>',
+            b'<c r="I2" t="n"><v>20261018</v></c>',
+            date(2026, 10, 18),
+            id="date-integer",
+        ),
+    ],
+)
+def test_excel_accepts_raw_integral_float_dates(
+    tmp_path: Path,
+    old: bytes,
+    new: bytes,
+    expected: date,
+) -> None:
+    """Raw ``<v>20261018.0</v>`` is a compact date, exactly like ``20261018``.
+
+    openpyxl's ``_cast_number`` promotes any value containing ``"."`` to float,
+    so a compact date written with a decimal point arrives as ``20261018.0``.
+    """
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(path, old, new)
+
+    assert single_valid(path).date_values[23] == expected
+
+
+@pytest.mark.parametrize(
+    ("new", "expected"),
+    [
+        (b'<c r="I2" t="n"><v>20261018.5</v></c>', "invalid_date"),
+        (b'<c r="I2" t="n"><v>1e300</v></c>', "invalid_date"),
+        (b'<c r="I2" t="n"><v>-20261018.0</v></c>', "invalid_date"),
+    ],
+)
+def test_excel_rejects_raw_non_integral_float_dates(
+    tmp_path: Path,
+    new: bytes,
+    expected: str,
+) -> None:
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(
+        path,
+        b'<c r="I2" s="1" t="n"><v>46313</v></c>',
+        new,
+    )
+
+    results = parse(path)
+
+    assert issue_tuples(results[0]) == [(expected, 23, "Date")]
+
+
+@pytest.mark.parametrize(
+    ("new", "expected"),
+    [
+        (b'<c r="J2" t="n"><v>1.0</v></c>', True),
+        (b'<c r="J2" t="n"><v>0.0</v></c>', False),
+    ],
+)
+def test_excel_accepts_raw_float_booleans(
+    tmp_path: Path,
+    new: bytes,
+    expected: bool,
+) -> None:
+    """Raw ``<v>1.0</v>``/``<v>0.0</v>`` are Excel's numeric boolean form."""
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(path, b'<c r="J2" t="b"><v>1</v></c>', new)
+
+    assert single_valid(path).boolean_values[24] is expected
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        b'<c r="J2" t="n"><v>1.5</v></c>',
+        b'<c r="J2" t="n"><v>2.0</v></c>',
+        b'<c r="J2" t="n"><v>-1.0</v></c>',
+        b'<c r="J2" t="n"><v>0.5</v></c>',
+    ],
+)
+def test_excel_rejects_raw_fractional_or_non_boolean_floats(
+    tmp_path: Path,
+    new: bytes,
+) -> None:
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    patch_worksheet_xml(path, b'<c r="J2" t="b"><v>1</v></c>', new)
+
+    results = parse(path)
+
+    assert issue_tuples(results[0]) == [("invalid_boolean", 24, "Boolean")]
+
+
+def make_formula_label_definition() -> ResolvedDataDefinition:
+    """The standard definition with formula-shaped labels in two columns.
+
+    ``_field`` rebuilds each field so the shared test definition stays
+    immutable; only the label changes.
+    """
+    labels = {10: "=SUM(A1)", 20: "=1+1"}
+    fields = tuple(
+        _field(
+            field.id,
+            labels.get(field.id, field.label),
+            field.field_type,
+            field.system_key,
+            required=field.required,
+            sort_order=field.sort_order,
+        )
+        for field in DEFINITION.fields
+    )
+    return ResolvedDataDefinition(
+        table=DEFINITION.table,
+        fields=fields,
+        fields_by_id={field.id: field for field in fields},
+        fields_by_system_key={
+            field.system_key: field
+            for field in fields
+            if field.system_key != DataFieldRole.CUSTOM
+        },
+        enum_options_by_id=DEFINITION.enum_options_by_id,
+        enum_options_by_field_id=DEFINITION.enum_options_by_field_id,
+    )
+
+
+def test_template_keeps_formula_shaped_labels_as_strings() -> None:
+    """A label beginning with ``=`` must be a literal string cell, not a formula."""
+    definition = make_formula_label_definition()
+
+    content = build_excel_template(definition)
+
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    try:
+        worksheet = workbook.active
+        headers = list(worksheet[1])
+        assert [cell.value for cell in headers] == list(definition.labels)
+        assert all(cell.data_type == "s" for cell in headers)
+        assert all(cell.data_type != "f" for cell in headers)
+    finally:
+        workbook.close()
+
+
+def test_template_with_formula_shaped_labels_round_trips(
+    tmp_path: Path,
+) -> None:
+    """The template the operator receives must import back unchanged."""
+    definition = make_formula_label_definition()
+    path = tmp_path / "formula-label-template.xlsx"
+    path.write_bytes(build_excel_template(definition))
+
+    assert parse(path, definition=definition) == []
+
+    entries = archive_entries(path)
+    worksheet_xml = entries["xl/worksheets/sheet1.xml"]
+    # The label text is preserved verbatim, but never as a formula element.
+    assert b"<f>" not in worksheet_xml
+    assert b"<f " not in worksheet_xml
+    assert b'<c r="A1" s="1" t="inlineStr"><is><t>=SUM(A1)</t></is></c>' in (
+        worksheet_xml
+    )
+    assert b'<c r="F1" s="1" t="inlineStr"><is><t>=1+1</t></is></c>' in worksheet_xml
+
+
+def test_openpyxl_warning_suppression_is_scoped_to_openpyxl() -> None:
+    """Suppression must silence openpyxl only, never unrelated warnings.
+
+    openpyxl warns with the raw serial value of an out-of-range date cell; the
+    same mechanism must not swallow a warning emitted by our own modules.
+    ``warn_explicit`` pins the emitting module name, which is exactly what the
+    filter matches on.
+    """
+    from app.services.data_import_parser import _suppress_openpyxl_warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with _suppress_openpyxl_warnings():
+            warnings.warn_explicit(
+                "Cell A1 is marked as a date but the serial value 987654321.75",
+                UserWarning,
+                "sheet.py",
+                1,
+                module="openpyxl.worksheet._reader",
+            )
+            warnings.warn_explicit(
+                "application sentinel",
+                UserWarning,
+                "service.py",
+                1,
+                module="app.services.data_import_storage",
+            )
+
+    messages = [str(warning.message) for warning in caught]
+    assert "application sentinel" in messages
+    assert all("987654321.75" not in message for message in messages)
+
+
+def test_excel_rejects_worksheet_part_mismatch_after_preflight(tmp_path: Path) -> None:
+    """The member openpyxl streams must be the member the preflight bounded.
+
+    A workbook can declare its single worksheet relationship for one part while
+    the ``workbook.xml`` sheet id resolves to another. The preflight validates
+    the relationship target, so the resolved part must match it before any row
+    is read.
+    """
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    second_sheet = entries["xl/worksheets/sheet1.xml"]
+    entries["xl/worksheets/sheet2.xml"] = second_sheet
+    rels = entries["xl/_rels/workbook.xml.rels"]
+    worksheet_relationship = (
+        b'<Relationship Type="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships/worksheet" Target="/xl/worksheets/sheet1.xml" '
+        b'Id="rId1" />'
+    )
+    assert worksheet_relationship in rels
+    entries["xl/_rels/workbook.xml.rels"] = rels.replace(
+        worksheet_relationship,
+        b'<Relationship Type="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships/styles" Target="/xl/worksheets/sheet2.xml" '
+        b'Id="rId1" /><Relationship Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/'
+        b'sheet1.xml" Id="rId2" />',
+        1,
+    )
+    repack_entries(path, entries)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
