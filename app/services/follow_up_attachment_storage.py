@@ -46,6 +46,11 @@ _XLSX_FORMAT = AttachmentFormat(
     ".xlsx",
 )
 
+_OOXML_MAIN_PARTS: tuple[tuple[str, AttachmentFormat], ...] = (
+    ("word/document.xml", _DOCX_FORMAT),
+    ("xl/workbook.xml", _XLSX_FORMAT),
+)
+
 _ALLOWED_DECLARED_CONTENT_TYPES: dict[str, frozenset[str]] = {
     "image/png": frozenset({"image/png"}),
     "image/jpeg": frozenset({"image/jpeg", "image/jpg"}),
@@ -68,6 +73,7 @@ def _invalid_attachment(message: str) -> BusinessError:
 
 
 def _detect_ooxml_format(content: bytes) -> AttachmentFormat | None:
+    """按 OOXML 主部件识别 DOCX/XLSX；缺少主部件或同时含两族时返回 None。"""
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             names = archive.namelist()
@@ -76,11 +82,14 @@ def _detect_ooxml_format(content: bytes) -> AttachmentFormat | None:
 
     if "[Content_Types].xml" not in names:
         return None
-    if any(name.startswith("word/") for name in names):
-        return _DOCX_FORMAT
-    if any(name.startswith("xl/") for name in names):
-        return _XLSX_FORMAT
-    return None
+    matched = [
+        ooxml_format
+        for main_part, ooxml_format in _OOXML_MAIN_PARTS
+        if main_part in names
+    ]
+    if len(matched) != 1:
+        return None
+    return matched[0]
 
 
 def detect_attachment_format(content: bytes) -> AttachmentFormat | None:
@@ -179,8 +188,27 @@ def _write_atomic(directory: Path, filename: str, content: bytes) -> None:
         raise
 
 
+def _require_contained_directory(directory: Path) -> None:
+    """校验目录的真实路径仍位于私有附件根目录之内。
+
+    符号链接会让 ``mkdir(exist_ok=True)`` 把字节写到根目录之外，因此创建前后
+    都按解析后的真实路径判断包含关系，一旦逃逸立即失败关闭。
+    """
+    root = Path(settings.follow_up_attachment_root).expanduser().resolve()
+    try:
+        resolved = directory.resolve()
+    except OSError, RuntimeError, ValueError:
+        raise _invalid_attachment(_INVALID_ATTACHMENT_MESSAGE) from None
+    if resolved == root or not resolved.is_relative_to(root):
+        raise _invalid_attachment(
+            "Attachment storage directory escapes the private root",
+        )
+
+
 def _store_atomic(directory: Path, filename: str, content: bytes) -> None:
+    _require_contained_directory(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    _require_contained_directory(directory)
     _write_atomic(directory, filename, content)
 
 

@@ -21,16 +21,16 @@ DOCX_CONTENT_TYPE = (
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _ooxml(prefix: str) -> bytes:
+def _ooxml(main_part: str) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("[Content_Types].xml", "<Types/>")
-        archive.writestr(f"{prefix}/document.xml", "<doc/>")
+        archive.writestr(main_part, "<part/>")
     return buffer.getvalue()
 
 
-DOCX = _ooxml("word")
-XLSX = _ooxml("xl")
+DOCX = _ooxml("word/document.xml")
+XLSX = _ooxml("xl/workbook.xml")
 
 
 async def chunks(*parts: bytes) -> AsyncIterator[bytes]:
@@ -72,6 +72,51 @@ def test_plain_zip_is_rejected() -> None:
 def test_malformed_zip_and_unsupported_content_are_rejected() -> None:
     assert storage.detect_attachment_format(b"PK\x03\x04broken") is None
     assert storage.detect_attachment_format(b"not-an-attachment") is None
+
+
+def test_ooxml_package_with_only_a_word_directory_entry_is_rejected() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/", b"")
+
+    assert storage.detect_attachment_format(buffer.getvalue()) is None
+
+
+def test_ooxml_package_without_a_main_part_is_rejected() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/styles.xml", "<styles/>")
+        archive.writestr("xl/sharedStrings.xml", "<strings/>")
+
+    assert storage.detect_attachment_format(buffer.getvalue()) is None
+
+
+def test_ooxml_package_with_both_word_and_excel_main_parts_is_rejected() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/document.xml", "<doc/>")
+        archive.writestr("xl/workbook.xml", "<workbook/>")
+
+    assert storage.detect_attachment_format(buffer.getvalue()) is None
+
+
+def test_ooxml_main_part_with_extra_entries_is_still_detected() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("word/document.xml", "<doc/>")
+        archive.writestr("word/styles.xml", "<styles/>")
+        archive.writestr("word/media/image1.png", "")
+        archive.writestr("docProps/core.xml", "<core/>")
+
+    detected = storage.detect_attachment_format(buffer.getvalue())
+
+    assert detected is not None
+    assert detected.content_type == DOCX_CONTENT_TYPE
+    assert detected.extension == ".docx"
 
 
 def test_sanitize_original_name_strips_paths_and_controls() -> None:
@@ -260,6 +305,29 @@ async def test_store_attachment_runs_filesystem_write_in_worker_thread(
 
     assert len(write_threads) == 1
     assert write_threads[0] is not main_thread
+
+
+async def test_store_attachment_rejects_symlinked_managed_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attachments"
+    monkeypatch.setattr(settings, "follow_up_attachment_root", str(root))
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "contact-follow-up").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(BusinessError) as error:
+        await storage.store_attachment(
+            follow_up_id=1,
+            content_type=None,
+            chunks=chunks(PDF),
+        )
+
+    assert error.value.code == ErrorCode.FOLLOW_UP_ATTACHMENT_INVALID
+    assert error.value.http_status == 422
+    assert list(outside.rglob("*")) == []
 
 
 async def test_remove_attachment_file_only_accepts_safe_relative_paths(
