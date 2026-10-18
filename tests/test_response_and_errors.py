@@ -34,7 +34,13 @@ def test_business_routes_expose_success_envelope_in_openapi() -> None:
                 for status_code, response in responses.items()
                 if status_code.startswith("2")
             )
-            if "application/json" not in success_response.get("content", {}):
+            attachment_download_path = (
+                "/api/v1/customers/{customer_id}/contacts/{contact_id}"
+                "/follow-ups/{follow_up_id}/attachments/{attachment_id}/download"
+            )
+            if path == attachment_download_path:
+                assert method == "get"
+                assert "application/json" not in success_response.get("content", {})
                 continue
             schema = success_response["content"]["application/json"]["schema"]
             if "$ref" in schema:

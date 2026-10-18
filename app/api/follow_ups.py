@@ -1,5 +1,6 @@
 """客户跟进方式、跟进记录、待跟进清单与附件接口。"""
 
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import unquote
 
@@ -550,7 +551,8 @@ async def download_attachment(
     return FileResponse(
         path,
         media_type=attachment.content_type,
-        filename=attachment.original_name or f"attachment-{attachment.id}",
+        filename=attachment.original_name
+        or f"attachment-{attachment.id}{Path(attachment.storage_path).suffix}",
         headers={"Cache-Control": "no-store"},
     )
 

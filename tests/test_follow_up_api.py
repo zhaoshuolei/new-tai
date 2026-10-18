@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 import pytest_asyncio
@@ -116,19 +117,48 @@ async def test_routes_require_permissions(session) -> None:  # noqa: F811
             )
             assert response.status_code == 403, url
 
+    read_update_ctx = make_context(
+        owner,
+        permission_codes={"customer:read", "customer:update"},
+    )
+    async with api_client(session, read_update_ctx) as client:
+        for method_name, url in (
+            (
+                "DELETE",
+                f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+                "/follow-ups/1",
+            ),
+            (
+                "GET",
+                f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+                "/follow-ups/recycle-bin",
+            ),
+        ):
+            response = await client.request(method_name, url)
+            assert response.status_code == 403, url
 
-async def test_method_route_denies_non_super_admin(session) -> None:  # noqa: F811
-    owner, _, _, _, _ = await _fixture(session)
+
+async def test_method_routes_deny_non_super_admin(session) -> None:  # noqa: F811
+    owner, _, _, method, _ = await _fixture(session)
     ctx = make_context(
         owner,
         permission_codes={"customer:read", "customer:update"},
     )
     async with api_client(session, ctx) as client:
-        response = await client.post(
-            "/api/v1/follow-up-methods",
-            json={"name": "钉钉"},
-        )
-    assert response.status_code == 403
+        for method_name, url, payload in (
+            ("POST", "/api/v1/follow-up-methods", {"name": "钉钉"}),
+            (
+                "PATCH",
+                f"/api/v1/follow-up-methods/{method.id}",
+                {"name": "微信"},
+            ),
+        ):
+            response = await client.request(
+                method_name,
+                url,
+                json=payload,
+            )
+            assert response.status_code == 403, url
 
 
 async def test_due_summary_and_customers_endpoints(
@@ -201,8 +231,58 @@ async def test_attachment_upload_and_download(
         )
         assert download.status_code == 200
         assert download.content == pdf
-        assert "attachment" in download.headers["content-disposition"]
+        expected_filename = quote("报价单.pdf")
+        assert (
+            f"filename*=utf-8''{expected_filename}"
+            in download.headers["content-disposition"]
+        )
+        assert download.headers["content-type"] == "application/pdf"
         assert download.headers["cache-control"] == "no-store"
+
+
+async def test_attachment_download_fallback_preserves_detected_extension(
+    session,
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: F811
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "follow_up_attachment_root",
+        str(tmp_path / "attachments"),
+    )
+    owner, customer, contact, method, ctx = await _fixture(session)
+    record = await add_follow_up(
+        session,
+        contact,
+        method,
+        follow_up_user=owner,
+        content="无文件名附件",
+    )
+    pdf = b"%PDF-1.7\n%%EOF\n"
+    async with api_client(session, ctx) as client:
+        upload = await client.post(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+            f"/follow-ups/{record.id}/attachments",
+            content=pdf,
+            headers={"Content-Type": "application/pdf"},
+        )
+        assert upload.status_code == 200
+        attachment = upload.json()["data"]
+        assert attachment["original_name"] is None
+
+        download = await client.get(
+            f"/api/v1/customers/{customer.id}/contacts/{contact.id}"
+            f"/follow-ups/{record.id}/attachments/{attachment['id']}/download"
+        )
+        assert download.status_code == 200
+        assert download.content == pdf
+        content_disposition = download.headers["content-disposition"]
+        assert "attachment-" in content_disposition
+        filename = content_disposition.partition('filename="')[2].removesuffix('"')
+        assert filename == f"attachment-{attachment['id']}.pdf"
+        assert filename.endswith(".pdf")
 
 
 @pytest.mark.parametrize(
