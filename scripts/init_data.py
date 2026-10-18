@@ -13,6 +13,7 @@ from app.core.security import hash_password
 from app.db.session import session_factory
 from app.models.contact import ContactFunction, ContactStatus
 from app.models.department import Department, DepartmentStatus
+from app.models.follow_up import ContactFollowUpMethod
 from app.models.menu import Menu, MenuStatus, MenuType
 from app.models.role import DataScope, Role, RoleMenu, RoleStatus
 from app.models.system_setting import SystemSetting
@@ -29,6 +30,7 @@ _DEFAULT_ROLE_CODE = "default"
 _DIRECTORY_MENU_NAME = "通讯录"
 _PROFILE_MENU_NAME = "个人资料"
 _SHARED_CONTACT_FUNCTION_NAMES = ("商务", "运营", "研发", "产品")
+_FOLLOW_UP_METHOD_NAMES = ("电话", "微信", "拜访", "邮件")
 
 
 @dataclass(frozen=True)
@@ -631,6 +633,27 @@ async def _ensure_shared_contact_functions(session: AsyncSession) -> None:
             await session.flush()
 
 
+async def _ensure_follow_up_methods(session: AsyncSession) -> None:
+    """幂等创建启用状态的初始跟进方式。"""
+    for name in _FOLLOW_UP_METHOD_NAMES:
+        existing = await session.scalar(
+            select(ContactFollowUpMethod.id).where(
+                ContactFollowUpMethod.name == name,
+                ContactFollowUpMethod.status == ContactStatus.ACTIVE,
+            )
+        )
+        if existing is not None:
+            continue
+
+        session.add(
+            ContactFollowUpMethod(
+                name=name,
+                status=ContactStatus.ACTIVE,
+            )
+        )
+        await session.flush()
+
+
 async def init_data(
     session: AsyncSession,
     *,
@@ -678,6 +701,7 @@ async def init_data(
     )
     await _get_or_create_global_setting(session)
     await _ensure_shared_contact_functions(session)
+    await _ensure_follow_up_methods(session)
     await session.commit()
 
 
