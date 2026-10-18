@@ -8,6 +8,23 @@ from app.models.contact import (
     CustomerContact,
 )
 from app.models.customer import Customer, CustomerSource
+from app.models.data_management import (
+    DataCurrentSnapshot,
+    DataEnumOption,
+    DataFieldDefinition,
+    DataFieldRole,
+    DataFieldType,
+    DataImportError,
+    DataImportJob,
+    DataImportSource,
+    DataImportStatus,
+    DataRecord,
+    DataRecordValue,
+    DataSnapshot,
+    DataSnapshotStatus,
+    DataTableDefinition,
+    DataTableStatus,
+)
 from app.models.department import Department, DepartmentStatus
 from app.models.exception_log import ExceptionLevel, ExceptionLog
 from app.models.follow_up import (
@@ -42,7 +59,22 @@ __all__: tuple[str, ...] = (
     "Customer",
     "CustomerContact",
     "CustomerSource",
+    "DataCurrentSnapshot",
+    "DataEnumOption",
+    "DataFieldDefinition",
+    "DataFieldRole",
+    "DataFieldType",
+    "DataImportError",
+    "DataImportJob",
+    "DataImportSource",
+    "DataImportStatus",
+    "DataRecord",
+    "DataRecordValue",
     "DataScope",
+    "DataSnapshot",
+    "DataSnapshotStatus",
+    "DataTableDefinition",
+    "DataTableStatus",
     "Department",
     "DepartmentStatus",
     "ExceptionLevel",
