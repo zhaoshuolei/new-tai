@@ -194,7 +194,9 @@ def test_field_system_key_is_unique_but_custom_is_repeatable() -> None:
     table = _table(DataFieldDefinition)
     computed = table.c.system_key_unique.computed
     assert computed is not None
-    assert "CUSTOM" in str(computed.sqltext)
+    assert str(computed.sqltext) == (
+        "CASE WHEN system_key = 'CUSTOM' THEN NULL ELSE system_key END"
+    )
 
     unique_columns = {
         tuple(column.name for column in index.columns)
@@ -229,6 +231,9 @@ def test_enum_option_uniqueness_and_ownership() -> None:
     assert _foreign_keys(table)["field_id"] == ("custom_data_field", "CASCADE")
     assert cast(String, table.c.label.type).length == 100
     assert table.c.sort_order.nullable is False
+    # 唯一索引 (field_id, label) 的左前缀已覆盖 field_id 查询，
+    # 不再需要独立的 field_id 索引。
+    assert ("field_id",) not in _index_column_sets(table)
 
 
 def test_import_job_columns_fks_and_controller_source_values() -> None:
@@ -305,6 +310,22 @@ def test_snapshot_versions_are_unique_for_table_and_date() -> None:
     assert isinstance(table.c.business_date.type, Date)
     assert table.c.row_count.nullable is False
     assert table.c.activated_at.nullable is True
+
+
+def test_snapshot_active_business_key_enforces_single_active_per_date() -> None:
+    table = _table(DataSnapshot)
+    computed = table.c.active_business_key.computed
+    assert computed is not None
+    assert str(computed.sqltext) == (
+        "CASE WHEN status = 'ACTIVE' THEN business_date END"
+    )
+    assert table.c.active_business_key.nullable is True
+    assert isinstance(table.c.active_business_key.type, Date)
+    assert ("table_id", "active_business_key") in {
+        tuple(column.name for column in index.columns)
+        for index in table.indexes
+        if index.unique
+    }
 
 
 def test_current_snapshot_is_a_core_pointer_table_with_composite_pk() -> None:

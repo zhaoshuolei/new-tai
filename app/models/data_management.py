@@ -182,7 +182,6 @@ class DataEnumOption(Base):
         BigInteger,
         ForeignKey("custom_data_field.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     label: Mapped[str] = mapped_column(String(100), nullable=False)
     sort_order: Mapped[int] = mapped_column(
@@ -348,6 +347,12 @@ class DataSnapshot(Base):
             name="uq_custom_data_snapshot_table_date_version",
         ),
         Index(
+            "uq_custom_data_snapshot_table_active_date",
+            "table_id",
+            "active_business_key",
+            unique=True,
+        ),
+        Index(
             "ix_custom_data_snapshot_table_status_date",
             "table_id",
             "status",
@@ -377,6 +382,14 @@ class DataSnapshot(Base):
         nullable=False,
         default=DataSnapshotStatus.STAGED,
         server_default=DataSnapshotStatus.STAGED.value,
+    )
+    active_business_key: Mapped[date | None] = mapped_column(
+        Date,
+        Computed(
+            "CASE WHEN status = 'ACTIVE' THEN business_date END",
+            persisted=True,
+        ),
+        nullable=True,
     )
     row_count: Mapped[int] = mapped_column(
         Integer,

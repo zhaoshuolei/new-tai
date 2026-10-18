@@ -97,9 +97,11 @@ def test_upgrade_uses_generated_system_key_uniqueness_and_required_indexes() -> 
     statements = _capture(migration.upgrade)
 
     field_table = _create_statement(statements, "custom_data_field")
-    assert "system_key_unique" in field_table
-    assert "CUSTOM" in field_table
-    assert "STORED" in field_table
+    assert (
+        "system_key_unique VARCHAR(32) GENERATED ALWAYS AS "
+        "(CASE WHEN system_key = 'CUSTOM' THEN NULL ELSE system_key END) STORED"
+        in field_table
+    )
     assert "uq_custom_data_field_table_system_key" in " ".join(statements)
     assert "uq_custom_data_field_table_label" in " ".join(statements)
 
@@ -119,6 +121,44 @@ def test_upgrade_uses_generated_system_key_uniqueness_and_required_indexes() -> 
         "ix_custom_data_record_value_record_enum",
     ):
         assert index_name in joined
+
+
+def test_upgrade_enforces_single_active_snapshot_per_table_and_date() -> None:
+    migration = importlib.import_module(MIGRATION_MODULE)
+    statements = _capture(migration.upgrade)
+
+    snapshot_table = _create_statement(statements, "custom_data_snapshot")
+    assert (
+        "active_business_key DATE GENERATED ALWAYS AS "
+        "(CASE WHEN status = 'ACTIVE' THEN business_date END) STORED" in snapshot_table
+    )
+    joined = " ".join(statements)
+    assert (
+        "CREATE UNIQUE INDEX uq_custom_data_snapshot_table_active_date "
+        "ON custom_data_snapshot (table_id, active_business_key)"
+    ) in joined
+    assert (
+        "CONSTRAINT uq_custom_data_snapshot_table_date_version UNIQUE "
+        "(table_id, business_date, version)"
+    ) in snapshot_table
+
+
+def test_enum_option_has_no_redundant_field_id_index() -> None:
+    migration = importlib.import_module(MIGRATION_MODULE)
+    statements = _capture(migration.upgrade)
+
+    enum_option = _create_statement(statements, "custom_data_enum_option")
+    assert (
+        "CONSTRAINT uq_custom_data_enum_option_field_label UNIQUE (field_id, label)"
+        in enum_option
+    )
+    assert not any(
+        statement.startswith("CREATE INDEX ix_custom_data_enum_option_field_id")
+        or statement.startswith(
+            "CREATE UNIQUE INDEX ix_custom_data_enum_option_field_id"
+        )
+        for statement in statements
+    )
 
 
 def test_upgrade_constraints_match_cleanup_and_restriction_boundaries() -> None:

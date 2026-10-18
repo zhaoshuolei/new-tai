@@ -179,12 +179,6 @@ def upgrade() -> None:
             name="uq_custom_data_enum_option_field_label",
         ),
     )
-    op.create_index(
-        "ix_custom_data_enum_option_field_id",
-        "custom_data_enum_option",
-        ["field_id"],
-        unique=False,
-    )
     op.create_table(
         "custom_data_import",
         sa.Column("table_id", sa.BigInteger(), nullable=False),
@@ -369,6 +363,15 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column(
+            "active_business_key",
+            sa.Date(),
+            sa.Computed(
+                "CASE WHEN status = 'ACTIVE' THEN business_date END",
+                persisted=True,
+            ),
+            nullable=True,
+        ),
+        sa.Column(
             "row_count",
             sa.Integer(),
             server_default="0",
@@ -417,6 +420,12 @@ def upgrade() -> None:
         "custom_data_snapshot",
         ["table_id", "status", "business_date"],
         unique=False,
+    )
+    op.create_index(
+        "uq_custom_data_snapshot_table_active_date",
+        "custom_data_snapshot",
+        ["table_id", "active_business_key"],
+        unique=True,
     )
     op.create_table(
         "custom_data_current_snapshot",
