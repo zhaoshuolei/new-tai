@@ -76,6 +76,22 @@ _PRIVATE_JOB_FIELDS = {
 }
 _HARD_MAX_IMPORT_BYTES = 50 * 1024 * 1024
 _MULTIPART_OVERHEAD_BYTES = 64 * 1024
+_IMPORT_ROUTE_SPELLINGS = (
+    ("1", "excel", "excel"),
+    ("-1", "excel", "excel"),
+    ("+1", "excel", "excel"),
+    ("1_0", "excel", "excel"),
+    ("%2B1", "%65xcel", "excel"),
+    ("%2D1", "%65xcel", "excel"),
+    ("%31%5F0", "%65xcel", "excel"),
+    ("1", "json", "json"),
+    ("-1", "json", "json"),
+    ("+1", "json", "json"),
+    ("1_0", "json", "json"),
+    ("%2B1", "js%6Fn", "json"),
+    ("%2D1", "js%6Fn", "json"),
+    ("%31%5F0", "js%6Fn", "json"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -287,6 +303,23 @@ async def _chunked_content(
 ) -> AsyncIterator[bytes]:
     for offset in range(0, len(content), chunk_size):
         yield content[offset : offset + chunk_size]
+
+
+def _multipart_file_body(
+    *,
+    boundary: str,
+    filename: str,
+    content: bytes,
+) -> bytes:
+    return (
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        + content
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
 
 
 async def _assert_no_import_residue(
@@ -619,6 +652,113 @@ async def test_json_import_enforces_byte_limit_before_storage(
     assert (
         not configure_import_storage.exists()
         or list(configure_import_storage.iterdir()) == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("table_segment", "endpoint_segment", "endpoint_kind"),
+    _IMPORT_ROUTE_SPELLINGS,
+)
+async def test_import_receive_limit_matches_fastapi_route_spellings(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    configure_import_storage: Path,
+    table_segment: str,
+    endpoint_segment: str,
+    endpoint_kind: str,
+) -> None:
+    caller = await make_user(session)
+    monkeypatch.setattr(settings, "data_import_max_bytes", 256)
+    parser_reached = False
+
+    async def unexpected_body_read(request: Request) -> bytes:
+        nonlocal parser_reached
+        await request.body()
+        parser_reached = True
+        raise AssertionError("JSON endpoint read reached")
+
+    async def unexpected_upload_read(file: Any) -> bytes:
+        nonlocal parser_reached
+        parser_reached = True
+        raise AssertionError("Excel endpoint read reached")
+
+    monkeypatch.setattr(data_import_api, "_read_bounded_body", unexpected_body_read)
+    monkeypatch.setattr(data_import_api, "_read_bounded_upload", unexpected_upload_read)
+
+    if endpoint_kind == "excel":
+        boundary = "route-spelling-boundary"
+        raw_body = _multipart_file_body(
+            boundary=boundary,
+            filename="oversized.xlsx",
+            content=b"x" * (256 + _MULTIPART_OVERHEAD_BYTES + 1),
+        )
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        raw_body = b"x" * 257
+        content_type = "application/json"
+
+    path = f"/api/v1/data-tables/{table_segment}/imports/{endpoint_segment}"
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            path,
+            content=_chunked_content(raw_body, chunk_size=97),
+            headers={"content-type": content_type},
+        )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
+    assert response.json()["message"].endswith("-byte limit")
+    assert parser_reached is False
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("table_segment", "endpoint_segment", "endpoint_kind"),
+    _IMPORT_ROUTE_SPELLINGS,
+)
+async def test_normal_sized_imports_reach_fastapi_routes_for_all_spellings(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    configure_import_storage: Path,
+    table_segment: str,
+    endpoint_segment: str,
+    endpoint_kind: str,
+) -> None:
+    caller = await make_user(session)
+    path = f"/api/v1/data-tables/{table_segment}/imports/{endpoint_segment}"
+
+    async with _api_client(session, _context(caller)) as client:
+        if endpoint_kind == "excel":
+            response = await client.post(
+                path,
+                files={"file": ("wrong.csv", b"tiny", "text/csv")},
+            )
+        else:
+            response = await client.post(
+                path,
+                content=b'{"rows": [',
+                headers={"content-type": "application/json"},
+            )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
+    expected_message = (
+        "Excel import file must use the .xlsx suffix"
+        if endpoint_kind == "excel"
+        else "Import JSON is invalid"
+    )
+    assert response.json()["message"] == expected_message
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        1,
     )
 
 
@@ -1033,3 +1173,24 @@ def test_import_routes_register_audit_metadata_and_openapi_tag() -> None:
         assert path in document["paths"]
         for operation in document["paths"][path].values():
             assert operation["tags"] == ["数据管理"]
+
+
+def test_excel_import_openapi_declares_required_multipart_file() -> None:
+    document = create_app().openapi()
+    operation = document["paths"]["/api/v1/data-tables/{table_id}/imports/excel"][
+        "post"
+    ]
+    request_body = operation["requestBody"]
+    assert request_body["required"] is True
+
+    content = request_body["content"]
+    media_type = content.get("multipart/form-data") or content.get(
+        "application/x-www-form-urlencoded"
+    )
+    assert media_type is not None
+    schema = media_type["schema"]
+    ref = schema.get("$ref")
+    if ref is not None:
+        schema = document["components"]["schemas"][ref.rsplit("/", 1)[-1]]
+    assert "file" in schema["required"]
+    assert "file" in schema["properties"]

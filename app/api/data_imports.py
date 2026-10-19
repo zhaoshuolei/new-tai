@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 _HARD_MAX_IMPORT_BYTES = 50 * 1024 * 1024
 _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _READ_CHUNK_SIZE = 64 * 1024
-_EXCEL_IMPORT_PATH = re.compile(r"^/api/v1/data-tables/[0-9]+/imports/excel$")
-_JSON_IMPORT_PATH = re.compile(r"^/api/v1/data-tables/[0-9]+/imports/json$")
+_EXCEL_IMPORT_PATH = re.compile(r"(?:.*/)?data-tables/[^/]+/imports/excel")
+_JSON_IMPORT_PATH = re.compile(r"(?:.*/)?data-tables/[^/]+/imports/json")
 _XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _SOURCE_CONTENT_TYPES = {
     DataImportSource.EXCEL: _XLSX_CONTENT_TYPE,
@@ -245,6 +245,22 @@ async def _source_chunks(source: BinaryIO) -> AsyncIterator[bytes]:
     response_model=SuccessEnvelope[DataImportRead],
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_permission("data:import"))],
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {"type": "string", "format": "binary"},
+                        },
+                    },
+                },
+            },
+        },
+    },
 )
 async def import_excel(
     table_id: int,
