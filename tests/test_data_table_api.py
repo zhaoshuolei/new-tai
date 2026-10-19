@@ -401,7 +401,7 @@ def test_definition_routes_use_data_management_openapi_tag() -> None:
     document = create_app().openapi()
     paths = document["paths"]
     data_tag = next(tag for tag in document["tags"] if tag["name"] == "数据管理")
-    assert data_tag["description"] == "自定义数据表定义管理"
+    assert data_tag["description"] == "自定义数据表定义、导入、模板与当前数据管理"
     expected = [
         ("get", "/api/v1/data-tables"),
         ("post", "/api/v1/data-tables"),

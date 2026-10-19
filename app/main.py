@@ -37,7 +37,10 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     },
     {"name": "集成", "description": "第三方集成配置"},
     {"name": "系统设置", "description": "网站基础信息与品牌资源"},
-    {"name": "数据管理", "description": "自定义数据表定义管理"},
+    {
+        "name": "数据管理",
+        "description": "自定义数据表定义、导入、模板与当前数据管理",
+    },
     {"name": "健康", "description": "服务健康检查"},
     {"name": "个人资料", "description": "本人资料维护"},
 ]

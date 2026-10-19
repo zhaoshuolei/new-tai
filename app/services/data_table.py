@@ -8,8 +8,11 @@
 9003；存在未完成导入时任何修改或删除都返回 9008。
 """
 
+import asyncio
+import logging
 from collections.abc import Sequence
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_context import AuthContext
@@ -17,6 +20,7 @@ from app.core.errors import BusinessError, ErrorCode
 from app.models.data_management import (
     DataFieldRole,
     DataFieldType,
+    DataImportJob,
     DataTableDefinition,
     DataTableStatus,
 )
@@ -27,7 +31,10 @@ from app.repositories.data_table import (
     ResolvedDataDefinition,
 )
 from app.schemas.data_table import DataFieldInput, DataTableCreate
+from app.services import data_import_storage
 from app.services.audit import audited
+
+logger = logging.getLogger(__name__)
 
 _NAME_MAX_LENGTH = 100
 _DESCRIPTION_MAX_LENGTH = 500
@@ -289,6 +296,18 @@ async def _require_writable_table(
     return table
 
 
+async def _delete_import_source_best_effort(storage_path: str) -> None:
+    try:
+        await asyncio.to_thread(
+            data_import_storage.delete_import_source,
+            storage_path,
+        )
+    except Exception:
+        # The database deletion is already committed. Keep private paths and
+        # original filenames out of the log.
+        logger.warning("Failed to remove a deleted data import source")
+
+
 async def _load_written_definition(
     session: AsyncSession,
     table_id: int,
@@ -396,10 +415,27 @@ async def delete_table(
     *,
     context: AuthContext,
 ) -> None:
-    """物理删除没有成功数据的 DRAFT 表并提交。"""
+    """物理删除没有成功数据的 DRAFT 表并提交。
+
+    Import source paths are captured while the table lifecycle lock is held,
+    then removed only after the database cascade commits. Cleanup is
+    best-effort and cannot roll back or mask the successful DB deletion.
+    """
     table = await _require_writable_table(session, table_id)
+    source_paths = list(
+        (
+            await session.scalars(
+                select(DataImportJob.storage_path).where(
+                    DataImportJob.table_id == table_id
+                )
+            )
+        ).all()
+    )
     await data_table_repository.delete_table(session, table)
     await session.commit()
+
+    for storage_path in source_paths:
+        await _delete_import_source_best_effort(storage_path)
 
 
 __all__: tuple[str, ...] = (

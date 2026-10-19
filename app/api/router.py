@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.contacts import router as contacts_router
 from app.api.customers import router as customers_router
+from app.api.data_imports import router as data_imports_router
 from app.api.data_tables import router as data_tables_router
 from app.api.departments import router as departments_router
 from app.api.directory import router as directory_router
@@ -23,6 +24,7 @@ api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(contacts_router)
 api_v1_router.include_router(customers_router)
 api_v1_router.include_router(data_tables_router)
+api_v1_router.include_router(data_imports_router)
 api_v1_router.include_router(departments_router)
 api_v1_router.include_router(directory_router)
 api_v1_router.include_router(follow_ups_router)
