@@ -112,6 +112,11 @@ _XLSX_COLUMN_LIMIT = 16_384
 _XLSX_SPARSE_ROW_SLACK = 2
 _XLSX_MAX_SPARSE_ROW = _MAX_ROWS * _XLSX_SPARSE_ROW_SLACK
 _XLSX_MAX_SPARSE_COLUMN = 256
+# openpyxl's read-only row parser turns every direct child of ``<row>`` into a
+# cell, including unknown element names and repeated explicit coordinates.
+# Keep both the coordinate and materialization paths under the same bounded
+# width. This is comfortably above five system plus 100 custom fields.
+_XLSX_MAX_ROW_CHILDREN = _XLSX_MAX_SPARSE_COLUMN
 _XLSX_SCAN_CHUNK_BYTES = 1 << 20
 _XLSX_ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 _XLSX_ROW_PATTERN = re.compile(r"^[1-9][0-9]{0,6}$")
@@ -141,7 +146,11 @@ _EXECUTABLE_MACRO_CONTENT_TYPE_MARKERS = (
     b"macroenabled",
     b"macrosheet",
 )
-_EXECUTABLE_MACRO_RELATIONSHIP_MARKERS = (b"vbaproject", b"xlmacrosheet")
+_EXECUTABLE_MACRO_RELATIONSHIP_MARKERS = (
+    b"vbaproject",
+    b"xlmacrosheet",
+    b"intlmacrosheet",
+)
 _EXCEL_SHEET_COUNT_MESSAGE = "Excel file must contain exactly one visible worksheet"
 _EXCEL_HEADER_MESSAGE = "Excel header row is invalid"
 _EXCEL_INVALID_MESSAGE = "Import Excel file is invalid"
@@ -1368,16 +1377,19 @@ def _require_within_sparse_bounds(row: int, column: int) -> None:
 
 
 def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
-    """Stream one worksheet and reject out-of-range coordinates *before* openpyxl.
+    """Stream one worksheet and reject unsafe materialization *before* openpyxl.
 
     openpyxl's read-only iterator pads every missing row between two present
-    rows, so a single ``<c r="XFD1048576">`` would cost a million padded rows
-    from a tiny file. Streaming element scan keeps memory constant; the byte
-    budget (metadata/worksheet limits) bounds the work, and every declared
-    dimension, row number, and cell reference is checked as it is seen.
+    rows and treats every direct ``<row>`` child as a cell. Streaming keeps
+    memory constant; the byte budget bounds the work, while declared
+    dimensions, row numbers, cell references, implicit columns, and total
+    direct row children are checked as they are seen.
     """
     parser = expat.ParserCreate(namespace_separator="}")
     parser.buffer_text = True
+    depth = 0
+    row_depth: int | None = None
+    row_children = 0
     implicit_row = 0
     implicit_column = 0
 
@@ -1387,16 +1399,22 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
         raise _excel_invalid()
 
     def start_element(name: str, attributes: dict[str, str]) -> None:
-        nonlocal implicit_row, implicit_column
+        nonlocal depth, row_depth, row_children, implicit_row, implicit_column
         local = name.rsplit("}", 1)[-1]
+        if row_depth is not None and depth == row_depth + 1:
+            row_children += 1
+            if row_children > _XLSX_MAX_ROW_CHILDREN:
+                raise _excel_invalid()
         if local == "dimension":
             reference = attributes.get("ref")
-            if not reference:
-                return
-            for endpoint in reference.split(":"):
-                _require_within_sparse_bounds(*_parse_cell_reference(endpoint))
+            if reference:
+                for endpoint in reference.split(":"):
+                    _require_within_sparse_bounds(*_parse_cell_reference(endpoint))
+            depth += 1
             return
         if local == "row":
+            if row_depth is not None:
+                raise _excel_invalid()
             reference = attributes.get("r")
             if reference is None:
                 implicit_row += 1
@@ -1405,7 +1423,10 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
                     raise _excel_invalid()
                 implicit_row = int(reference)
             _require_within_sparse_bounds(implicit_row, 1)
+            row_depth = depth
+            row_children = 0
             implicit_column = 0
+            depth += 1
             return
         if local == "c":
             reference = attributes.get("r")
@@ -1414,12 +1435,21 @@ def _scan_worksheet_bounds(archive: zipfile.ZipFile, name: str) -> None:
                 # previous column, including after an explicit ``r`` reference.
                 implicit_column += 1
                 _require_within_sparse_bounds(implicit_row, implicit_column)
-                return
-            cell_row, implicit_column = _parse_cell_reference(reference)
-            _require_within_sparse_bounds(cell_row, implicit_column)
+            else:
+                cell_row, implicit_column = _parse_cell_reference(reference)
+                _require_within_sparse_bounds(cell_row, implicit_column)
+        depth += 1
+
+    def end_element(name: str) -> None:
+        nonlocal depth, row_depth, row_children
+        depth -= 1
+        if name.rsplit("}", 1)[-1] == "row":
+            row_depth = None
+            row_children = 0
 
     parser.EntityDeclHandler = reject_entities
     parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
     try:
         with archive.open(name) as source:
             while True:

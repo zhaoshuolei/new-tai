@@ -269,6 +269,31 @@ class CountingCustomerIndex(dict[str, CustomerIdentity]):
 DEFINITION = make_definition()
 
 
+def make_wide_definition() -> ResolvedDataDefinition:
+    """Return the approved five-system/100-custom/105-column envelope."""
+    base = make_definition()
+    custom_fields = tuple(
+        _field(
+            1_000 + index,
+            f"Wide {index}",
+            DataFieldType.TEXT,
+            DataFieldRole.CUSTOM,
+            required=False,
+            sort_order=100 + index,
+        )
+        for index in range(1, 95)
+    )
+    fields = (*base.fields, *custom_fields)
+    return ResolvedDataDefinition(
+        table=base.table,
+        fields=fields,
+        fields_by_id={item.id: item for item in fields},
+        fields_by_system_key=base.fields_by_system_key,
+        enum_options_by_id=base.enum_options_by_id,
+        enum_options_by_field_id=base.enum_options_by_field_id,
+    )
+
+
 def excel_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "Business date": datetime(2026, 10, 18),
@@ -296,11 +321,12 @@ def write_rows_workbook(
     filename: str = "import.xlsx",
     extra_sheet: bool = False,
     chartsheet: bool = False,
+    definition: ResolvedDataDefinition = DEFINITION,
 ) -> Path:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = title
-    labels = list(DEFINITION.labels) if headers is None else list(headers)
+    labels = list(definition.labels) if headers is None else list(headers)
     worksheet.append(labels)
     for row in rows:
         worksheet.append([row.get(label) if label in row else None for label in labels])
@@ -1511,6 +1537,22 @@ def patch_worksheet_xml(path: Path, old: bytes, new: bytes) -> Path:
     return repack_entries(path, entries)
 
 
+def write_worksheet_member_stored(path: Path, worksheet_xml: bytes) -> Path:
+    """Rewrite the worksheet without compression so ratio limits stay irrelevant."""
+    entries = archive_entries(path)
+    worksheet_name = "xl/worksheets/sheet1.xml"
+    entries[worksheet_name] = worksheet_xml
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for name, content in entries.items():
+            method = (
+                zipfile.ZIP_STORED if name == worksheet_name else zipfile.ZIP_DEFLATED
+            )
+            target.writestr(name, content, compress_type=method)
+    path.write_bytes(buffer.getvalue())
+    return path
+
+
 def forbid_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail the test if any archive member is expanded after a rejection."""
 
@@ -1571,6 +1613,7 @@ def test_xlsx_limits_are_named_and_cover_the_import_envelope() -> None:
     assert parser._XLSX_MAX_SPARSE_ROW == parser._MAX_ROWS * 2
     # 100 custom fields plus five system fields are always addressable.
     assert parser._XLSX_MAX_SPARSE_COLUMN >= 5 + 100
+    assert parser._XLSX_MAX_ROW_CHILDREN >= 5 + 100
     assert parser._XLSX_SPARSE_ROW_SLACK == 2
     # 424.5:1 is the measured worst legitimate case (4,000 identical
     # characters per cell); 1,032:1 is deflate's physical ceiling for zeros.
@@ -1631,46 +1674,66 @@ def test_excel_budgets_32_mib_bomb_under_any_member_name(
 
 
 @pytest.mark.parametrize(
-    "members",
+    "member",
     [
-        pytest.param(("xl/sharedStrings/",), id="shared-strings-directory-name"),
-        pytest.param(("xl/worksheets/",), id="worksheets-directory-name"),
+        pytest.param("xl/budget-probe", id="normal-name"),
+        pytest.param("xl/budget-probe/", id="directory-name"),
     ],
 )
-def test_excel_budgets_member_under_directory_style_name(
+def test_excel_budgets_over_limit_member_regardless_of_directory_style_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    members: tuple[str, ...],
+    member: str,
 ) -> None:
-    """The metadata cap applies to content under trailing-slash names too."""
+    """The metadata cap compares identical normal and trailing-slash members.
+
+    The cap is above the largest untouched non-worksheet package member, so the
+    added payload is the only per-member budget violation in both variants.
+    """
     from app.services import data_import_parser as parser
 
     path = write_rows_workbook(tmp_path, [excel_row()])
     entries = archive_entries(path)
-    for member in members:
-        entries[member] = b"x" * 64
+    worksheet_name = "xl/worksheets/sheet1.xml"
+    legitimate_metadata_max = max(
+        len(content) for name, content in entries.items() if name != worksheet_name
+    )
+    payload = b"x" * (legitimate_metadata_max + 64)
+    entries[member] = payload
     repack_entries(path, entries)
-    monkeypatch.setattr(parser, "_XLSX_MAX_METADATA_BYTES", 32)
-    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 1 << 30)
+    cap = len(payload) - 1
+    assert cap > legitimate_metadata_max
+    monkeypatch.setattr(parser, "_XLSX_MAX_METADATA_BYTES", cap)
 
-    forbid_member_expansion(monkeypatch, members)
+    forbid_member_expansion(monkeypatch, (member,))
 
     assert_invalid_excel(path, "Import Excel file is invalid")
 
 
-def test_excel_rejects_aggregate_bypass_through_directory_style_names(
+@pytest.mark.parametrize(
+    "member",
+    [
+        pytest.param("xl/budget-probe", id="normal-name"),
+        pytest.param("xl/budget-probe/", id="directory-name"),
+    ],
+)
+def test_excel_rejects_aggregate_overage_for_any_directory_style_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    member: str,
 ) -> None:
-    """Trailing-slash entries cannot hide their bytes from the aggregate cap."""
+    """Trailing slashes cannot change whether an added member crosses the cap."""
     from app.services import data_import_parser as parser
 
     path = write_rows_workbook(tmp_path, [excel_row()])
     entries = archive_entries(path)
-    entries["xl/sharedStrings/"] = b"x" * 64
-    entries["xl/worksheets/"] = b"y" * 64
+    legitimate_total = sum(len(content) for content in entries.values())
+    payload = b"x" * 64
+    entries[member] = payload
     repack_entries(path, entries)
-    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", 64)
+    cap = legitimate_total + len(payload) - 1
+    assert cap >= legitimate_total
+    monkeypatch.setattr(parser, "_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES", cap)
 
     forbid_expansion(monkeypatch)
 
@@ -1933,16 +1996,7 @@ def test_excel_rejects_millions_of_coordinate_less_cells_before_openpyxl(
         b'<sheetData><row r="2">' + b"<c/>" * 2_000_000 + b"</row>",
         1,
     )
-    entries[worksheet_name] = worksheet_xml
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as target:
-        for name, content in entries.items():
-            method = (
-                zipfile.ZIP_STORED if name == worksheet_name else zipfile.ZIP_DEFLATED
-            )
-            target.writestr(name, content, compress_type=method)
-    path.write_bytes(buffer.getvalue())
+    write_worksheet_member_stored(path, worksheet_xml)
     assert path.stat().st_size < 50 * 1024 * 1024
 
     def explode_workbook(*_args: object, **_kwargs: object) -> None:
@@ -1951,6 +2005,65 @@ def test_excel_rejects_millions_of_coordinate_less_cells_before_openpyxl(
     monkeypatch.setattr(parser, "load_workbook", explode_workbook)
 
     assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        pytest.param(b"<x/>", id="non-cell-row-children"),
+        pytest.param(b'<c r="A3"/>', id="repeated-explicit-cell"),
+    ],
+)
+def test_excel_rejects_millions_of_row_children_before_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child: bytes,
+) -> None:
+    """Every direct row child is materialized by openpyxl as a cell."""
+    from app.services import data_import_parser as parser
+
+    path = write_rows_workbook(tmp_path, [excel_row()])
+    entries = archive_entries(path)
+    worksheet_name = "xl/worksheets/sheet1.xml"
+    worksheet_xml = entries[worksheet_name].replace(
+        b"<sheetData>",
+        b'<sheetData><row r="3">' + child * 2_000_000 + b"</row>",
+        1,
+    )
+    write_worksheet_member_stored(path, worksheet_xml)
+    assert path.stat().st_size < 50 * 1024 * 1024
+
+    def explode_workbook(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("openpyxl was reached before rejection")
+
+    monkeypatch.setattr(parser, "load_workbook", explode_workbook)
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+def test_excel_accepts_maximum_width_configured_row(tmp_path: Path) -> None:
+    """The row-child bound does not reduce the approved 105-column envelope."""
+    definition = make_wide_definition()
+    assert len(definition.labels) == 105
+    assert len(definition.custom_fields) == 100
+    row = excel_row(
+        **{
+            label: f"value-{index}"
+            for index, label in enumerate(definition.labels[11:])
+        }
+    )
+    path = write_rows_workbook(
+        tmp_path,
+        [row],
+        filename="maximum-width.xlsx",
+        definition=definition,
+    )
+
+    results = parse(path, definition=definition)
+
+    assert len(results) == 1
+    assert results[0].issues == ()
+    assert results[0].row is not None
 
 
 def _patch_worksheet_crc(path: Path) -> Path:
@@ -2265,6 +2378,44 @@ def test_excel_rejects_macrosheet_relationship_without_part(tmp_path: Path) -> N
         tmp_path,
         "xlm-relationship.xlsx",
         declare_relationship,
+    )
+
+    assert_invalid_excel(path, "Import Excel file is invalid")
+
+
+XL_INTL_MACROSHEET_RELATIONSHIP = (
+    b"http://schemas.microsoft.com/office/2006/relationships/intlMacrosheet"
+)
+
+
+def test_excel_rejects_intl_macrosheet_relationship_with_benign_part(
+    tmp_path: Path,
+) -> None:
+    """IntlMacrosheet is executable even when its target looks like a worksheet."""
+
+    def declare_intl_relationship(entries: dict[str, bytes]) -> None:
+        entries["xl/intl-benign.xml"] = b"<Properties />"
+        entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+            b"</Types>",
+            b'<Override PartName="/xl/intl-benign.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.'
+            b'extended-properties+xml" /></Types>',
+            1,
+        )
+        entries["xl/_rels/workbook.xml.rels"] = entries[
+            "xl/_rels/workbook.xml.rels"
+        ].replace(
+            b"</Relationships>",
+            b'<Relationship Type="'
+            + XL_INTL_MACROSHEET_RELATIONSHIP
+            + b'" Target="intl-benign.xml" Id="rId99" /></Relationships>',
+            1,
+        )
+
+    path = write_macro_variant(
+        tmp_path,
+        "intl-macrosheet-relationship.xlsx",
+        declare_intl_relationship,
     )
 
     assert_invalid_excel(path, "Import Excel file is invalid")
