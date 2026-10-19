@@ -14,6 +14,7 @@ from app.models.data_management import (
     DataFieldType,
     DataTableStatus,
 )
+from app.schemas.data_query import TableVisibilitySummary
 
 if TYPE_CHECKING:
     from app.repositories.data_table import ResolvedDataDefinition
@@ -138,6 +139,24 @@ class DataTableDefinitionRead(BaseModel):
         return _serialize_utc(value)
 
 
+class DataTableListItem(DataTableDefinitionRead):
+    """Table definition plus caller-scoped current-row visibility."""
+
+    visibility: TableVisibilitySummary
+
+    @classmethod
+    def from_resolved_with_visibility(
+        cls,
+        definition: ResolvedDataDefinition,
+        visibility: TableVisibilitySummary,
+    ) -> Self:
+        base = DataTableDefinitionRead.from_resolved(definition)
+        return cls(
+            **base.model_dump(),
+            visibility=visibility,
+        )
+
+
 __all__: tuple[str, ...] = (
     "DataEnumOptionInput",
     "DataEnumOptionRead",
@@ -145,5 +164,6 @@ __all__: tuple[str, ...] = (
     "DataFieldRead",
     "DataTableCreate",
     "DataTableDefinitionRead",
+    "DataTableListItem",
     "DataTableReplace",
 )

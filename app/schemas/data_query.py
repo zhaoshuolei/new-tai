@@ -9,9 +9,31 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-type CustomRecordValue = str | int | Decimal | date | bool
+type CustomScalarValue = str | int | Decimal | date | bool
+
+
+class DataEnumRecordValue(BaseModel):
+    """Serialized enum value retaining both stable option ID and display label."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    label: str
+
+
+type CustomRecordValue = CustomScalarValue | DataEnumRecordValue
+
+
+def _serialize_scalar(value: CustomRecordValue) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, DataEnumRecordValue):
+        return value.model_dump(mode="json")
+    return value
 
 
 class DataFieldCondition(BaseModel):
@@ -66,6 +88,26 @@ class DataRecordLine(BaseModel):
         """Expose the canonical record ID under an explicit query-layer name."""
         return self.id
 
+    @field_serializer(
+        "revenue",
+        "cost",
+        "gross_profit",
+        "gross_margin",
+        when_used="json",
+    )
+    def serialize_decimal(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)
+
+    @field_serializer("custom_values", when_used="json")
+    def serialize_custom_values(
+        self,
+        values: dict[int, CustomRecordValue],
+    ) -> dict[str, object]:
+        return {
+            str(field_id): _serialize_scalar(value)
+            for field_id, value in values.items()
+        }
+
 
 class DataSearchSummary(BaseModel):
     """Aggregates over every visible and filtered row, never only one page."""
@@ -75,6 +117,16 @@ class DataSearchSummary(BaseModel):
     cost: Decimal
     gross_profit: Decimal
     gross_margin: Decimal | None
+
+    @field_serializer(
+        "revenue",
+        "cost",
+        "gross_profit",
+        "gross_margin",
+        when_used="json",
+    )
+    def serialize_decimal(self, value: Decimal | None) -> str | None:
+        return None if value is None else str(value)
 
 
 class DataSearchResult(BaseModel):
@@ -95,6 +147,8 @@ class TableVisibilitySummary(BaseModel):
 
 __all__: tuple[str, ...] = (
     "CustomRecordValue",
+    "CustomScalarValue",
+    "DataEnumRecordValue",
     "DataFieldCondition",
     "DataRecordLine",
     "DataRecordSearch",

@@ -15,9 +15,11 @@ from app.models.data_management import DataFieldDefinition, DataFieldType
 from app.models.role import DataScope
 from app.repositories import data_query as data_query_repository
 from app.repositories import data_table as data_table_repository
-from app.repositories.data_query import QueryCondition
+from app.repositories.data_query import QueryCondition, QueryEnumValue
 from app.repositories.data_table import ResolvedDataDefinition
 from app.schemas.data_query import (
+    CustomRecordValue,
+    DataEnumRecordValue,
     DataFieldCondition,
     DataRecordLine,
     DataRecordSearch,
@@ -207,6 +209,13 @@ def _line_from_repository(
 ) -> DataRecordLine:
     gross_profit = row.revenue - row.cost
     gross_margin = None if row.revenue == 0 else gross_profit / row.revenue
+    custom_values: dict[int, CustomRecordValue] = {}
+    for field_id, value in row.custom_values.items():
+        custom_values[field_id] = (
+            DataEnumRecordValue(id=value.id, label=value.label)
+            if isinstance(value, QueryEnumValue)
+            else value
+        )
     return DataRecordLine(
         id=row.id,
         business_date=row.business_date,
@@ -222,7 +231,7 @@ def _line_from_repository(
         cost=row.cost,
         gross_profit=gross_profit,
         gross_margin=gross_margin,
-        custom_values=dict(row.custom_values),
+        custom_values=custom_values,
     )
 
 

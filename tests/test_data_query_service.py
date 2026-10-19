@@ -21,7 +21,11 @@ from app.models.data_management import (
     DataRecordValue,
 )
 from app.models.role import DataScope
-from app.schemas.data_query import DataFieldCondition, DataRecordSearch
+from app.schemas.data_query import (
+    DataEnumRecordValue,
+    DataFieldCondition,
+    DataRecordSearch,
+)
 from app.services import data_query as data_query_service
 from tests.customer_helpers import TEST_DATABASE_URL
 from tests.data_query_helpers import (
@@ -201,7 +205,10 @@ async def test_default_page_returns_complete_typed_row(
         dataset.fields.decimal.id: Decimal("3.50000000"),
         dataset.fields.custom_date.id: date(2026, 1, 3),
         dataset.fields.boolean.id: True,
-        dataset.fields.enum.id: "Low",
+        dataset.fields.enum.id: DataEnumRecordValue(
+            id=dataset.fields.enum_options["Low"],
+            label="Low",
+        ),
     }
     assert all(
         not isinstance(value, float) for value in first_line.custom_values.values()

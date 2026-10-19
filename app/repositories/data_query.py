@@ -30,7 +30,16 @@ from app.models.data_management import (
 )
 from app.repositories.data_table import ResolvedDataDefinition
 
-type QueryValue = str | int | Decimal | date | bool
+
+@dataclass(frozen=True)
+class QueryEnumValue:
+    """Decoded enum option retaining its stable ID and display label."""
+
+    id: int
+    label: str
+
+
+type QueryValue = str | int | Decimal | date | bool | QueryEnumValue
 
 
 @dataclass(frozen=True)
@@ -368,8 +377,13 @@ async def _load_page_custom_values(
             value = row.date_value
         elif field.field_type == DataFieldType.BOOLEAN:
             value = row.boolean_value
+        elif row.enum_option_id is None or row.enum_label is None:
+            value = None
         else:
-            value = row.enum_label
+            value = QueryEnumValue(
+                id=int(row.enum_option_id),
+                label=str(row.enum_label),
+            )
         if value is not None:
             values[row.record_id][row.field_id] = value
     return values
@@ -550,6 +564,7 @@ async def aggregate_table_visibility(
 __all__: tuple[str, ...] = (
     "CurrentRecordPage",
     "QueryCondition",
+    "QueryEnumValue",
     "QueryRecordRow",
     "TableVisibilityAggregate",
     "aggregate_table_visibility",

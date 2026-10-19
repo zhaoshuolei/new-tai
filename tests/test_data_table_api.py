@@ -266,7 +266,16 @@ async def test_list_and_detail_return_resolved_definitions(
     listing_body = listing.json()
     assert listing_body["code"] == 0
     assert listing_body["message"] == "ok"
-    assert [item["id"] for item in listing_body["data"]] == [created["id"]]
+    assert listing_body["data"] == [
+        {
+            **created,
+            "visibility": {
+                "row_count": 0,
+                "date_from": None,
+                "date_to": None,
+            },
+        }
+    ]
 
 
 async def test_replace_definition_returns_replaced_fields(
@@ -408,6 +417,7 @@ def test_definition_routes_use_data_management_openapi_tag() -> None:
         ("get", "/api/v1/data-tables/{table_id}"),
         ("put", "/api/v1/data-tables/{table_id}"),
         ("delete", "/api/v1/data-tables/{table_id}"),
+        ("post", "/api/v1/data-tables/{table_id}/records/search"),
     ]
 
     for method, path in expected:

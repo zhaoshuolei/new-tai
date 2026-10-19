@@ -11,11 +11,14 @@ from app.core.deps import get_current_context
 from app.core.permissions import require_permission
 from app.core.response import SuccessEnvelope, success
 from app.db.session import get_session
+from app.schemas.data_query import DataRecordSearch, DataSearchResult
 from app.schemas.data_table import (
     DataTableCreate,
     DataTableDefinitionRead,
+    DataTableListItem,
     DataTableReplace,
 )
+from app.services import data_query as data_query_service
 from app.services import data_table as data_table_service
 
 router = APIRouter(prefix="/data-tables", tags=["数据管理"])
@@ -23,7 +26,7 @@ router = APIRouter(prefix="/data-tables", tags=["数据管理"])
 
 @router.get(
     "",
-    response_model=SuccessEnvelope[list[DataTableDefinitionRead]],
+    response_model=SuccessEnvelope[list[DataTableListItem]],
     dependencies=[Depends(require_permission("data:read"))],
 )
 async def list_data_tables(
@@ -31,9 +34,17 @@ async def list_data_tables(
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
     definitions = await data_table_service.list_tables(session, context=context)
+    summaries = await data_query_service.list_table_visibility_summaries(
+        session,
+        [definition.table.id for definition in definitions],
+        context=context,
+    )
     return success(
         [
-            DataTableDefinitionRead.from_resolved(definition)
+            DataTableListItem.from_resolved_with_visibility(
+                definition,
+                summaries[definition.table.id],
+            )
             for definition in definitions
         ]
     )
@@ -59,6 +70,26 @@ async def create_data_table(
         DataTableDefinitionRead.from_resolved(definition),
         message="created",
     )
+
+
+@router.post(
+    "/{table_id}/records/search",
+    response_model=SuccessEnvelope[DataSearchResult],
+    dependencies=[Depends(require_permission("data:read"))],
+)
+async def search_data_records(
+    table_id: int,
+    payload: DataRecordSearch,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    context: Annotated[AuthContext, Depends(get_current_context)],
+) -> dict[str, Any]:
+    result = await data_query_service.search_records(
+        session,
+        table_id,
+        payload,
+        context=context,
+    )
+    return success(result)
 
 
 @router.get(
@@ -146,4 +177,5 @@ __all__: tuple[str, ...] = (
     "list_data_tables",
     "replace_data_table",
     "router",
+    "search_data_records",
 )
