@@ -375,9 +375,9 @@ async def test_append_staged_rows_persists_all_typed_values_in_batches(
     record_rows = list(
         (
             await session.scalars(
-                sa.select(DataRecord).where(
-                    DataRecord.snapshot_id == snapshots[BUSINESS_DATE].id
-                )
+                sa.select(DataRecord)
+                .where(DataRecord.snapshot_id == snapshots[BUSINESS_DATE].id)
+                .order_by(DataRecord.id)
             )
         ).all()
     )
@@ -677,7 +677,12 @@ async def test_discard_removes_only_staged_snapshots_and_rows(
         customer_name=customer.name,
     )
 
-    await data_import_service.discard_staged_import(session, staged_job.id)
+    await data_import_service.discard_staged_import(
+        session,
+        staged_job.id,
+        worker_id="test-worker",
+        attempt_count=1,
+    )
 
     assert await session.get(DataSnapshot, staged.id) is None
     assert await session.get(DataRecord, staged_record.id) is None
@@ -685,6 +690,269 @@ async def test_discard_removes_only_staged_snapshots_and_rows(
     assert await session.get(DataSnapshot, superseded.id) is not None
     assert await session.get(DataRecord, active_record.id) is not None
     assert await session.get(DataRecord, superseded_record.id) is not None
+
+
+async def test_discard_rejects_stale_owner_without_deleting_current_staging(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        worker_id="current-worker",
+        attempt_count=3,
+    )
+    staged = (
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="current-worker",
+        )
+    )[BUSINESS_DATE]
+    record = await _add_record(
+        session,
+        snapshot=staged,
+        customer_id=customer.id,
+        customer_name=customer.name,
+    )
+    staged_id = staged.id
+    record_id = record.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.discard_staged_import(
+            session,
+            job.id,
+            worker_id="stale-worker",
+            attempt_count=3,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, staged_id) is not None
+    assert await session.get(DataRecord, record_id) is not None
+
+
+async def test_discard_rejects_expired_lease_without_deletion(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        expired=True,
+        attempt_count=1,
+    )
+    staged = await _add_snapshot(
+        session,
+        table=table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    record = await _add_record(
+        session,
+        snapshot=staged,
+        customer_id=customer.id,
+        customer_name=customer.name,
+    )
+    staged_id = staged.id
+    record_id = record.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.discard_staged_import(
+            session,
+            job.id,
+            worker_id="test-worker",
+            attempt_count=1,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, staged_id) is not None
+    assert await session.get(DataRecord, record_id) is not None
+
+
+async def test_discard_rejects_stale_attempt_after_reclaim_without_deletion(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        worker_id="fresh-worker",
+        attempt_count=2,
+    )
+    staged = (
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="fresh-worker",
+        )
+    )[BUSINESS_DATE]
+    record = await _add_record(
+        session,
+        snapshot=staged,
+        customer_id=customer.id,
+        customer_name=customer.name,
+    )
+    staged_id = staged.id
+    record_id = record.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.discard_staged_import(
+            session,
+            job.id,
+            worker_id="fresh-worker",
+            attempt_count=1,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, staged_id) is not None
+    assert await session.get(DataRecord, record_id) is not None
+
+
+async def test_discard_rejects_wrong_status_without_deletion(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=DataImportStatus.SUCCEEDED,
+        attempt_count=1,
+    )
+    job.lease_owner = "test-worker"
+    job.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=5)
+    await session.flush()
+    staged = await _add_snapshot(
+        session,
+        table=table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    record = await _add_record(
+        session,
+        snapshot=staged,
+        customer_id=customer.id,
+        customer_name=customer.name,
+    )
+    staged_id = staged.id
+    record_id = record.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.discard_staged_import(
+            session,
+            job.id,
+            worker_id="test-worker",
+            attempt_count=1,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, staged_id) is not None
+    assert await session.get(DataRecord, record_id) is not None
+
+
+async def test_discard_allows_failed_job_with_retained_owner_and_attempt(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=DataImportStatus.FAILED,
+        attempt_count=4,
+    )
+    job.lease_owner = "test-worker"
+    await session.flush()
+    staged = await _add_snapshot(
+        session,
+        table=table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    record = await _add_record(
+        session,
+        snapshot=staged,
+        customer_id=customer.id,
+        customer_name=customer.name,
+    )
+    staged_id = staged.id
+    record_id = record.id
+
+    await data_import_service.discard_staged_import(
+        session,
+        job.id,
+        worker_id="test-worker",
+        attempt_count=4,
+    )
+
+    assert await session.get(DataSnapshot, staged_id) is None
+    assert await session.get(DataRecord, record_id) is None
+    refreshed_job = await session.get(DataImportJob, job.id)
+    assert refreshed_job is not None
+    assert refreshed_job.status == DataImportStatus.FAILED
+    assert refreshed_job.lease_owner == "test-worker"
+    assert refreshed_job.attempt_count == 4
+
+
+async def test_discard_with_no_staged_rows_is_safe_and_idempotent(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=DataImportStatus.APPLYING,
+        attempt_count=2,
+    )
+
+    await data_import_service.discard_staged_import(
+        session,
+        job.id,
+        worker_id="test-worker",
+        attempt_count=2,
+    )
+    await data_import_service.discard_staged_import(
+        session,
+        job.id,
+        worker_id="test-worker",
+        attempt_count=2,
+    )
+
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataSnapshot)
+            .where(DataSnapshot.import_id == job.id)
+        )
+        == 0
+    )
 
 
 async def test_activation_failure_rolls_back_every_pointer_and_status(

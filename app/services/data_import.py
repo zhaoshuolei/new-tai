@@ -78,6 +78,30 @@ def _require_live_lease(
         raise _invalid_import_error("Import lease has expired")
 
 
+def _require_staged_cleanup_owner(
+    job: DataImportJob,
+    *,
+    worker_id: str,
+    attempt_count: int,
+) -> None:
+    """Allow cleanup only for the current attempt's retained owner."""
+    if job.attempt_count != attempt_count:
+        raise _invalid_import_error("Import attempt does not match")
+    if job.lease_owner != worker_id:
+        raise _invalid_import_error("Import lease is owned by another worker")
+    if job.status == DataImportStatus.FAILED:
+        return
+    if job.status not in {
+        DataImportStatus.VALIDATING,
+        DataImportStatus.APPLYING,
+    }:
+        raise _invalid_import_error(
+            "Import job must be VALIDATING, APPLYING, or FAILED for cleanup"
+        )
+    if job.lease_expires_at is None or job.lease_expires_at <= _utc_now():
+        raise _invalid_import_error("Import lease has expired")
+
+
 async def _lock_table_and_job(
     session: AsyncSession,
     import_id: int,
@@ -453,11 +477,24 @@ async def activate_import(
 async def discard_staged_import(
     session: AsyncSession,
     import_id: int,
+    *,
+    worker_id: str,
+    attempt_count: int,
 ) -> None:
-    """Delete only STAGED data owned by this import and commit."""
+    """Delete STAGED data owned by the current attempt and retained owner.
+
+    The table and import rows are locked before cleanup. A stale worker or
+    attempt, a terminal status without retained cleanup identity, and an
+    expired live lease are rejected before any snapshot is selected.
+    """
     try:
-        await _lock_table_and_job(session, import_id)
-        await data_import_repository.discard_staged_rows(session, import_id)
+        _, job = await _lock_table_and_job(session, import_id)
+        _require_staged_cleanup_owner(
+            job,
+            worker_id=worker_id,
+            attempt_count=attempt_count,
+        )
+        await data_import_repository.discard_staged_rows(session, job.id)
         await session.commit()
     except Exception:
         await session.rollback()
