@@ -10,7 +10,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql import Select
@@ -95,6 +95,7 @@ def _base_record_select(
             and_(
                 DataSnapshot.id == DataCurrentSnapshot.c.snapshot_id,
                 DataSnapshot.table_id == DataCurrentSnapshot.c.table_id,
+                DataSnapshot.business_date == DataCurrentSnapshot.c.business_date,
             ),
         )
         .where(
@@ -174,6 +175,11 @@ def _join_custom_fields(
     conditions: Sequence[QueryCondition],
     sort_field: DataFieldDefinition | None,
 ) -> tuple[Select[Any], dict[int, Any]]:
+    condition_field_ids = {
+        condition.field.id
+        for condition in conditions
+        if condition.field.system_key == DataFieldRole.CUSTOM
+    }
     fields: dict[int, DataFieldDefinition] = {
         condition.field.id: condition.field
         for condition in conditions
@@ -186,13 +192,14 @@ def _join_custom_fields(
     for field_id in sorted(fields):
         alias = aliased(DataRecordValue)
         aliases[field_id] = alias
-        statement = statement.join(
-            alias,
-            and_(
-                alias.record_id == DataRecord.id,
-                alias.field_id == field_id,
-            ),
+        on_clause = and_(
+            alias.record_id == DataRecord.id,
+            alias.field_id == field_id,
         )
+        if field_id in condition_field_ids:
+            statement = statement.join(alias, on_clause)
+        else:
+            statement = statement.outerjoin(alias, on_clause)
     return statement, aliases
 
 
@@ -332,7 +339,10 @@ async def _load_page_custom_values(
         )
         .outerjoin(
             DataEnumOption,
-            DataEnumOption.id == DataRecordValue.enum_option_id,
+            and_(
+                DataEnumOption.id == DataRecordValue.enum_option_id,
+                DataEnumOption.field_id == DataRecordValue.field_id,
+            ),
         )
         .where(
             DataRecordValue.record_id.in_(list(record_ids)),
@@ -443,10 +453,11 @@ async def search_current_records(
         downstream_customer=downstream_customer,
     )
     direction = sort_column.asc() if sort_direction == "asc" else sort_column.desc()
+    ordering = [direction, DataRecord.id.desc()]
+    if sort_field is not None:
+        ordering.insert(0, case((sort_column.is_(None), 1), else_=0))
     statement = (
-        statement.order_by(direction, DataRecord.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
+        statement.order_by(*ordering).offset((page - 1) * page_size).limit(page_size)
     )
     rows = (await session.execute(statement)).all()
     record_ids = [row.record_id for row in rows]
@@ -512,6 +523,7 @@ async def aggregate_table_visibility(
             and_(
                 DataSnapshot.id == DataCurrentSnapshot.c.snapshot_id,
                 DataSnapshot.table_id == DataCurrentSnapshot.c.table_id,
+                DataSnapshot.business_date == DataCurrentSnapshot.c.business_date,
             ),
         )
         .where(

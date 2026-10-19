@@ -7,11 +7,13 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest_asyncio
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.auth_context import AuthContext
 from app.models.customer import Customer
 from app.models.data_management import (
+    DataCurrentSnapshot,
     DataRecord,
     DataSnapshotStatus,
     DataTableDefinition,
@@ -235,6 +237,11 @@ async def test_visible_subquery_matches_each_existing_scope(
             include_children=True,
         ),
         "all": _context(data, data_scope=DataScope.ALL),
+        "roleless_all": _context(
+            data,
+            data_scope=DataScope.ALL,
+            role_id=None,
+        ),
         "super_without_role": _context(
             data,
             data_scope=None,
@@ -254,6 +261,7 @@ async def test_visible_subquery_matches_each_existing_scope(
         "custom_exact": {seller_id, peer_id},
         "custom_children": {seller_id, peer_id, child_id},
         "all": {seller_id, peer_id, child_id, hidden_id},
+        "roleless_all": {seller_id},
         "super_without_role": {seller_id, peer_id, child_id, hidden_id},
     }
 
@@ -382,6 +390,45 @@ async def test_all_scope_and_super_admin_see_every_current_row(
     assert all_result.total == super_result.total == 5
 
 
+async def test_roleless_all_uses_self_scope_for_search_and_table_visibility(
+    session: AsyncSession,
+    authorization_data: AuthorizationData,
+) -> None:
+    data = authorization_data
+    context = _context(
+        data,
+        data_scope=DataScope.ALL,
+        role_id=None,
+        is_super_admin=False,
+    )
+    visible_ids = {
+        data.records["upstream_visible"].id,
+        data.records["downstream_visible"].id,
+    }
+
+    result = await data_query_service.search_records(
+        session,
+        data.table.id,
+        DataRecordSearch(page=1, page_size=1),
+        context=context,
+    )
+    summaries = await data_query_service.list_table_visibility_summaries(
+        session,
+        [data.table.id],
+        context=context,
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].id in visible_ids
+    assert result.total == 2
+    assert result.summary.row_count == 2
+    assert result.summary.revenue == Decimal("30.00000000")
+    assert result.summary.cost == Decimal("12.00000000")
+    assert summaries[data.table.id].row_count == 2
+    assert summaries[data.table.id].date_from == date(2026, 10, 1)
+    assert summaries[data.table.id].date_to == date(2026, 10, 1)
+
+
 async def test_soft_deleted_customer_remains_owned_and_never_rebinds_by_name(
     session: AsyncSession,
     authorization_data: AuthorizationData,
@@ -466,6 +513,37 @@ async def test_table_visibility_summaries_include_zero_visible_tables(
     assert summaries[missing_id].row_count == 0
     assert summaries[missing_id].date_from is None
     assert summaries[missing_id].date_to is None
+
+
+async def test_cross_date_current_pointer_is_ignored_by_visibility_summary(
+    session: AsyncSession,
+    authorization_data: AuthorizationData,
+) -> None:
+    data = authorization_data
+    malformed_record = data.records["department_peer"]
+    await session.execute(
+        update(DataRecord)
+        .where(DataRecord.id == malformed_record.id)
+        .values(business_date=date(2026, 10, 1))
+    )
+    await session.execute(
+        update(DataCurrentSnapshot)
+        .where(
+            DataCurrentSnapshot.c.table_id == data.table.id,
+            DataCurrentSnapshot.c.business_date == date(2026, 10, 1),
+        )
+        .values(snapshot_id=malformed_record.snapshot_id)
+    )
+
+    summaries = await data_query_service.list_table_visibility_summaries(
+        session,
+        [data.table.id],
+        context=_context(data, data_scope=DataScope.ALL),
+    )
+
+    assert summaries[data.table.id].row_count == 1
+    assert summaries[data.table.id].date_from == date(2026, 10, 2)
+    assert summaries[data.table.id].date_to == date(2026, 10, 2)
 
 
 async def test_all_scope_summary_has_no_customer_scope_requirement(

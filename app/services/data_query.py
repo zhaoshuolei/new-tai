@@ -55,7 +55,9 @@ def _table_not_found() -> BusinessError:
 
 
 def _is_unrestricted(context: AuthContext) -> bool:
-    return context.is_super_admin or context.data_scope == DataScope.ALL
+    return context.is_super_admin or (
+        context.role_id is not None and context.data_scope == DataScope.ALL
+    )
 
 
 def visible_customer_id_subquery(context: AuthContext) -> Select[int]:

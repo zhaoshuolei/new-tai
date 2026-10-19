@@ -7,11 +7,19 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import event, update
+from sqlalchemy import delete, event, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.errors import BusinessError, ErrorCode
-from app.models.data_management import DataCurrentSnapshot
+from app.models.data_management import (
+    DataCurrentSnapshot,
+    DataEnumOption,
+    DataFieldDefinition,
+    DataFieldRole,
+    DataFieldType,
+    DataRecord,
+    DataRecordValue,
+)
 from app.models.role import DataScope
 from app.schemas.data_query import DataFieldCondition, DataRecordSearch
 from app.services import data_query as data_query_service
@@ -124,6 +132,41 @@ async def test_pointer_to_superseded_snapshot_never_exposes_its_rows(
 
     assert result.items == []
     assert result.total == 0
+
+
+async def test_cross_date_current_pointer_never_exposes_snapshot_rows(
+    session: AsyncSession,
+    dataset: QueryDataset,
+) -> None:
+    malformed_record = dataset.records["zero_revenue"]
+    await session.execute(
+        update(DataRecord)
+        .where(DataRecord.id == malformed_record.id)
+        .values(business_date=date(2026, 10, 1))
+    )
+    await session.execute(
+        update(DataCurrentSnapshot)
+        .where(
+            DataCurrentSnapshot.c.table_id == dataset.table.id,
+            DataCurrentSnapshot.c.business_date == date(2026, 10, 1),
+        )
+        .values(snapshot_id=malformed_record.snapshot_id)
+    )
+
+    result = await data_query_service.search_records(
+        session,
+        dataset.table.id,
+        _all_search(
+            date_from=date(2026, 10, 1),
+            date_to=date(2026, 10, 1),
+        ),
+        context=context_for(dataset.owner),
+    )
+
+    assert result.items == []
+    assert result.total == 0
+    assert result.summary.row_count == 0
+    assert result.summary.revenue == Decimal("0")
 
 
 async def test_default_page_returns_complete_typed_row(
@@ -459,6 +502,59 @@ async def test_custom_sort_is_stable_and_paginated(
     assert first_page.total == second_page.total == 4
 
 
+@pytest.mark.parametrize(
+    ("direction", "expected_keys"),
+    [
+        ("asc", ("first", "hidden", "zero_revenue", "second")),
+        ("desc", ("zero_revenue", "hidden", "first", "second")),
+    ],
+)
+async def test_sort_only_optional_field_keeps_missing_rows_with_nulls_last(
+    session: AsyncSession,
+    dataset: QueryDataset,
+    direction: str,
+    expected_keys: tuple[str, ...],
+) -> None:
+    missing_record = dataset.records["second"]
+    await session.execute(
+        delete(DataRecordValue).where(
+            DataRecordValue.record_id == missing_record.id,
+            DataRecordValue.field_id == dataset.fields.integer.id,
+        )
+    )
+
+    first_page = await data_query_service.search_records(
+        session,
+        dataset.table.id,
+        _all_search(
+            sort_field_id=dataset.fields.integer.id,
+            sort_direction=direction,
+            page=1,
+            page_size=3,
+        ),
+        context=context_for(dataset.owner),
+    )
+    second_page = await data_query_service.search_records(
+        session,
+        dataset.table.id,
+        _all_search(
+            sort_field_id=dataset.fields.integer.id,
+            sort_direction=direction,
+            page=2,
+            page_size=3,
+        ),
+        context=context_for(dataset.owner),
+    )
+
+    expected_ids = [dataset.records[key].id for key in expected_keys]
+    assert [item.id for item in (*first_page.items, *second_page.items)] == expected_ids
+    assert second_page.items[0].id == missing_record.id
+    for page in (first_page, second_page):
+        assert page.total == 4
+        assert page.summary.row_count == 4
+        assert page.summary.revenue == Decimal("140.00000000")
+
+
 async def test_custom_values_for_page_are_loaded_in_one_query(
     session: AsyncSession,
     dataset: QueryDataset,
@@ -490,6 +586,52 @@ async def test_custom_values_for_page_are_loaded_in_one_query(
 
     assert len(result.items) == 4
     assert len(statements) == 1
+
+
+async def test_page_enum_decoding_requires_option_field_ownership(
+    session: AsyncSession,
+    dataset: QueryDataset,
+) -> None:
+    other_enum_field = DataFieldDefinition(
+        table_id=dataset.table.id,
+        label="Other enum",
+        field_type=DataFieldType.ENUM,
+        system_key=DataFieldRole.CUSTOM,
+        required=False,
+        sort_order=100,
+    )
+    session.add(other_enum_field)
+    await session.flush()
+    foreign_option = DataEnumOption(
+        field_id=other_enum_field.id,
+        label="Foreign label",
+        sort_order=0,
+    )
+    session.add(foreign_option)
+    await session.flush()
+    decoded_record = dataset.records["first"]
+    await session.execute(
+        update(DataRecordValue)
+        .where(
+            DataRecordValue.record_id == decoded_record.id,
+            DataRecordValue.field_id == dataset.fields.enum.id,
+        )
+        .values(enum_option_id=foreign_option.id)
+    )
+
+    result = await data_query_service.search_records(
+        session,
+        dataset.table.id,
+        _all_search(
+            date_from=date(2026, 10, 1),
+            date_to=date(2026, 10, 1),
+        ),
+        context=context_for(dataset.owner),
+    )
+
+    line = next(item for item in result.items if item.id == decoded_record.id)
+    assert dataset.fields.enum.id not in line.custom_values
+    assert line.custom_values[dataset.fields.text.id] == "Alpha"
 
 
 @pytest.mark.parametrize(
