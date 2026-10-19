@@ -143,17 +143,23 @@ def _claim_identity(job: DataImportJob, worker_id: str) -> _ClaimIdentity:
     )
 
 
-def _require_claimed_job(
+def _require_claim_identity(
     job: DataImportJob,
     identity: _ClaimIdentity,
+    *,
+    expected_statuses: Collection[DataImportStatus],
 ) -> None:
-    _require_live_lease(
-        job,
-        identity.worker_id,
-        expected_status=DataImportStatus.VALIDATING,
-    )
-    if job.attempt_count != identity.attempt_count:
-        raise _invalid_import_error("Import attempt is no longer current")
+    """Reject a stale claim after the table and import rows are locked."""
+    if (
+        job.id != identity.job_id
+        or job.table_id != identity.table_id
+        or job.lease_owner != identity.worker_id
+        or job.attempt_count != identity.attempt_count
+        or job.status not in expected_statuses
+        or job.lease_expires_at is None
+        or job.lease_expires_at <= _utc_now()
+    ):
+        raise _LeaseLost
 
 
 def _safe_failure(error: Exception) -> tuple[str, str]:
@@ -282,6 +288,22 @@ async def _lock_table_and_job(
     if job.table_id != table.id:
         raise _invalid_import_error("Import job table does not match its locked table")
     return table, job
+
+
+async def _lock_claimed_job(
+    session: AsyncSession,
+    identity: _ClaimIdentity,
+    *,
+    expected_statuses: Collection[DataImportStatus],
+) -> DataImportJob:
+    """Lock table then import and prove the captured claim is still current."""
+    _, job = await _lock_table_and_job(session, identity.job_id)
+    _require_claim_identity(
+        job,
+        identity,
+        expected_statuses=expected_statuses,
+    )
+    return job
 
 
 async def _lock_snapshot_chain(
@@ -731,6 +753,19 @@ def _raise_if_heartbeat_failed(task: asyncio.Task[None]) -> None:
         task.result()
 
 
+async def _renew_import_lease_once(identity: _ClaimIdentity) -> None:
+    async with session_factory() as session:
+        renewed = await data_import_repository.renew_import_lease(
+            session,
+            import_id=identity.job_id,
+            worker_id=identity.worker_id,
+            lease_seconds=_LEASE_SECONDS,
+            attempt_count=identity.attempt_count,
+        )
+    if not renewed:
+        raise _LeaseLost
+
+
 async def _renew_until_stopped(
     identity: _ClaimIdentity,
     stop_event: asyncio.Event,
@@ -745,15 +780,19 @@ async def _renew_until_stopped(
             pass
         if stop_event.is_set():
             return
-        async with session_factory() as session:
-            renewed = await data_import_repository.renew_import_lease(
-                session,
-                import_id=identity.job_id,
-                worker_id=identity.worker_id,
-                lease_seconds=_LEASE_SECONDS,
-            )
-        if not renewed:
-            raise _LeaseLost
+        await _renew_import_lease_once(identity)
+
+
+async def _start_heartbeat(
+    identity: _ClaimIdentity,
+) -> tuple[asyncio.Task[None], asyncio.Event]:
+    """Renew immediately, then continue at the configured interval."""
+    await _renew_import_lease_once(identity)
+    stop_event = asyncio.Event()
+    return (
+        asyncio.create_task(_renew_until_stopped(identity, stop_event)),
+        stop_event,
+    )
 
 
 async def _stop_heartbeat(
@@ -792,7 +831,6 @@ async def _validate_source(
     definition: ResolvedDataDefinition,
     customer_index: dict[str, CustomerIdentity],
     allowed_customer_ids: set[int] | None,
-    expected_json_rows: int | None,
     heartbeat: asyncio.Task[None],
 ) -> _ValidationSummary:
     iterator = await asyncio.to_thread(
@@ -833,12 +871,6 @@ async def _validate_source(
         if not finished:
             await asyncio.to_thread(_close_iterator, iterator)
 
-    if expected_json_rows is not None and total_rows != expected_json_rows:
-        raise BusinessError(
-            ErrorCode.DATA_IMPORT_INVALID,
-            "Import JSON row count changed while processing",
-            http_status=422,
-        )
     return _ValidationSummary(
         total_rows=total_rows,
         valid_rows=valid_rows,
@@ -851,36 +883,44 @@ async def _validate_source(
 
 async def _persist_validation_summary(
     session: AsyncSession,
-    job: DataImportJob,
+    identity: _ClaimIdentity,
     summary: _ValidationSummary,
 ) -> None:
-    job.total_rows = summary.total_rows
-    job.valid_rows = summary.valid_rows
-    job.invalid_rows = summary.invalid_rows
-    job.error_count = summary.error_count
-    job.date_from = min(summary.business_dates) if summary.business_dates else None
-    job.date_to = max(summary.business_dates) if summary.business_dates else None
-    job.progress_percent = 20
-    session.add_all(
-        DataImportError(
-            import_id=job.id,
-            sheet_name=issue.sheet_name,
-            row_number=issue.row_number,
-            column_label=issue.column_label,
-            field_id=issue.field_id,
-            error_code=issue.error_code,
-            message=issue.message[:500],
+    try:
+        job = await _lock_claimed_job(
+            session,
+            identity,
+            expected_statuses={DataImportStatus.VALIDATING},
         )
-        for issue in summary.issues
-    )
-    await session.commit()
+        job.total_rows = summary.total_rows
+        job.valid_rows = summary.valid_rows
+        job.invalid_rows = summary.invalid_rows
+        job.error_count = summary.error_count
+        job.date_from = min(summary.business_dates) if summary.business_dates else None
+        job.date_to = max(summary.business_dates) if summary.business_dates else None
+        job.progress_percent = 20
+        session.add_all(
+            DataImportError(
+                import_id=identity.job_id,
+                sheet_name=issue.sheet_name,
+                row_number=issue.row_number,
+                column_label=issue.column_label,
+                field_id=issue.field_id,
+                error_code=issue.error_code,
+                message=issue.message[:500],
+            )
+            for issue in summary.issues
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def _stage_source(
     *,
     session: AsyncSession,
     identity: _ClaimIdentity,
-    job: DataImportJob,
     source_path: Path,
     definition: ResolvedDataDefinition,
     customer_index: dict[str, CustomerIdentity],
@@ -917,6 +957,7 @@ async def _stage_source(
                         "Import changed after validation",
                     )
                 rows_by_date.setdefault(parsed.row.business_date, []).append(parsed.row)
+            claimed_job: DataImportJob | None = None
             for business_date, rows in rows_by_date.items():
                 snapshot = snapshots.get(business_date)
                 if snapshot is None:
@@ -924,6 +965,13 @@ async def _stage_source(
                         ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
                         "Import date set changed after validation",
                     )
+                _, current_job, _ = await _lock_snapshot_chain(session, snapshot.id)
+                _require_claim_identity(
+                    current_job,
+                    identity,
+                    expected_statuses={DataImportStatus.APPLYING},
+                )
+                claimed_job = current_job
                 await append_staged_rows(
                     session,
                     snapshot.id,
@@ -933,11 +981,15 @@ async def _stage_source(
                 )
                 staged_dates.add(business_date)
             staged_rows += len(batch)
-            job.progress_percent = min(
-                90,
-                20 + int((staged_rows / expected_rows) * 70),
-            )
-            await session.commit()
+            if batch:
+                if claimed_job is None:
+                    raise _invalid_import_error("Import staging batch has no rows")
+                claimed_job.progress_percent = min(
+                    90,
+                    20 + int((staged_rows / expected_rows) * 70),
+                )
+                _raise_if_heartbeat_failed(heartbeat)
+                await session.commit()
     finally:
         if not finished:
             await asyncio.to_thread(_close_iterator, iterator)
@@ -1014,15 +1066,14 @@ async def _mark_failed_and_discard(
     marked = False
     try:
         async with session_factory() as session:
-            _, job = await _lock_table_and_job(session, identity.job_id)
-            if (
-                job.lease_owner != identity.worker_id
-                or job.attempt_count != identity.attempt_count
-                or job.status
-                not in {DataImportStatus.VALIDATING, DataImportStatus.APPLYING}
-            ):
-                await session.rollback()
-                return False
+            job = await _lock_claimed_job(
+                session,
+                identity,
+                expected_statuses={
+                    DataImportStatus.VALIDATING,
+                    DataImportStatus.APPLYING,
+                },
+            )
             job.status = DataImportStatus.FAILED
             job.failure_code = code[:64]
             job.failure_message = message[:500]
@@ -1050,30 +1101,39 @@ async def _mark_failed_and_discard(
 
 
 async def _process_claimed_import(identity: _ClaimIdentity) -> None:
-    async with session_factory() as session:
-        job = await data_import_repository.get_import_job(session, identity.job_id)
-        if job is None:
-            raise _not_found_error()
-        _require_claimed_job(job, identity)
-        context = await _rehydrate_requester(session, identity.requested_by)
-        definition = await data_table_repository.load_resolved_definition(
-            session,
-            identity.table_id,
-        )
-        if definition is None:
-            raise _ImportFailure(
-                ErrorCode.DATA_TABLE_NOT_FOUND.name,
-                "Import table definition is unavailable",
+    heartbeat, heartbeat_stop = await _start_heartbeat(identity)
+    try:
+        async with session_factory() as session:
+            context = await _rehydrate_requester(session, identity.requested_by)
+            _raise_if_heartbeat_failed(heartbeat)
+            definition = await data_table_repository.load_resolved_definition(
+                session,
+                identity.table_id,
             )
-        customer_index, allowed_customer_ids = await _load_customer_validation_inputs(
-            session, context
-        )
-        job.progress_percent = 5
-        await session.commit()
+            _raise_if_heartbeat_failed(heartbeat)
+            if definition is None:
+                raise _ImportFailure(
+                    ErrorCode.DATA_TABLE_NOT_FOUND.name,
+                    "Import table definition is unavailable",
+                )
+            (
+                customer_index,
+                allowed_customer_ids,
+            ) = await _load_customer_validation_inputs(session, context)
+            _raise_if_heartbeat_failed(heartbeat)
 
-        heartbeat_stop = asyncio.Event()
-        heartbeat = asyncio.create_task(_renew_until_stopped(identity, heartbeat_stop))
-        try:
+            try:
+                job = await _lock_claimed_job(
+                    session,
+                    identity,
+                    expected_statuses={DataImportStatus.VALIDATING},
+                )
+                job.progress_percent = 5
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
             with tempfile.TemporaryDirectory(prefix="data-import-worker-") as root:
                 source_path = Path(root) / _source_filename(identity.source)
                 await asyncio.to_thread(
@@ -1084,23 +1144,16 @@ async def _process_claimed_import(identity: _ClaimIdentity) -> None:
                     expected_size=identity.size_bytes,
                 )
                 _raise_if_heartbeat_failed(heartbeat)
-                expected_json_rows = None
-                if identity.source == DataImportSource.API:
-                    expected_json_rows = await asyncio.to_thread(
-                        data_import_parser.json_import_row_count,
-                        source_path,
-                    )
-                _raise_if_heartbeat_failed(heartbeat)
                 summary = await _validate_source(
                     identity=identity,
                     source_path=source_path,
                     definition=definition,
                     customer_index=customer_index,
                     allowed_customer_ids=allowed_customer_ids,
-                    expected_json_rows=expected_json_rows,
                     heartbeat=heartbeat,
                 )
-                await _persist_validation_summary(session, job, summary)
+                _raise_if_heartbeat_failed(heartbeat)
+                await _persist_validation_summary(session, identity, summary)
                 _raise_if_heartbeat_failed(heartbeat)
                 if summary.total_rows == 0:
                     raise _ImportFailure(
@@ -1118,18 +1171,26 @@ async def _process_claimed_import(identity: _ClaimIdentity) -> None:
                         "Import contains no business dates",
                     )
 
-                snapshots = await start_staged_import(
-                    session,
-                    identity.job_id,
-                    summary.business_dates,
-                    worker_id=identity.worker_id,
-                )
-                job.progress_percent = 25
-                await session.commit()
+                try:
+                    claimed_job = await _lock_claimed_job(
+                        session,
+                        identity,
+                        expected_statuses={DataImportStatus.VALIDATING},
+                    )
+                    claimed_job.progress_percent = 25
+                    snapshots = await start_staged_import(
+                        session,
+                        identity.job_id,
+                        summary.business_dates,
+                        worker_id=identity.worker_id,
+                    )
+                except Exception:
+                    await session.rollback()
+                    raise
+                _raise_if_heartbeat_failed(heartbeat)
                 await _stage_source(
                     session=session,
                     identity=identity,
-                    job=job,
                     source_path=source_path,
                     definition=definition,
                     customer_index=customer_index,
@@ -1139,15 +1200,26 @@ async def _process_claimed_import(identity: _ClaimIdentity) -> None:
                     expected_rows=summary.total_rows,
                     heartbeat=heartbeat,
                 )
-        finally:
-            await _stop_heartbeat(heartbeat, heartbeat_stop)
+                _raise_if_heartbeat_failed(heartbeat)
+    finally:
+        await _stop_heartbeat(heartbeat, heartbeat_stop)
 
-        await activate_import(
-            session,
-            import_id=identity.job_id,
-            worker_id=identity.worker_id,
-            expected_dates=summary.business_dates,
-        )
+    async with session_factory() as session:
+        try:
+            await _lock_claimed_job(
+                session,
+                identity,
+                expected_statuses={DataImportStatus.APPLYING},
+            )
+            await activate_import(
+                session,
+                import_id=identity.job_id,
+                worker_id=identity.worker_id,
+                expected_dates=summary.business_dates,
+            )
+        except Exception:
+            await session.rollback()
+            raise
         await record_audit_entry(
             action="data_import:complete",
             resource_type="custom_data_import",

@@ -320,24 +320,30 @@ async def renew_import_lease(
     import_id: int,
     worker_id: str,
     lease_seconds: int,
+    attempt_count: int | None = None,
 ) -> bool:
     """Extend a still-live lease owned by ``worker_id``.
 
     An expired lease cannot be revived: another worker may already have
-    claimed the job using ``SKIP LOCKED``.
+    claimed the job using ``SKIP LOCKED``. When supplied, ``attempt_count``
+    also prevents an abandoned process with a reused worker ID from renewing a
+    later attempt.
     """
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
     now = _utc_now()
+    conditions = [
+        DataImportJob.id == import_id,
+        DataImportJob.lease_owner == worker_id,
+        DataImportJob.status.in_(_CLAIMABLE_LEASED_STATUSES),
+        DataImportJob.lease_expires_at.is_not(None),
+        DataImportJob.lease_expires_at > now,
+    ]
+    if attempt_count is not None:
+        conditions.append(DataImportJob.attempt_count == attempt_count)
     result = await session.execute(
         update(DataImportJob)
-        .where(
-            DataImportJob.id == import_id,
-            DataImportJob.lease_owner == worker_id,
-            DataImportJob.status.in_(_CLAIMABLE_LEASED_STATUSES),
-            DataImportJob.lease_expires_at.is_not(None),
-            DataImportJob.lease_expires_at > now,
-        )
+        .where(*conditions)
         .values(
             lease_expires_at=now + timedelta(seconds=lease_seconds),
             heartbeat_at=now,

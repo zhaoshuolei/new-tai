@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -517,7 +518,16 @@ async def test_process_json_import_activates_all_dates_and_preserves_absent_date
         table_id = table.id
         await setup.commit()
 
+    def unexpected_json_count(*args: Any, **kwargs: Any) -> int:
+        del args, kwargs
+        raise AssertionError("JSON row-count prepass must not run")
+
     _allow_requester(monkeypatch, context)
+    monkeypatch.setattr(
+        data_import_parser,
+        "json_import_row_count",
+        unexpected_json_count,
+    )
     claimed = await _claim(factory, worker_id="worker-json")
     assert claimed.id == job_id
     await data_import_service.process_import_job(job_id, worker_id="worker-json")
@@ -827,6 +837,185 @@ async def test_failure_after_staging_retains_cleanup_identity_and_discards_stage
     assert failed_audit[0].result == AuditResult.DENIED
 
 
+async def test_reclaimed_attempt_cannot_write_stage_fail_or_cleanup_new_state(
+    factory: async_sessionmaker[AsyncSession],
+    committed: _CommittedState,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "data_import_root", str(tmp_path))
+    monkeypatch.setattr(data_import_service, "_LEASE_SECONDS", 1)
+    monkeypatch.setattr(data_import_service, "_LEASE_RENEW_INTERVAL_SECONDS", 3600.0)
+    async with factory() as setup:
+        owner = await make_user(setup)
+        committed.track_user(owner)
+        upstream = await make_customer_row(setup, owner=owner)
+        downstream = await make_customer_row(setup, owner=owner)
+        table = await _make_definition(setup, committed, owner)
+        context = _context(owner)
+        invalid_row = _row(
+            DATE_ONE,
+            upstream.id,
+            downstream.id,
+            revenue="not-a-decimal",
+        )
+        job = await _enqueue(
+            setup,
+            table,
+            _store_json([invalid_row]),
+            context,
+        )
+        job_id = job.id
+        table_id = table.id
+        await setup.commit()
+
+    _allow_requester(monkeypatch, context)
+    old_claim = await _claim(factory, worker_id="worker-old", lease_seconds=1)
+    old_identity = data_import_service._claim_identity(old_claim, "worker-old")
+    paused = asyncio.Event()
+    release = asyncio.Event()
+    original_persist = data_import_service._persist_validation_summary
+
+    async def paused_persist(*args: Any, **kwargs: Any) -> None:
+        paused.set()
+        await release.wait()
+        await original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(
+        data_import_service,
+        "_persist_validation_summary",
+        paused_persist,
+    )
+    old_task = asyncio.create_task(
+        data_import_service.process_import_job(job_id, worker_id="worker-old")
+    )
+    try:
+        await asyncio.wait_for(paused.wait(), timeout=5)
+        await asyncio.sleep(1.1)
+        new_claim = await _claim(
+            factory,
+            worker_id="worker-new",
+            lease_seconds=120,
+        )
+        assert new_claim.id == job_id
+        assert new_claim.attempt_count == old_claim.attempt_count + 1
+
+        async with factory() as session:
+            new_job = await session.get(DataImportJob, job_id)
+            assert new_job is not None
+            new_job.total_rows = 41
+            new_job.valid_rows = 40
+            new_job.invalid_rows = 1
+            new_job.error_count = 3
+            new_job.date_from = DATE_ONE
+            new_job.date_to = DATE_ONE
+            new_job.progress_percent = 61
+            session.add(
+                DataImportError(
+                    import_id=job_id,
+                    row_number=41,
+                    error_code="new_attempt_error",
+                    message="new-attempt-diagnostic",
+                )
+            )
+            await session.commit()
+
+        async with factory() as session:
+            new_snapshots = await data_import_service.start_staged_import(
+                session,
+                job_id,
+                {DATE_ONE},
+                worker_id="worker-new",
+            )
+        new_snapshot_id = new_snapshots[DATE_ONE].id
+
+        release.set()
+        await asyncio.wait_for(old_task, timeout=5)
+    finally:
+        release.set()
+        if not old_task.done():
+            old_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await old_task
+
+    refreshed = await _job(factory, job_id)
+    assert refreshed.status == DataImportStatus.APPLYING
+    assert refreshed.lease_owner == "worker-new"
+    assert refreshed.attempt_count == new_claim.attempt_count
+    assert refreshed.total_rows == 41
+    assert refreshed.valid_rows == 40
+    assert refreshed.invalid_rows == 1
+    assert refreshed.error_count == 3
+    assert refreshed.date_from == DATE_ONE
+    assert refreshed.date_to == DATE_ONE
+    assert refreshed.progress_percent == 61
+    assert refreshed.failure_code is None
+    assert refreshed.failure_message is None
+    assert refreshed.finished_at is None
+
+    async with factory() as session:
+        errors = await data_import_repository.list_import_errors(session, job_id)
+        assert [error.error_code for error in errors] == ["new_attempt_error"]
+        snapshot = await session.get(DataSnapshot, new_snapshot_id)
+        assert snapshot is not None
+        assert snapshot.status == DataSnapshotStatus.STAGED
+        assert snapshot.row_count == 0
+        records = list(
+            (
+                await session.scalars(
+                    sa.select(DataRecord).where(DataRecord.table_id == table_id)
+                )
+            ).all()
+        )
+        assert records == []
+
+    with pytest.raises(BusinessError):
+        async with factory() as session:
+            await data_import_service.start_staged_import(
+                session,
+                job_id,
+                {DATE_ONE},
+                worker_id="worker-old",
+            )
+    with pytest.raises(BusinessError):
+        async with factory() as session:
+            await data_import_service.append_staged_rows(
+                session,
+                new_snapshot_id,
+                [],
+                worker_id="worker-old",
+            )
+    with pytest.raises(BusinessError):
+        async with factory() as session:
+            await data_import_service.activate_import(
+                session,
+                import_id=job_id,
+                worker_id="worker-old",
+                expected_dates={DATE_ONE},
+            )
+    with pytest.raises(BusinessError):
+        async with factory() as session:
+            await data_import_service.discard_staged_import(
+                session,
+                job_id,
+                worker_id="worker-old",
+                attempt_count=old_claim.attempt_count,
+            )
+    assert not await data_import_service._mark_failed_and_discard(
+        old_identity,
+        code="STALE",
+        message="stale worker",
+    )
+
+    final_state = await _job(factory, job_id)
+    assert final_state.status == DataImportStatus.APPLYING
+    assert final_state.lease_owner == "worker-new"
+    assert final_state.attempt_count == new_claim.attempt_count
+    assert final_state.progress_percent == 61
+    async with factory() as session:
+        assert await session.get(DataSnapshot, new_snapshot_id) is not None
+
+
 async def test_process_requires_current_matching_lease(
     factory: async_sessionmaker[AsyncSession],
     committed: _CommittedState,
@@ -1027,12 +1216,14 @@ async def test_long_parse_renews_lease_periodically(
         import_id: int,
         worker_id: str,
         lease_seconds: int,
+        attempt_count: int | None = None,
     ) -> bool:
         renewed = await original_renew(
             session,
             import_id=import_id,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
+            attempt_count=attempt_count,
         )
         renewals.append(renewed)
         return renewed
@@ -1042,10 +1233,26 @@ async def test_long_parse_renews_lease_periodically(
         "renew_import_lease",
         tracked_renew,
     )
+    original_rehydrate = data_import_service._rehydrate_requester
+    renewals_before_requester: list[int] = []
+
+    async def tracked_rehydrate(
+        session: AsyncSession,
+        requested_by: int,
+    ) -> AuthContext:
+        renewals_before_requester.append(len(renewals))
+        return await original_rehydrate(session, requested_by)
+
+    monkeypatch.setattr(
+        data_import_service,
+        "_rehydrate_requester",
+        tracked_rehydrate,
+    )
     _allow_requester(monkeypatch, context)
     await _claim(factory, worker_id="worker-lease", lease_seconds=2)
     await data_import_service.process_import_job(job_id, worker_id="worker-lease")
 
+    assert renewals_before_requester == [1]
     assert len(renewals) >= 2
     assert all(renewals)
     assert (await _job(factory, job_id)).status == DataImportStatus.SUCCEEDED

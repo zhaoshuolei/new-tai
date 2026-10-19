@@ -449,6 +449,7 @@ async def test_renew_lease_requires_owner_and_unexpired_active_lease(
             import_id=job.id,
             worker_id="worker-b",
             lease_seconds=300,
+            attempt_count=1,
         )
         is False
     )
@@ -458,6 +459,17 @@ async def test_renew_lease_requires_owner_and_unexpired_active_lease(
             import_id=job.id,
             worker_id="worker-a",
             lease_seconds=300,
+            attempt_count=2,
+        )
+        is False
+    )
+    assert (
+        await data_import_repository.renew_import_lease(
+            session,
+            import_id=job.id,
+            worker_id="worker-a",
+            lease_seconds=300,
+            attempt_count=1,
         )
         is True
     )
