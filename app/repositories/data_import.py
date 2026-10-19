@@ -302,6 +302,8 @@ async def claim_next_import_job(
         job.total_rows = 0
         job.valid_rows = 0
         job.invalid_rows = 0
+        job.date_from = None
+        job.date_to = None
         job.error_count = 0
         job.progress_percent = 0
         await session.flush()

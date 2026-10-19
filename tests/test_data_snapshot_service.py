@@ -1,5 +1,6 @@
 """Snapshot staging, versioning, activation, and cleanup tests."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -9,7 +10,11 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.errors import BusinessError, ErrorCode
 from app.models.data_management import (
@@ -54,6 +59,59 @@ async def session() -> AsyncIterator[AsyncSession]:
             await test_session.close()
             await transaction.rollback()
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield session_factory
+    finally:
+        await engine.dispose()
+
+
+async def _delete_committed_table(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    table_id: int,
+    user_id: int,
+) -> None:
+    async with factory() as cleanup:
+        record_ids = sa.select(DataRecord.id).where(DataRecord.table_id == table_id)
+        await cleanup.execute(
+            sa.delete(DataRecordValue).where(DataRecordValue.record_id.in_(record_ids))
+        )
+        await cleanup.execute(
+            sa.delete(DataRecord).where(DataRecord.table_id == table_id)
+        )
+        await cleanup.execute(
+            DataCurrentSnapshot.delete().where(
+                DataCurrentSnapshot.c.table_id == table_id
+            )
+        )
+        await cleanup.execute(
+            sa.delete(DataSnapshot).where(DataSnapshot.table_id == table_id)
+        )
+        await cleanup.execute(
+            sa.delete(DataImportJob).where(DataImportJob.table_id == table_id)
+        )
+        field_ids = sa.select(DataFieldDefinition.id).where(
+            DataFieldDefinition.table_id == table_id
+        )
+        await cleanup.execute(
+            sa.delete(DataEnumOption).where(DataEnumOption.field_id.in_(field_ids))
+        )
+        await cleanup.execute(
+            sa.delete(DataFieldDefinition).where(
+                DataFieldDefinition.table_id == table_id
+            )
+        )
+        await cleanup.execute(
+            sa.delete(DataTableDefinition).where(DataTableDefinition.id == table_id)
+        )
+        await cleanup.execute(sa.delete(User).where(User.id == user_id))
+        await cleanup.commit()
 
 
 async def _make_table(session: AsyncSession, owner: User) -> DataTableDefinition:
@@ -251,31 +309,67 @@ async def test_append_staged_rows_persists_all_typed_values_in_batches(
     )
     job = await _make_job(session, table=table, owner=owner)
     snapshots = await data_import_service.start_staged_import(
-        session, job, {BUSINESS_DATE}
+        session,
+        job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
     )
-    field_values = {
-        text_field.id: FieldValue(field_id=text_field.id, text_value="hello"),
-        integer_field.id: FieldValue(field_id=integer_field.id, integer_value=42),
-        decimal_field.id: FieldValue(
-            field_id=decimal_field.id, decimal_value=Decimal("1.25000000")
+    rows = [
+        _validated_row(
+            customer_id=customer.id,
+            customer_name=customer.name,
+            business_date=BUSINESS_DATE,
+            custom_values={
+                text_field.id: FieldValue(field_id=text_field.id, text_value="hello"),
+                integer_field.id: FieldValue(
+                    field_id=integer_field.id, integer_value=42
+                ),
+                decimal_field.id: FieldValue(
+                    field_id=decimal_field.id,
+                    decimal_value=Decimal("1.25000000"),
+                ),
+                date_field.id: FieldValue(
+                    field_id=date_field.id, date_value=BUSINESS_DATE
+                ),
+                boolean_field.id: FieldValue(
+                    field_id=boolean_field.id, boolean_value=True
+                ),
+                enum_field.id: FieldValue(
+                    field_id=enum_field.id, enum_option_id=enum_options[1].id
+                ),
+            },
         ),
-        date_field.id: FieldValue(field_id=date_field.id, date_value=BUSINESS_DATE),
-        boolean_field.id: FieldValue(field_id=boolean_field.id, boolean_value=True),
-        enum_field.id: FieldValue(
-            field_id=enum_field.id, enum_option_id=enum_options[1].id
+        _validated_row(
+            customer_id=customer.id,
+            customer_name=customer.name,
+            business_date=BUSINESS_DATE,
+            custom_values={
+                text_field.id: FieldValue(field_id=text_field.id, text_value=""),
+                integer_field.id: FieldValue(
+                    field_id=integer_field.id, integer_value=0
+                ),
+                decimal_field.id: FieldValue(
+                    field_id=decimal_field.id,
+                    decimal_value=Decimal("0.00000000"),
+                ),
+                date_field.id: FieldValue(
+                    field_id=date_field.id, date_value=BUSINESS_DATE
+                ),
+                boolean_field.id: FieldValue(
+                    field_id=boolean_field.id, boolean_value=False
+                ),
+                enum_field.id: FieldValue(
+                    field_id=enum_field.id, enum_option_id=enum_options[0].id
+                ),
+            },
         ),
-    }
-    row = _validated_row(
-        customer_id=customer.id,
-        customer_name=customer.name,
-        business_date=BUSINESS_DATE,
-        custom_values=field_values,
-    )
+    ]
 
     await data_import_service.append_staged_rows(
         session,
         snapshots[BUSINESS_DATE].id,
-        [row, row],
+        rows,
+        worker_id="test-worker",
     )
 
     record_rows = list(
@@ -304,13 +398,19 @@ async def test_append_staged_rows_persists_all_typed_values_in_batches(
         }
         for record in record_rows
     }
-    for typed_values in by_record.values():
-        assert typed_values[text_field.id].text_value == "hello"
-        assert typed_values[integer_field.id].integer_value == 42
-        assert typed_values[decimal_field.id].decimal_value == Decimal("1.25000000")
+    ordered_values = [by_record[record.id] for record in record_rows]
+    assert ordered_values[0][text_field.id].text_value == "hello"
+    assert ordered_values[0][integer_field.id].integer_value == 42
+    assert ordered_values[0][decimal_field.id].decimal_value == Decimal("1.25000000")
+    assert ordered_values[0][boolean_field.id].boolean_value is True
+    assert ordered_values[0][enum_field.id].enum_option_id == enum_options[1].id
+    assert ordered_values[1][text_field.id].text_value == ""
+    assert ordered_values[1][integer_field.id].integer_value == 0
+    assert ordered_values[1][decimal_field.id].decimal_value == Decimal("0.00000000")
+    assert ordered_values[1][boolean_field.id].boolean_value is False
+    assert ordered_values[1][enum_field.id].enum_option_id == enum_options[0].id
+    for typed_values in ordered_values:
         assert typed_values[date_field.id].date_value == BUSINESS_DATE
-        assert typed_values[boolean_field.id].boolean_value is True
-        assert typed_values[enum_field.id].enum_option_id == enum_options[1].id
     refreshed_snapshot = await session.get(DataSnapshot, snapshots[BUSINESS_DATE].id)
     assert refreshed_snapshot is not None
     assert refreshed_snapshot.row_count == 2
@@ -346,7 +446,10 @@ async def test_start_allocates_versions_above_all_history(
     job = await _make_job(session, table=table, owner=owner)
 
     snapshots = await data_import_service.start_staged_import(
-        session, job, {BUSINESS_DATE}
+        session,
+        job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
     )
 
     assert snapshots[BUSINESS_DATE].version == 3
@@ -393,8 +496,12 @@ async def test_activation_switches_all_dates_and_preserves_unlisted_date(
             snapshot_id=snapshot.id,
         )
     job = await _make_job(session, table=table, owner=owner)
+    expected_dates = {BUSINESS_DATE, SECOND_DATE}
     staged = await data_import_service.start_staged_import(
-        session, job, {BUSINESS_DATE, SECOND_DATE}
+        session,
+        job.id,
+        expected_dates,
+        worker_id="test-worker",
     )
     for snapshot in staged.values():
         await data_import_service.append_staged_rows(
@@ -408,12 +515,14 @@ async def test_activation_switches_all_dates_and_preserves_unlisted_date(
                     custom_values={},
                 )
             ],
+            worker_id="test-worker",
         )
 
     await data_import_service.activate_import(
         session,
         import_id=job.id,
         worker_id="test-worker",
+        expected_dates=expected_dates,
     )
 
     current = {
@@ -456,7 +565,12 @@ async def test_start_retry_discards_only_previous_staged_rows(
     table = await _make_table(session, owner)
     customer = await make_customer_row(session, owner=owner)
     job = await _make_job(session, table=table, owner=owner)
-    first = await data_import_service.start_staged_import(session, job, {BUSINESS_DATE})
+    first = await data_import_service.start_staged_import(
+        session,
+        job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
+    )
     first_id = first[BUSINESS_DATE].id
     await data_import_service.append_staged_rows(
         session,
@@ -469,6 +583,7 @@ async def test_start_retry_discards_only_previous_staged_rows(
                 custom_values={},
             )
         ],
+        worker_id="test-worker",
     )
     first_record_ids = list(
         (
@@ -477,9 +592,14 @@ async def test_start_retry_discards_only_previous_staged_rows(
             )
         ).all()
     )
+    job.status = DataImportStatus.VALIDATING
+    await session.flush()
 
     second = await data_import_service.start_staged_import(
-        session, job, {BUSINESS_DATE}
+        session,
+        job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
     )
 
     assert second[BUSINESS_DATE].id != first_id
@@ -598,8 +718,12 @@ async def test_activation_failure_rolls_back_every_pointer_and_status(
             snapshot_id=snapshot.id,
         )
     job = await _make_job(session, table=table, owner=owner)
+    expected_dates = {BUSINESS_DATE, SECOND_DATE}
     staged = await data_import_service.start_staged_import(
-        session, job, {BUSINESS_DATE, SECOND_DATE}
+        session,
+        job.id,
+        expected_dates,
+        worker_id="test-worker",
     )
     table_id = table.id
     job_id = job.id
@@ -631,6 +755,7 @@ async def test_activation_failure_rolls_back_every_pointer_and_status(
             session,
             import_id=job_id,
             worker_id="test-worker",
+            expected_dates=expected_dates,
         )
 
     pointers = {
@@ -682,7 +807,12 @@ async def test_activation_rejects_wrong_or_expired_lease(
         owner=owner,
         worker_id="test-worker",
     )
-    await data_import_service.start_staged_import(session, job, {BUSINESS_DATE})
+    await data_import_service.start_staged_import(
+        session,
+        job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
+    )
     if expired:
         job.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             seconds=1
@@ -695,6 +825,7 @@ async def test_activation_rejects_wrong_or_expired_lease(
             session,
             import_id=job.id,
             worker_id=worker_id,
+            expected_dates={BUSINESS_DATE},
         )
 
     assert error.value.code == expected_code
@@ -708,7 +839,12 @@ async def test_append_rejects_rows_for_a_different_business_date(
     customer = await make_customer_row(session, owner=owner)
     job = await _make_job(session, table=table, owner=owner)
     snapshot = (
-        await data_import_service.start_staged_import(session, job, {BUSINESS_DATE})
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="test-worker",
+        )
     )[BUSINESS_DATE]
 
     with pytest.raises(BusinessError) as error:
@@ -723,6 +859,487 @@ async def test_append_rejects_rows_for_a_different_business_date(
                     custom_values={},
                 )
             ],
+            worker_id="test-worker",
         )
 
     assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+
+
+@pytest.mark.parametrize(
+    "invalid_dates",
+    [
+        (),
+        (BUSINESS_DATE, BUSINESS_DATE),
+    ],
+)
+async def test_start_rejects_empty_or_duplicate_dates_before_cleanup(
+    session: AsyncSession,
+    invalid_dates: tuple[date, ...],
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(session, table=table, owner=owner)
+    existing = (
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="test-worker",
+        )
+    )[BUSINESS_DATE]
+    job.status = DataImportStatus.VALIDATING
+    await session.flush()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            invalid_dates,
+            worker_id="test-worker",
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, existing.id) is not None
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataSnapshot)
+            .where(DataSnapshot.import_id == job.id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_status", "worker_id", "expired"),
+    [
+        (DataImportStatus.APPLYING, "test-worker", False),
+        (DataImportStatus.VALIDATING, "other-worker", False),
+        (DataImportStatus.VALIDATING, "test-worker", True),
+    ],
+)
+async def test_start_rejects_wrong_status_owner_or_expired_lease_without_cleanup(
+    session: AsyncSession,
+    job_status: DataImportStatus,
+    worker_id: str,
+    expired: bool,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=job_status,
+        expired=expired,
+    )
+    existing = await _add_snapshot(
+        session,
+        table=table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    existing_id = existing.id
+    job_id = job.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.start_staged_import(
+            session,
+            job_id,
+            {SECOND_DATE},
+            worker_id=worker_id,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, existing_id) is not None
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataSnapshot)
+            .where(DataSnapshot.import_id == job_id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_status", "worker_id", "expired"),
+    [
+        (DataImportStatus.VALIDATING, "test-worker", False),
+        (DataImportStatus.APPLYING, "other-worker", False),
+        (DataImportStatus.APPLYING, "test-worker", True),
+    ],
+)
+async def test_append_rejects_wrong_status_owner_or_expired_lease_without_writes(
+    session: AsyncSession,
+    job_status: DataImportStatus,
+    worker_id: str,
+    expired: bool,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(session, table=table, owner=owner)
+    snapshot = (
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="test-worker",
+        )
+    )[BUSINESS_DATE]
+    job.status = job_status
+    if expired:
+        job.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            seconds=1
+        )
+    await session.flush()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.append_staged_rows(
+            session,
+            snapshot.id,
+            [
+                _validated_row(
+                    customer_id=customer.id,
+                    customer_name=customer.name,
+                    business_date=BUSINESS_DATE,
+                    custom_values={},
+                )
+            ],
+            worker_id=worker_id,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert await session.get(DataSnapshot, snapshot.id) is not None
+    assert snapshot.row_count == 0
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataRecord)
+            .where(DataRecord.snapshot_id == snapshot.id)
+        )
+        == 0
+    )
+
+
+async def test_append_rejects_snapshot_owned_by_another_import(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    first_table = await _make_table(session, owner)
+    second_table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    first_job = await _make_job(session, table=first_table, owner=owner)
+    second_job = await _make_job(
+        session,
+        table=second_table,
+        owner=owner,
+        worker_id="second-worker",
+    )
+    await data_import_service.start_staged_import(
+        session,
+        first_job.id,
+        {BUSINESS_DATE},
+        worker_id="test-worker",
+    )
+    second_snapshot = (
+        await data_import_service.start_staged_import(
+            session,
+            second_job.id,
+            {BUSINESS_DATE},
+            worker_id="second-worker",
+        )
+    )[BUSINESS_DATE]
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.append_staged_rows(
+            session,
+            second_snapshot.id,
+            [
+                _validated_row(
+                    customer_id=customer.id,
+                    customer_name=customer.name,
+                    business_date=BUSINESS_DATE,
+                    custom_values={},
+                )
+            ],
+            worker_id="test-worker",
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataRecord)
+            .where(DataRecord.snapshot_id == second_snapshot.id)
+        )
+        == 0
+    )
+
+
+async def test_append_rejects_snapshot_table_mismatch_with_parent_job(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    parent_table = await _make_table(session, owner)
+    foreign_table = await _make_table(session, owner)
+    customer = await make_customer_row(session, owner=owner)
+    job = await _make_job(
+        session,
+        table=parent_table,
+        owner=owner,
+        status=DataImportStatus.APPLYING,
+    )
+    foreign_snapshot = await _add_snapshot(
+        session,
+        table=foreign_table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.append_staged_rows(
+            session,
+            foreign_snapshot.id,
+            [
+                _validated_row(
+                    customer_id=customer.id,
+                    customer_name=customer.name,
+                    business_date=BUSINESS_DATE,
+                    custom_values={},
+                )
+            ],
+            worker_id="test-worker",
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataRecord)
+            .where(DataRecord.snapshot_id == foreign_snapshot.id)
+        )
+        == 0
+    )
+
+
+async def test_activation_rejects_non_applying_job(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=DataImportStatus.VALIDATING,
+    )
+    staged = await _add_snapshot(
+        session,
+        table=table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    staged_id = staged.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.activate_import(
+            session,
+            import_id=job.id,
+            worker_id="test-worker",
+            expected_dates={BUSINESS_DATE},
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    refreshed = await session.get(DataSnapshot, staged_id)
+    assert refreshed is not None
+    assert refreshed.status == DataSnapshotStatus.STAGED
+
+
+@pytest.mark.parametrize(
+    ("staged_dates", "expected_dates"),
+    [
+        ({BUSINESS_DATE}, {BUSINESS_DATE, SECOND_DATE}),
+        ({BUSINESS_DATE, SECOND_DATE}, {BUSINESS_DATE}),
+    ],
+)
+async def test_activation_rejects_missing_or_extra_staged_dates(
+    session: AsyncSession,
+    staged_dates: set[date],
+    expected_dates: set[date],
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(session, table=table, owner=owner)
+    job_id = job.id
+    table_id = table.id
+    staged = await data_import_service.start_staged_import(
+        session,
+        job_id,
+        staged_dates,
+        worker_id="test-worker",
+    )
+    staged_ids = {
+        business_date: snapshot.id for business_date, snapshot in staged.items()
+    }
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.activate_import(
+            session,
+            import_id=job_id,
+            worker_id="test-worker",
+            expected_dates=expected_dates,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    for snapshot_id in staged_ids.values():
+        refreshed = await session.get(DataSnapshot, snapshot_id)
+        assert refreshed is not None
+        assert refreshed.status == DataSnapshotStatus.STAGED
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataCurrentSnapshot)
+            .where(DataCurrentSnapshot.c.table_id == table_id)
+        )
+        == 0
+    )
+
+
+async def test_activation_rejects_foreign_table_snapshot(
+    session: AsyncSession,
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    foreign_table = await _make_table(session, owner)
+    job = await _make_job(
+        session,
+        table=table,
+        owner=owner,
+        status=DataImportStatus.APPLYING,
+    )
+    foreign_snapshot = await _add_snapshot(
+        session,
+        table=foreign_table,
+        job=job,
+        business_date=BUSINESS_DATE,
+        version=1,
+        status=DataSnapshotStatus.STAGED,
+    )
+    foreign_snapshot_id = foreign_snapshot.id
+    table_id = table.id
+    await session.commit()
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.activate_import(
+            session,
+            import_id=job.id,
+            worker_id="test-worker",
+            expected_dates={BUSINESS_DATE},
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    refreshed = await session.get(DataSnapshot, foreign_snapshot_id)
+    assert refreshed is not None
+    assert refreshed.status == DataSnapshotStatus.STAGED
+    assert (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DataCurrentSnapshot)
+            .where(DataCurrentSnapshot.c.table_id == table_id)
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "expected_dates",
+    [
+        (),
+        (BUSINESS_DATE, BUSINESS_DATE),
+    ],
+)
+async def test_activation_rejects_empty_or_duplicate_expected_dates_without_mutation(
+    session: AsyncSession,
+    expected_dates: tuple[date, ...],
+) -> None:
+    owner = await make_user(session)
+    table = await _make_table(session, owner)
+    job = await _make_job(session, table=table, owner=owner)
+    snapshot = (
+        await data_import_service.start_staged_import(
+            session,
+            job.id,
+            {BUSINESS_DATE},
+            worker_id="test-worker",
+        )
+    )[BUSINESS_DATE]
+
+    with pytest.raises(BusinessError) as error:
+        await data_import_service.activate_import(
+            session,
+            import_id=job.id,
+            worker_id="test-worker",
+            expected_dates=expected_dates,
+        )
+
+    assert error.value.code == ErrorCode.DATA_IMPORT_INVALID
+    refreshed = await session.get(DataSnapshot, snapshot.id)
+    assert refreshed is not None
+    assert refreshed.status == DataSnapshotStatus.STAGED
+
+
+async def test_start_waits_for_direct_table_row_lock(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    table_id: int | None = None
+    user_id: int | None = None
+    try:
+        async with factory() as setup:
+            owner = await make_user(setup)
+            table = await _make_table(setup, owner)
+            job = await _make_job(setup, table=table, owner=owner)
+            table_id = table.id
+            user_id = owner.id
+            job_id = job.id
+            await setup.commit()
+
+        async with factory() as holder:
+            locked = await holder.scalar(
+                sa.select(DataTableDefinition)
+                .where(DataTableDefinition.id == table_id)
+                .with_for_update()
+            )
+            assert locked is not None
+            async with factory() as contender:
+                task = asyncio.create_task(
+                    data_import_service.start_staged_import(
+                        contender,
+                        job_id,
+                        {BUSINESS_DATE},
+                        worker_id="test-worker",
+                    )
+                )
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+                await holder.rollback()
+                snapshots = await asyncio.wait_for(task, timeout=5)
+
+        assert set(snapshots) == {BUSINESS_DATE}
+        assert snapshots[BUSINESS_DATE].status == DataSnapshotStatus.STAGED
+    finally:
+        if table_id is not None and user_id is not None:
+            await _delete_committed_table(
+                factory,
+                table_id=table_id,
+                user_id=user_id,
+            )

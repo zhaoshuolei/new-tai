@@ -28,13 +28,6 @@ from app.models.data_management import (
 from app.repositories import data_import as data_import_repository
 from app.services.data_import_parser import ValidatedImportRow
 
-_ACTIVE_LEASE_STATUSES: frozenset[DataImportStatus] = frozenset(
-    {
-        DataImportStatus.VALIDATING,
-        DataImportStatus.APPLYING,
-    }
-)
-
 
 def _utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -56,19 +49,39 @@ def _invalid_import_error(message: str) -> BusinessError:
     )
 
 
-def _require_live_lease(job: DataImportJob, worker_id: str) -> None:
-    if job.status not in _ACTIVE_LEASE_STATUSES:
-        raise _invalid_import_error("Import job is not active")
+def _validated_dates(
+    values: Collection[date],
+    *,
+    name: str,
+) -> tuple[date, ...]:
+    dates = tuple(values)
+    if not dates:
+        raise _invalid_import_error(f"{name} must not be empty")
+    if len(dates) != len(set(dates)):
+        raise _invalid_import_error(f"{name} must not contain duplicates")
+    return dates
+
+
+def _require_live_lease(
+    job: DataImportJob,
+    worker_id: str,
+    *,
+    expected_status: DataImportStatus,
+) -> None:
+    if job.status != expected_status:
+        raise _invalid_import_error(
+            f"Import job must be {expected_status.value} for this operation"
+        )
     if job.lease_owner != worker_id:
         raise _invalid_import_error("Import lease is owned by another worker")
     if job.lease_expires_at is None or job.lease_expires_at <= _utc_now():
         raise _invalid_import_error("Import lease has expired")
 
 
-async def _lock_job_and_table(
+async def _lock_table_and_job(
     session: AsyncSession,
     import_id: int,
-) -> DataImportJob:
+) -> tuple[DataTableDefinition, DataImportJob]:
     """Lock table then import, preserving the binding lock order."""
     table_id = await session.scalar(
         select(DataImportJob.table_id).where(DataImportJob.id == import_id)
@@ -86,40 +99,92 @@ async def _lock_job_and_table(
     job = await data_import_repository.get_import_job_for_update(session, import_id)
     if job is None:
         raise _not_found_error()
-    return job
+    if job.table_id != table.id:
+        raise _invalid_import_error("Import job table does not match its locked table")
+    return table, job
 
 
-async def start_staged_import(
+async def _lock_snapshot_chain(
     session: AsyncSession,
-    job: DataImportJob,
-    business_dates: Collection[date],
-) -> dict[date, DataSnapshot]:
-    """Allocate one STAGED snapshot per date and enter APPLYING.
+    snapshot_id: int,
+) -> tuple[DataTableDefinition, DataImportJob, DataSnapshot]:
+    """Lock table then parent import then snapshot for a staging write."""
+    reference = (
+        await session.execute(
+            select(DataSnapshot.table_id, DataSnapshot.import_id).where(
+                DataSnapshot.id == snapshot_id
+            )
+        )
+    ).one_or_none()
+    if reference is None:
+        raise _invalid_import_error("Import snapshot not found")
 
-    The table lock serializes version allocation.  Any STAGED data left by a
-    previous attempt of this same job is removed first; successful history is
-    never touched.
-    """
     table = await session.scalar(
         select(DataTableDefinition)
-        .where(DataTableDefinition.id == job.table_id)
+        .where(DataTableDefinition.id == reference.table_id)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     if table is None:
-        raise _not_found_error()
-    locked_job = await data_import_repository.get_import_job_for_update(session, job.id)
-    if locked_job is None:
-        raise _not_found_error()
-    if locked_job.status not in _ACTIVE_LEASE_STATUSES:
-        raise _invalid_import_error("Import job is not active")
-    if locked_job.lease_expires_at is None or locked_job.lease_expires_at <= _utc_now():
-        raise _invalid_import_error("Import lease has expired")
+        raise _invalid_import_error("Import snapshot table not found")
+    job = await data_import_repository.get_import_job_for_update(
+        session, reference.import_id
+    )
+    if job is None:
+        raise _invalid_import_error("Import snapshot parent job not found")
+    snapshot = await session.scalar(
+        select(DataSnapshot)
+        .where(DataSnapshot.id == snapshot_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if snapshot is None:
+        raise _invalid_import_error("Import snapshot not found")
+    return table, job, snapshot
 
-    await data_import_repository.discard_staged_rows(session, locked_job.id)
-    dates = sorted(set(business_dates))
-    snapshots: dict[date, DataSnapshot] = {}
-    if dates:
+
+async def start_staged_import(
+    session: AsyncSession,
+    job_id: int,
+    business_dates: Collection[date],
+    *,
+    worker_id: str,
+) -> dict[date, DataSnapshot]:
+    """Allocate one STAGED snapshot per date for the live validation owner.
+
+    The table lock serializes version allocation. Any STAGED data left by a
+    previous attempt of this same job is removed only after ownership, status,
+    lease, and the complete date input have been validated.
+    """
+    dates = tuple(sorted(_validated_dates(business_dates, name="business_dates")))
+    try:
+        table, job = await _lock_table_and_job(session, job_id)
+        _require_live_lease(
+            job,
+            worker_id,
+            expected_status=DataImportStatus.VALIDATING,
+        )
+
+        prior_staged = list(
+            (
+                await session.scalars(
+                    select(DataSnapshot)
+                    .where(
+                        DataSnapshot.import_id == job.id,
+                        DataSnapshot.status == DataSnapshotStatus.STAGED,
+                    )
+                    .order_by(DataSnapshot.business_date, DataSnapshot.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).all()
+        )
+        if any(snapshot.table_id != table.id for snapshot in prior_staged):
+            raise _invalid_import_error(
+                "A STAGED snapshot does not belong to the import table"
+            )
+
+        await data_import_repository.discard_staged_rows(session, job.id)
         maximum_by_date = {
             business_date: maximum
             for business_date, maximum in (
@@ -136,21 +201,25 @@ async def start_staged_import(
                 )
             ).all()
         }
+        snapshots: dict[date, DataSnapshot] = {}
         for business_date in dates:
             snapshot = DataSnapshot(
                 table_id=table.id,
                 business_date=business_date,
-                import_id=locked_job.id,
+                import_id=job.id,
                 version=int(maximum_by_date.get(business_date) or 0) + 1,
                 status=DataSnapshotStatus.STAGED,
                 row_count=0,
             )
             session.add(snapshot)
             snapshots[business_date] = snapshot
-        locked_job.status = DataImportStatus.APPLYING
+        job.status = DataImportStatus.APPLYING
         await session.flush()
-    await session.commit()
-    return snapshots
+        await session.commit()
+        return snapshots
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def append_staged_rows(
@@ -158,25 +227,36 @@ async def append_staged_rows(
     snapshot_id: int,
     rows: Sequence[ValidatedImportRow],
     *,
+    worker_id: str,
     batch_size: int = 1000,
 ) -> None:
-    """Insert typed records and values in bounded ORM batches.
+    """Insert typed records for the live APPLYING owner of the parent import.
 
     Rows remain invisible because the destination snapshot is locked and must
-    still be ``STAGED``.  The caller owns the final commit.
+    still be ``STAGED``. The caller owns the final commit.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    snapshot = await session.scalar(
-        select(DataSnapshot)
-        .where(DataSnapshot.id == snapshot_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    table, job, snapshot = await _lock_snapshot_chain(session, snapshot_id)
+    if (
+        job.table_id != table.id
+        or snapshot.table_id != job.table_id
+        or snapshot.import_id != job.id
+    ):
+        raise _invalid_import_error(
+            "Import snapshot does not belong to the locked job and table"
+        )
+    _require_live_lease(
+        job,
+        worker_id,
+        expected_status=DataImportStatus.APPLYING,
     )
-    if snapshot is None:
-        raise _invalid_import_error("Import snapshot not found")
     if snapshot.status != DataSnapshotStatus.STAGED:
         raise _invalid_import_error("Only STAGED snapshots can receive rows")
+    if any(row.business_date != snapshot.business_date for row in rows):
+        raise _invalid_import_error(
+            "Import row business date does not match the snapshot"
+        )
 
     field_ids = {field_id for row in rows for field_id in row.custom_values}
     if field_ids:
@@ -200,11 +280,6 @@ async def append_staged_rows(
                     raise _invalid_import_error(
                         "Custom field value key does not match its field ID"
                     )
-
-    if any(row.business_date != snapshot.business_date for row in rows):
-        raise _invalid_import_error(
-            "Import row business date does not match the snapshot"
-        )
 
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
@@ -271,16 +346,23 @@ async def activate_import(
     *,
     import_id: int,
     worker_id: str,
+    expected_dates: Collection[date],
 ) -> None:
-    """Atomically activate every staged date for one complete import.
+    """Atomically activate exactly the expected dates for one live import.
 
     Old ACTIVE rows are cleared before new ACTIVE rows in the same flush so
     the database's active-only unique key is never transiently violated.
     Any exception rolls the whole session transaction back.
     """
+    dates = _validated_dates(expected_dates, name="expected_dates")
+    expected_date_set = set(dates)
     try:
-        job = await _lock_job_and_table(session, import_id)
-        _require_live_lease(job, worker_id)
+        table, job = await _lock_table_and_job(session, import_id)
+        _require_live_lease(
+            job,
+            worker_id,
+            expected_status=DataImportStatus.APPLYING,
+        )
         staged = list(
             (
                 await session.scalars(
@@ -295,12 +377,18 @@ async def activate_import(
                 )
             ).all()
         )
-        if not staged:
-            raise _invalid_import_error("Import has no STAGED snapshots")
-        staged_dates = [item.business_date for item in staged]
+        if any(snapshot.table_id != job.table_id for snapshot in staged):
+            raise _invalid_import_error(
+                "A STAGED snapshot does not belong to the import table"
+            )
+        staged_dates = [snapshot.business_date for snapshot in staged]
         if len(staged_dates) != len(set(staged_dates)):
             raise _invalid_import_error(
                 "Import has multiple STAGED snapshots for one business date"
+            )
+        if set(staged_dates) != expected_date_set:
+            raise _invalid_import_error(
+                "STAGED snapshots do not match the expected business dates"
             )
 
         old_active = list(
@@ -308,8 +396,8 @@ async def activate_import(
                 await session.scalars(
                     select(DataSnapshot)
                     .where(
-                        DataSnapshot.table_id == job.table_id,
-                        DataSnapshot.business_date.in_(staged_dates),
+                        DataSnapshot.table_id == table.id,
+                        DataSnapshot.business_date.in_(dates),
                         DataSnapshot.status == DataSnapshotStatus.ACTIVE,
                     )
                     .order_by(DataSnapshot.business_date, DataSnapshot.id)
@@ -321,8 +409,8 @@ async def activate_import(
         await session.execute(
             select(DataCurrentSnapshot)
             .where(
-                DataCurrentSnapshot.c.table_id == job.table_id,
-                DataCurrentSnapshot.c.business_date.in_(staged_dates),
+                DataCurrentSnapshot.c.table_id == table.id,
+                DataCurrentSnapshot.c.business_date.in_(dates),
             )
             .with_for_update()
         )
@@ -341,14 +429,11 @@ async def activate_import(
         for snapshot in staged:
             await _upsert_current_pointer(
                 session,
-                table_id=job.table_id,
+                table_id=table.id,
                 business_date=snapshot.business_date,
                 snapshot_id=snapshot.id,
             )
 
-        table = await session.get(DataTableDefinition, job.table_id)
-        if table is None:
-            raise _not_found_error()
         if table.status != DataTableStatus.LOCKED or table.locked_at is None:
             table.status = DataTableStatus.LOCKED
             table.locked_at = now
@@ -371,7 +456,7 @@ async def discard_staged_import(
 ) -> None:
     """Delete only STAGED data owned by this import and commit."""
     try:
-        await _lock_job_and_table(session, import_id)
+        await _lock_table_and_job(session, import_id)
         await data_import_repository.discard_staged_rows(session, import_id)
         await session.commit()
     except Exception:

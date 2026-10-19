@@ -363,6 +363,13 @@ async def test_expired_claim_recovers_lease_and_cleans_staged_rows(
                 - timedelta(minutes=1),
                 attempt_count=1,
             )
+            job.total_rows = 20
+            job.valid_rows = 18
+            job.invalid_rows = 2
+            job.date_from = date(2026, 10, 17)
+            job.date_to = date(2026, 10, 18)
+            job.error_count = 2
+            job.progress_percent = 75
             snapshot = DataSnapshot(
                 table_id=table.id,
                 business_date=date(2026, 10, 18),
@@ -401,12 +408,21 @@ async def test_expired_claim_recovers_lease_and_cleans_staged_rows(
             assert claimed.id == job_id
             assert claimed.attempt_count == 2
             assert claimed.lease_owner == "fresh-worker"
+            assert claimed.total_rows == 0
+            assert claimed.valid_rows == 0
+            assert claimed.invalid_rows == 0
+            assert claimed.date_from is None
+            assert claimed.date_to is None
+            assert claimed.error_count == 0
+            assert claimed.progress_percent == 0
 
         async with factory() as verifier:
             assert await verifier.get(DataSnapshot, snapshot_id) is None
             refreshed = await verifier.get(DataImportJob, job_id)
             assert refreshed is not None
             assert refreshed.status == DataImportStatus.VALIDATING
+            assert refreshed.date_from is None
+            assert refreshed.date_to is None
     finally:
         await _delete_test_rows(factory, table_id=table_id, user_id=user_id)
 
