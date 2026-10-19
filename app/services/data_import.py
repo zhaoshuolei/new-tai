@@ -5,18 +5,32 @@ snapshots.  Activation is the one short transaction that makes a complete
 multi-date batch visible by switching every current pointer together.
 """
 
-from collections.abc import Collection, Sequence
+import asyncio
+import hashlib
+import logging
+import tempfile
+from collections.abc import Collection, Iterator, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_context import AuthContext
 from app.core.errors import BusinessError, ErrorCode
+from app.db.session import session_factory
+from app.models.audit_log import AuditResult
+from app.models.contact import ContactStatus
+from app.models.customer import Customer
 from app.models.data_management import (
     DataCurrentSnapshot,
     DataFieldDefinition,
+    DataImportError,
     DataImportJob,
+    DataImportSource,
     DataImportStatus,
     DataRecord,
     DataRecordValue,
@@ -25,8 +39,31 @@ from app.models.data_management import (
     DataTableDefinition,
     DataTableStatus,
 )
+from app.models.role import DataScope
+from app.models.user import UserStatus
 from app.repositories import data_import as data_import_repository
-from app.services.data_import_parser import ValidatedImportRow
+from app.repositories import data_table as data_table_repository
+from app.repositories import user as user_repository
+from app.repositories.data_table import ResolvedDataDefinition
+from app.services import data_import_parser
+from app.services.audit import actor_from_context, audited, record_audit_entry
+from app.services.auth import build_auth_context
+from app.services.data_import_parser import (
+    CustomerIdentity,
+    ParsedImportRow,
+    RowIssue,
+    ValidatedImportRow,
+)
+from app.services.data_import_storage import StoredImportSource, read_import_source
+from app.services.data_scope import apply_customer_scope
+
+logger = logging.getLogger(__name__)
+
+_MAX_ERROR_DETAILS = 10_000
+_STAGE_BATCH_SIZE = 1_000
+_SOURCE_COPY_CHUNK_SIZE = 64 * 1024
+_LEASE_SECONDS = 300
+_LEASE_RENEW_INTERVAL_SECONDS = 60.0
 
 
 def _utc_now() -> datetime:
@@ -47,6 +84,125 @@ def _invalid_import_error(message: str) -> BusinessError:
         message,
         http_status=422,
     )
+
+
+def _require_import_permission(context: AuthContext) -> None:
+    if "data:import" not in context.permission_codes:
+        raise BusinessError(
+            ErrorCode.FORBIDDEN,
+            "Import permission is required",
+            http_status=403,
+        )
+
+
+@dataclass(frozen=True)
+class _ClaimIdentity:
+    job_id: int
+    table_id: int
+    requested_by: int
+    attempt_count: int
+    worker_id: str
+    storage_path: str
+    source: DataImportSource
+    content_sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class _ValidationSummary:
+    total_rows: int
+    valid_rows: int
+    invalid_rows: int
+    error_count: int
+    business_dates: frozenset[date]
+    issues: tuple[RowIssue, ...]
+
+
+class _ImportFailure(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _LeaseLost(Exception):
+    """The replacement heartbeat could no longer prove ownership."""
+
+
+def _claim_identity(job: DataImportJob, worker_id: str) -> _ClaimIdentity:
+    return _ClaimIdentity(
+        job_id=job.id,
+        table_id=job.table_id,
+        requested_by=job.requested_by,
+        attempt_count=job.attempt_count,
+        worker_id=worker_id,
+        storage_path=job.storage_path,
+        source=job.source,
+        content_sha256=job.content_sha256,
+        size_bytes=job.size_bytes,
+    )
+
+
+def _require_claimed_job(
+    job: DataImportJob,
+    identity: _ClaimIdentity,
+) -> None:
+    _require_live_lease(
+        job,
+        identity.worker_id,
+        expected_status=DataImportStatus.VALIDATING,
+    )
+    if job.attempt_count != identity.attempt_count:
+        raise _invalid_import_error("Import attempt is no longer current")
+
+
+def _safe_failure(error: Exception) -> tuple[str, str]:
+    if isinstance(error, _ImportFailure):
+        return error.code, error.message
+    if isinstance(error, BusinessError):
+        try:
+            code = ErrorCode(error.code).name
+        except ValueError:
+            code = "DATA_IMPORT_INVALID"
+        return code, error.message
+    return ErrorCode.INTERNAL_ERROR.name, "Data import processing failed"
+
+
+@audited(
+    action="data_import:request",
+    resource_type="custom_data_import",
+    resource_id_attr="id",
+)
+async def enqueue_import(
+    session: AsyncSession,
+    table_id: int,
+    *,
+    source: DataImportSource,
+    stored: StoredImportSource,
+    context: AuthContext,
+) -> DataImportJob:
+    """Persist a QUEUED import after serializing on the data table row.
+
+    The private source must already have been written and hashed by Task 5.
+    This function owns the transaction boundary and commits before returning.
+    """
+    _require_import_permission(context)
+    try:
+        job = await data_import_repository.create_import_job(
+            session,
+            table_id=table_id,
+            source=source,
+            storage_path=stored.storage_path,
+            original_filename=stored.original_name,
+            content_sha256=stored.content_sha256,
+            size_bytes=stored.size_bytes,
+            requested_by=context.user_id,
+        )
+        await session.commit()
+        return job
+    except Exception:
+        await session.rollback()
+        raise
 
 
 def _validated_dates(
@@ -501,9 +657,548 @@ async def discard_staged_import(
         raise
 
 
+def _source_filename(source: DataImportSource) -> str:
+    return "source.xlsx" if source == DataImportSource.EXCEL else "source.json"
+
+
+def _materialize_source(
+    *,
+    storage_path: str,
+    target_path: Path,
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
+    """Copy and verify a private source entirely off the event-loop thread."""
+    digest = hashlib.sha256()
+    copied = 0
+    with read_import_source(storage_path) as source, target_path.open("wb") as target:
+        while chunk := source.read(_SOURCE_COPY_CHUNK_SIZE):
+            digest.update(chunk)
+            target.write(chunk)
+            copied += len(chunk)
+    if copied != expected_size or digest.hexdigest() != expected_sha256:
+        raise BusinessError(
+            ErrorCode.DATA_IMPORT_INVALID,
+            "Data import source metadata does not match",
+            http_status=422,
+        )
+
+
+def _row_iterator(
+    *,
+    source: DataImportSource,
+    source_path: Path,
+    definition: ResolvedDataDefinition,
+    customer_index: dict[str, CustomerIdentity],
+    allowed_customer_ids: set[int] | None,
+) -> Iterator[ParsedImportRow]:
+    if source == DataImportSource.EXCEL:
+        return data_import_parser.iter_excel_rows(
+            source_path,
+            definition,
+            customer_index,
+            allowed_customer_ids,
+        )
+    return data_import_parser.iter_json_rows(
+        source_path,
+        definition,
+        customer_index,
+        allowed_customer_ids,
+    )
+
+
+def _take_rows(
+    iterator: Iterator[ParsedImportRow],
+    batch_size: int,
+) -> tuple[list[ParsedImportRow], bool]:
+    rows: list[ParsedImportRow] = []
+    for _ in range(batch_size):
+        try:
+            rows.append(next(iterator))
+        except StopIteration:
+            return rows, True
+    return rows, False
+
+
+def _close_iterator(iterator: Iterator[ParsedImportRow]) -> None:
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
+def _raise_if_heartbeat_failed(task: asyncio.Task[None]) -> None:
+    if task.done():
+        task.result()
+
+
+async def _renew_until_stopped(
+    identity: _ClaimIdentity,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=_LEASE_RENEW_INTERVAL_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        async with session_factory() as session:
+            renewed = await data_import_repository.renew_import_lease(
+                session,
+                import_id=identity.job_id,
+                worker_id=identity.worker_id,
+                lease_seconds=_LEASE_SECONDS,
+            )
+        if not renewed:
+            raise _LeaseLost
+
+
+async def _stop_heartbeat(
+    task: asyncio.Task[None],
+    stop_event: asyncio.Event,
+) -> None:
+    stop_event.set()
+    if not task.done():
+        task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def _load_customer_validation_inputs(
+    session: AsyncSession,
+    context: AuthContext,
+) -> tuple[dict[str, CustomerIdentity], set[int] | None]:
+    customer_index = await data_import_parser.load_customer_name_index(session)
+    if context.is_super_admin or context.data_scope == DataScope.ALL:
+        return customer_index, None
+    statement = apply_customer_scope(
+        select(Customer.id).where(
+            Customer.status == ContactStatus.ACTIVE,
+            Customer.deleted_at.is_(None),
+        ),
+        context,
+    )
+    visible_customer_ids = set((await session.scalars(statement)).all())
+    return customer_index, visible_customer_ids
+
+
+async def _validate_source(
+    *,
+    identity: _ClaimIdentity,
+    source_path: Path,
+    definition: ResolvedDataDefinition,
+    customer_index: dict[str, CustomerIdentity],
+    allowed_customer_ids: set[int] | None,
+    expected_json_rows: int | None,
+    heartbeat: asyncio.Task[None],
+) -> _ValidationSummary:
+    iterator = await asyncio.to_thread(
+        _row_iterator,
+        source=identity.source,
+        source_path=source_path,
+        definition=definition,
+        customer_index=customer_index,
+        allowed_customer_ids=allowed_customer_ids,
+    )
+    total_rows = 0
+    valid_rows = 0
+    invalid_rows = 0
+    error_count = 0
+    business_dates: set[date] = set()
+    issues: list[RowIssue] = []
+    finished = False
+    try:
+        while not finished:
+            batch, finished = await asyncio.to_thread(
+                _take_rows,
+                iterator,
+                _STAGE_BATCH_SIZE,
+            )
+            _raise_if_heartbeat_failed(heartbeat)
+            for parsed in batch:
+                total_rows += 1
+                if parsed.row is not None and not parsed.issues:
+                    valid_rows += 1
+                    business_dates.add(parsed.row.business_date)
+                else:
+                    invalid_rows += 1
+                    error_count += len(parsed.issues)
+                    remaining = _MAX_ERROR_DETAILS - len(issues)
+                    if remaining > 0:
+                        issues.extend(parsed.issues[:remaining])
+    finally:
+        if not finished:
+            await asyncio.to_thread(_close_iterator, iterator)
+
+    if expected_json_rows is not None and total_rows != expected_json_rows:
+        raise BusinessError(
+            ErrorCode.DATA_IMPORT_INVALID,
+            "Import JSON row count changed while processing",
+            http_status=422,
+        )
+    return _ValidationSummary(
+        total_rows=total_rows,
+        valid_rows=valid_rows,
+        invalid_rows=invalid_rows,
+        error_count=error_count,
+        business_dates=frozenset(business_dates),
+        issues=tuple(issues),
+    )
+
+
+async def _persist_validation_summary(
+    session: AsyncSession,
+    job: DataImportJob,
+    summary: _ValidationSummary,
+) -> None:
+    job.total_rows = summary.total_rows
+    job.valid_rows = summary.valid_rows
+    job.invalid_rows = summary.invalid_rows
+    job.error_count = summary.error_count
+    job.date_from = min(summary.business_dates) if summary.business_dates else None
+    job.date_to = max(summary.business_dates) if summary.business_dates else None
+    job.progress_percent = 20
+    session.add_all(
+        DataImportError(
+            import_id=job.id,
+            sheet_name=issue.sheet_name,
+            row_number=issue.row_number,
+            column_label=issue.column_label,
+            field_id=issue.field_id,
+            error_code=issue.error_code,
+            message=issue.message[:500],
+        )
+        for issue in summary.issues
+    )
+    await session.commit()
+
+
+async def _stage_source(
+    *,
+    session: AsyncSession,
+    identity: _ClaimIdentity,
+    job: DataImportJob,
+    source_path: Path,
+    definition: ResolvedDataDefinition,
+    customer_index: dict[str, CustomerIdentity],
+    allowed_customer_ids: set[int] | None,
+    snapshots: dict[date, DataSnapshot],
+    expected_dates: frozenset[date],
+    expected_rows: int,
+    heartbeat: asyncio.Task[None],
+) -> None:
+    iterator = await asyncio.to_thread(
+        _row_iterator,
+        source=identity.source,
+        source_path=source_path,
+        definition=definition,
+        customer_index=customer_index,
+        allowed_customer_ids=allowed_customer_ids,
+    )
+    staged_rows = 0
+    staged_dates: set[date] = set()
+    finished = False
+    try:
+        while not finished:
+            batch, finished = await asyncio.to_thread(
+                _take_rows,
+                iterator,
+                _STAGE_BATCH_SIZE,
+            )
+            _raise_if_heartbeat_failed(heartbeat)
+            rows_by_date: dict[date, list[ValidatedImportRow]] = {}
+            for parsed in batch:
+                if parsed.row is None or parsed.issues:
+                    raise _ImportFailure(
+                        ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+                        "Import changed after validation",
+                    )
+                rows_by_date.setdefault(parsed.row.business_date, []).append(parsed.row)
+            for business_date, rows in rows_by_date.items():
+                snapshot = snapshots.get(business_date)
+                if snapshot is None:
+                    raise _ImportFailure(
+                        ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+                        "Import date set changed after validation",
+                    )
+                await append_staged_rows(
+                    session,
+                    snapshot.id,
+                    rows,
+                    worker_id=identity.worker_id,
+                    batch_size=len(rows),
+                )
+                staged_dates.add(business_date)
+            staged_rows += len(batch)
+            job.progress_percent = min(
+                90,
+                20 + int((staged_rows / expected_rows) * 70),
+            )
+            await session.commit()
+    finally:
+        if not finished:
+            await asyncio.to_thread(_close_iterator, iterator)
+
+    if staged_rows != expected_rows or staged_dates != set(expected_dates):
+        raise _ImportFailure(
+            ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+            "Import result changed before staging completed",
+        )
+
+
+async def _load_live_claim(job_id: int, worker_id: str) -> _ClaimIdentity:
+    if not worker_id:
+        raise ValueError("worker_id must not be empty")
+    async with session_factory() as session:
+        job = await data_import_repository.get_import_job(session, job_id)
+        if job is None:
+            raise _not_found_error()
+        _require_live_lease(
+            job,
+            worker_id,
+            expected_status=DataImportStatus.VALIDATING,
+        )
+        return _claim_identity(job, worker_id)
+
+
+async def _rehydrate_requester(
+    session: AsyncSession,
+    requested_by: int,
+) -> AuthContext:
+    user = await user_repository.get_by_id(session, requested_by)
+    if user is None or user.status != UserStatus.ACTIVE:
+        raise _ImportFailure(
+            ErrorCode.ACCOUNT_DISABLED.name,
+            "Import requester is inactive",
+        )
+    context = await build_auth_context(session, user)
+    _require_import_permission(context)
+    return context
+
+
+async def _audit_failure(
+    *,
+    job_id: int,
+    requested_by: int,
+    reason: str,
+) -> None:
+    actor = None
+    try:
+        async with session_factory() as session:
+            user = await user_repository.get_by_id(session, requested_by)
+            if user is not None:
+                context = await build_auth_context(session, user)
+                actor = actor_from_context(context)
+    except Exception:
+        logger.warning("Could not rehydrate import requester for audit")
+    await record_audit_entry(
+        action="data_import:fail",
+        resource_type="custom_data_import",
+        resource_id=job_id,
+        result=AuditResult.DENIED,
+        reason=reason[:64],
+        actor=actor,
+        request_meta=None,
+    )
+
+
+async def _mark_failed_and_discard(
+    identity: _ClaimIdentity,
+    *,
+    code: str,
+    message: str,
+) -> bool:
+    marked = False
+    try:
+        async with session_factory() as session:
+            _, job = await _lock_table_and_job(session, identity.job_id)
+            if (
+                job.lease_owner != identity.worker_id
+                or job.attempt_count != identity.attempt_count
+                or job.status
+                not in {DataImportStatus.VALIDATING, DataImportStatus.APPLYING}
+            ):
+                await session.rollback()
+                return False
+            job.status = DataImportStatus.FAILED
+            job.failure_code = code[:64]
+            job.failure_message = message[:500]
+            job.finished_at = _utc_now()
+            await session.commit()
+            marked = True
+    except Exception:
+        logger.warning("Could not mark data import job %s failed", identity.job_id)
+        return False
+
+    try:
+        async with session_factory() as session:
+            await discard_staged_import(
+                session,
+                identity.job_id,
+                worker_id=identity.worker_id,
+                attempt_count=identity.attempt_count,
+            )
+    except Exception:
+        logger.warning(
+            "Could not discard staged data for failed import job %s",
+            identity.job_id,
+        )
+    return marked
+
+
+async def _process_claimed_import(identity: _ClaimIdentity) -> None:
+    async with session_factory() as session:
+        job = await data_import_repository.get_import_job(session, identity.job_id)
+        if job is None:
+            raise _not_found_error()
+        _require_claimed_job(job, identity)
+        context = await _rehydrate_requester(session, identity.requested_by)
+        definition = await data_table_repository.load_resolved_definition(
+            session,
+            identity.table_id,
+        )
+        if definition is None:
+            raise _ImportFailure(
+                ErrorCode.DATA_TABLE_NOT_FOUND.name,
+                "Import table definition is unavailable",
+            )
+        customer_index, allowed_customer_ids = await _load_customer_validation_inputs(
+            session, context
+        )
+        job.progress_percent = 5
+        await session.commit()
+
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(_renew_until_stopped(identity, heartbeat_stop))
+        try:
+            with tempfile.TemporaryDirectory(prefix="data-import-worker-") as root:
+                source_path = Path(root) / _source_filename(identity.source)
+                await asyncio.to_thread(
+                    _materialize_source,
+                    storage_path=identity.storage_path,
+                    target_path=source_path,
+                    expected_sha256=identity.content_sha256,
+                    expected_size=identity.size_bytes,
+                )
+                _raise_if_heartbeat_failed(heartbeat)
+                expected_json_rows = None
+                if identity.source == DataImportSource.API:
+                    expected_json_rows = await asyncio.to_thread(
+                        data_import_parser.json_import_row_count,
+                        source_path,
+                    )
+                _raise_if_heartbeat_failed(heartbeat)
+                summary = await _validate_source(
+                    identity=identity,
+                    source_path=source_path,
+                    definition=definition,
+                    customer_index=customer_index,
+                    allowed_customer_ids=allowed_customer_ids,
+                    expected_json_rows=expected_json_rows,
+                    heartbeat=heartbeat,
+                )
+                await _persist_validation_summary(session, job, summary)
+                _raise_if_heartbeat_failed(heartbeat)
+                if summary.total_rows == 0:
+                    raise _ImportFailure(
+                        ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+                        "Import contains no data rows",
+                    )
+                if summary.error_count:
+                    raise _ImportFailure(
+                        ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+                        "Import contains validation errors",
+                    )
+                if not summary.business_dates:
+                    raise _ImportFailure(
+                        ErrorCode.DATA_IMPORT_VALIDATION_FAILED.name,
+                        "Import contains no business dates",
+                    )
+
+                snapshots = await start_staged_import(
+                    session,
+                    identity.job_id,
+                    summary.business_dates,
+                    worker_id=identity.worker_id,
+                )
+                job.progress_percent = 25
+                await session.commit()
+                await _stage_source(
+                    session=session,
+                    identity=identity,
+                    job=job,
+                    source_path=source_path,
+                    definition=definition,
+                    customer_index=customer_index,
+                    allowed_customer_ids=allowed_customer_ids,
+                    snapshots=snapshots,
+                    expected_dates=summary.business_dates,
+                    expected_rows=summary.total_rows,
+                    heartbeat=heartbeat,
+                )
+        finally:
+            await _stop_heartbeat(heartbeat, heartbeat_stop)
+
+        await activate_import(
+            session,
+            import_id=identity.job_id,
+            worker_id=identity.worker_id,
+            expected_dates=summary.business_dates,
+        )
+        await record_audit_entry(
+            action="data_import:complete",
+            resource_type="custom_data_import",
+            resource_id=identity.job_id,
+            result=AuditResult.SUCCESS,
+            reason=None,
+            actor=actor_from_context(context),
+            request_meta=None,
+        )
+
+
+async def process_import_job(job_id: int, *, worker_id: str) -> None:
+    """Process one already-claimed import owned by ``worker_id``.
+
+    The caller obtains the durable lease with
+    ``claim_next_import_job(worker_id=worker_id)``.  This function never claims
+    an arbitrary job, so an unclaimed, expired, or foreign job is rejected
+    without mutation.  A processing failure owned by this lease transitions to
+    FAILED, retains the owner/attempt cleanup identity, and discards only
+    STAGED snapshots.
+    """
+    identity = await _load_live_claim(job_id, worker_id)
+    try:
+        await _process_claimed_import(identity)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        code, message = _safe_failure(error)
+        logger.warning(
+            "Data import job %s failed (%s)",
+            job_id,
+            type(error).__name__,
+        )
+        marked = await _mark_failed_and_discard(
+            identity,
+            code=code,
+            message=message,
+        )
+        if marked:
+            await _audit_failure(
+                job_id=job_id,
+                requested_by=identity.requested_by,
+                reason=code,
+            )
+
+
 __all__: tuple[str, ...] = (
     "activate_import",
     "append_staged_rows",
     "discard_staged_import",
     "start_staged_import",
+    "enqueue_import",
+    "process_import_job",
 )
