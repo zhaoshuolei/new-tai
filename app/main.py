@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.api.auth import router as auth_router
+from app.api.data_imports import import_receive_body_limit_rules
 from app.api.health import router as health_router
 from app.api.router import api_v1_router
 from app.core.config import (
@@ -18,7 +19,11 @@ from app.core.config import (
 )
 from app.core.exception_handlers import register_exception_handlers
 from app.core.logging import configure_logging
-from app.core.middleware import RequestContextMiddleware, configure_security
+from app.core.middleware import (
+    ReceiveBodyLimitMiddleware,
+    RequestContextMiddleware,
+    configure_security,
+)
 from app.core.redis import redis_client
 from app.db.session import engine
 from app.services.monitor import run_sampler
@@ -144,6 +149,10 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         lifespan=lifespan,
         openapi_tags=OPENAPI_TAGS,
+    )
+    application.add_middleware(
+        ReceiveBodyLimitMiddleware,
+        rules=import_receive_body_limit_rules(),
     )
     configure_security(application)
     application.add_middleware(RequestContextMiddleware)

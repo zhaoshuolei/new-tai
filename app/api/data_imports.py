@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, BinaryIO
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import UploadFile
 
 from app.core.audit_meta import register_audit_route
 from app.core.auth_context import AuthContext
 from app.core.config import settings
 from app.core.deps import get_current_context
 from app.core.errors import BusinessError, ErrorCode
+from app.core.middleware import ReceiveBodyLimitRule
 from app.core.permissions import require_permission
 from app.core.response import MAX_PAGE_SIZE, Page, SuccessEnvelope, success
 from app.db.session import get_session
@@ -44,9 +48,13 @@ from app.services.data_import_storage import (
 from app.services.private_storage import sanitize_original_name
 
 router = APIRouter(prefix="/data-tables", tags=["数据管理"])
+logger = logging.getLogger(__name__)
 
 _HARD_MAX_IMPORT_BYTES = 50 * 1024 * 1024
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _READ_CHUNK_SIZE = 64 * 1024
+_EXCEL_IMPORT_PATH = re.compile(r"^/api/v1/data-tables/[0-9]+/imports/excel$")
+_JSON_IMPORT_PATH = re.compile(r"^/api/v1/data-tables/[0-9]+/imports/json$")
 _XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _SOURCE_CONTENT_TYPES = {
     DataImportSource.EXCEL: _XLSX_CONTENT_TYPE,
@@ -62,6 +70,14 @@ def _invalid_import(message: str) -> BusinessError:
     return BusinessError(
         ErrorCode.DATA_IMPORT_INVALID,
         message,
+        http_status=422,
+    )
+
+
+def _invalid_parameters() -> BusinessError:
+    return BusinessError(
+        ErrorCode.INVALID_PARAMETER,
+        "Invalid request parameters",
         http_status=422,
     )
 
@@ -88,8 +104,28 @@ def _oversized_error() -> BusinessError:
     )
 
 
+def import_receive_body_limit_rules() -> tuple[ReceiveBodyLimitRule, ...]:
+    """Return receive-boundary limits for the two import POST routes."""
+    return (
+        ReceiveBodyLimitRule(
+            path_pattern=_EXCEL_IMPORT_PATH,
+            method="POST",
+            max_body_bytes=_import_limit,
+            multipart_overhead_bytes=_MULTIPART_OVERHEAD_BYTES,
+            error_factory=_oversized_error,
+        ),
+        ReceiveBodyLimitRule(
+            path_pattern=_JSON_IMPORT_PATH,
+            method="POST",
+            max_body_bytes=_import_limit,
+            multipart_overhead_bytes=0,
+            error_factory=_oversized_error,
+        ),
+    )
+
+
 async def _read_bounded_body(request: Request) -> bytes:
-    """Read the original request bytes after an early Content-Length guard."""
+    """Read original JSON request bytes without unbounded framework buffering."""
     limit = _import_limit()
     declared_length = request.headers.get("content-length")
     if declared_length is not None:
@@ -102,10 +138,12 @@ async def _read_bounded_body(request: Request) -> bytes:
         if length > limit:
             raise _oversized_error()
 
-    content = await request.body()
-    if len(content) > limit:
-        raise _oversized_error()
-    return content
+    content = bytearray()
+    async for chunk in request.stream():
+        if len(content) + len(chunk) > limit:
+            raise _oversized_error()
+        content.extend(chunk)
+    return bytes(content)
 
 
 async def _read_bounded_upload(upload: UploadFile) -> bytes:
@@ -126,7 +164,7 @@ async def _delete_saved_source_best_effort(storage_path: str) -> None:
         await asyncio.to_thread(delete_import_source, storage_path)
     except Exception:
         # Do not include the private path or original filename in the log.
-        pass
+        logger.warning("Failed to remove an unsaved data import source")
 
 
 async def _enqueue_after_save(
@@ -210,29 +248,37 @@ async def _source_chunks(source: BinaryIO) -> AsyncIterator[bytes]:
 )
 async def import_excel(
     table_id: int,
-    file: Annotated[UploadFile, File()],
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     context: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict[str, Any]:
-    original_name = file.filename
-    if not (original_name or "").lower().endswith(".xlsx"):
-        raise _invalid_import("Excel import file must use the .xlsx suffix")
+    form = await request.form()
+    try:
+        file = form.get("file")
+        if not isinstance(file, UploadFile):
+            raise _invalid_parameters()
 
-    content = await _read_bounded_upload(file)
-    stored = await asyncio.to_thread(
-        save_import_bytes,
-        content,
-        suffix=".xlsx",
-        original_name=original_name,
-    )
-    job = await _enqueue_after_save(
-        session,
-        table_id,
-        source=DataImportSource.EXCEL,
-        stored=stored,
-        context=context,
-    )
-    return success(DataImportRead.model_validate(job), message="queued")
+        original_name = file.filename
+        if not (original_name or "").lower().endswith(".xlsx"):
+            raise _invalid_import("Excel import file must use the .xlsx suffix")
+
+        content = await _read_bounded_upload(file)
+        stored = await asyncio.to_thread(
+            save_import_bytes,
+            content,
+            suffix=".xlsx",
+            original_name=original_name,
+        )
+        job = await _enqueue_after_save(
+            session,
+            table_id,
+            source=DataImportSource.EXCEL,
+            stored=stored,
+            context=context,
+        )
+        return success(DataImportRead.model_validate(job), message="queued")
+    finally:
+        await form.close()
 
 
 @router.post(
@@ -440,6 +486,7 @@ __all__: tuple[str, ...] = (
     "get_import",
     "import_excel",
     "import_json",
+    "import_receive_body_limit_rules",
     "list_import_errors",
     "list_imports",
     "router",

@@ -71,8 +71,8 @@ def parse_data_import_json_request(content: bytes) -> DataImportJsonRequest:
 
     Task 10 MUST:
 
-    - accept a FastAPI ``Request`` (not a bound body model) and call this
-      helper as ``parse_data_import_json_request(await request.body())``;
+    - bind a FastAPI ``Request`` (not a bound body model), read its stream with
+      a bounded helper, and pass those raw bytes to this function;
     - persist those **exact request bytes unchanged** as the import source.
 
     Task 10 MUST NOT:

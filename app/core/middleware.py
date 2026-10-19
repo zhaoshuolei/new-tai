@@ -1,10 +1,15 @@
 import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from time import perf_counter
 
 from fastapi import FastAPI, Request
+from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.config import settings
 from app.core.logging import (
@@ -27,6 +32,76 @@ SECURITY_HEADERS: dict[str, str] = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiveBodyLimitRule:
+    """One method/path rule enforced while the application receives body bytes."""
+
+    path_pattern: re.Pattern[str]
+    method: str
+    max_body_bytes: Callable[[], int]
+    multipart_overhead_bytes: int
+    error_factory: Callable[[], Exception]
+
+    def __post_init__(self) -> None:
+        if self.multipart_overhead_bytes < 0:
+            raise ValueError("multipart_overhead_bytes must be non-negative")
+
+    def body_limit(self, scope: Scope) -> int:
+        limit = self.max_body_bytes()
+        content_type = Headers(scope=scope).get("content-type", "")
+        if content_type.lower().startswith("multipart/form-data"):
+            return limit + self.multipart_overhead_bytes
+        return limit
+
+
+class ReceiveBodyLimitMiddleware:
+    """Raise a configured error before body bytes exceeding a rule are buffered."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        rules: tuple[ReceiveBodyLimitRule, ...],
+    ) -> None:
+        self.app = app
+        self.rules = rules
+
+    def _match_rule(self, scope: Scope) -> ReceiveBodyLimitRule | None:
+        if scope["type"] != "http":
+            return None
+        method = scope.get("method", "").upper()
+        path = scope.get("path", "")
+        for rule in self.rules:
+            if method == rule.method.upper() and rule.path_pattern.fullmatch(path):
+                return rule
+        return None
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        rule = self._match_rule(scope)
+        if rule is None:
+            await self.app(scope, receive, send)
+            return
+
+        body_limit = rule.body_limit(scope)
+        received_bytes = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > body_limit:
+                    raise rule.error_factory()
+            return message
+
+        await self.app(scope, limited_receive, send)
 
 
 def _request_user_id(request: Request) -> object:
@@ -119,6 +194,8 @@ def configure_security(app: FastAPI) -> None:
 
 __all__: tuple[str, ...] = (
     "SECURITY_HEADERS",
+    "ReceiveBodyLimitMiddleware",
+    "ReceiveBodyLimitRule",
     "RequestContextMiddleware",
     "configure_security",
     "current_request_id",

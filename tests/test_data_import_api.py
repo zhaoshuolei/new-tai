@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -73,6 +74,8 @@ _PRIVATE_JOB_FIELDS = {
     "lease_expires_at",
     "heartbeat_at",
 }
+_HARD_MAX_IMPORT_BYTES = 50 * 1024 * 1024
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
 @pytest.fixture(autouse=True)
@@ -277,6 +280,26 @@ def _json_body(revenue: str = "10.25", cost: str = "4.75") -> bytes:
     ).encode()
 
 
+async def _chunked_content(
+    content: bytes,
+    *,
+    chunk_size: int,
+) -> AsyncIterator[bytes]:
+    for offset in range(0, len(content), chunk_size):
+        yield content[offset : offset + chunk_size]
+
+
+async def _assert_no_import_residue(
+    session: AsyncSession,
+    audit_factory: async_sessionmaker[AsyncSession],
+    storage_root: Path,
+    table_id: int,
+) -> None:
+    assert await _jobs(session, table_id) == []
+    assert await _audit_rows(audit_factory) == []
+    assert not storage_root.exists() or list(storage_root.iterdir()) == []
+
+
 async def test_excel_import_returns_202_and_persists_exact_source(
     session: AsyncSession,
     import_audit_session_factory: async_sessionmaker[AsyncSession],
@@ -412,6 +435,69 @@ async def test_enqueue_failure_removes_newly_saved_source(
     ]
 
 
+async def test_enqueue_rollback_delete_failure_logs_only_generic_warning(
+    session: AsyncSession,
+    configure_import_storage: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    definition_id = definition.id
+    existing = _job(
+        table_id=definition_id,
+        user_id=caller.id,
+        status=DataImportStatus.QUEUED,
+    )
+    session.add(existing)
+    await session.commit()
+
+    private_name = "private-customer-source.xlsx"
+    source_marker = b"private-source-bytes"
+    saved_sources = []
+    real_save = data_import_api.save_import_bytes
+
+    def record_saved_source(*args: Any, **kwargs: Any) -> Any:
+        stored = real_save(*args, **kwargs)
+        saved_sources.append(stored)
+        return stored
+
+    def fail_delete(storage_path: str) -> None:
+        raise PermissionError(
+            f"cannot delete {configure_import_storage / storage_path} "
+            f"for {private_name} containing {source_marker!r}"
+        )
+
+    monkeypatch.setattr(data_import_api, "save_import_bytes", record_saved_source)
+    monkeypatch.setattr(data_import_api, "delete_import_source", fail_delete)
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="app.api.data_imports")
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition_id}/imports/excel",
+            files={
+                "file": (
+                    private_name,
+                    source_marker,
+                    "application/octet-stream",
+                )
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_IN_PROGRESS
+    assert [job.id for job in await _jobs(session, definition_id)] == [existing.id]
+    assert len(saved_sources) == 1
+    stored = saved_sources[0]
+    assert (configure_import_storage / stored.storage_path).is_file()
+    assert "Failed to remove an unsaved data import source" in caplog.text
+    assert str(configure_import_storage) not in caplog.text
+    assert stored.storage_path not in caplog.text
+    assert private_name not in caplog.text
+    assert source_marker.decode() not in caplog.text
+
+
 async def test_json_import_persists_exact_raw_bytes_and_exact_decimal(
     session: AsyncSession,
     import_audit_session_factory: async_sessionmaker[AsyncSession],
@@ -452,6 +538,7 @@ async def test_json_import_persists_exact_raw_bytes_and_exact_decimal(
 
 async def test_json_import_rejects_malformed_body_before_storage(
     session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
     configure_import_storage: Path,
 ) -> None:
     caller = await make_user(session)
@@ -467,10 +554,11 @@ async def test_json_import_rejects_malformed_body_before_storage(
     assert response.status_code == 422
     assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
     assert response.json()["message"] == "Import JSON is invalid"
-    assert await _jobs(session, definition.id) == []
-    assert (
-        not configure_import_storage.exists()
-        or list(configure_import_storage.iterdir()) == []
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        definition.id,
     )
 
 
@@ -532,6 +620,189 @@ async def test_json_import_enforces_byte_limit_before_storage(
         not configure_import_storage.exists()
         or list(configure_import_storage.iterdir()) == []
     )
+
+
+async def test_json_chunked_body_without_content_length_is_rejected(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    configure_import_storage: Path,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    monkeypatch.setattr(settings, "data_import_max_bytes", 128)
+    raw_json = _json_body()
+
+    async def unbounded_body_read(request: Request) -> bytes:
+        await request.body()
+        raise AssertionError("receive guard did not reject the body")
+
+    monkeypatch.setattr(data_import_api, "_read_bounded_body", unbounded_body_read)
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition.id}/imports/json",
+            content=_chunked_content(raw_json, chunk_size=37),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        definition.id,
+    )
+
+
+async def test_json_lying_small_content_length_is_rejected_by_actual_bytes(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    configure_import_storage: Path,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    monkeypatch.setattr(settings, "data_import_max_bytes", 128)
+    raw_json = _json_body()
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition.id}/imports/json",
+            content=raw_json,
+            headers={
+                "content-type": "application/json",
+                "content-length": "64",
+            },
+        )
+
+    assert len(raw_json) > 128
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        definition.id,
+    )
+
+
+async def test_json_exact_50_mib_body_is_accepted(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    configure_import_storage: Path,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    prefix = b'{"rows":[]}'
+    raw_json = prefix + b" " * (_HARD_MAX_IMPORT_BYTES - len(prefix))
+    assert len(raw_json) == _HARD_MAX_IMPORT_BYTES
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition.id}/imports/json",
+            content=raw_json,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 202, response.text
+    jobs = await _jobs(session, definition.id)
+    assert len(jobs) == 1
+    assert jobs[0].size_bytes == _HARD_MAX_IMPORT_BYTES
+    assert (
+        configure_import_storage / jobs[0].storage_path
+    ).stat().st_size == _HARD_MAX_IMPORT_BYTES
+    audits = await _audit_rows(import_audit_session_factory)
+    assert len(audits) == 1
+    assert audits[0].result is AuditResult.SUCCESS
+
+
+async def test_chunked_multipart_is_rejected_at_receive_boundary(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    configure_import_storage: Path,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    monkeypatch.setattr(settings, "data_import_max_bytes", 4096)
+    boundary = "chunked-import-boundary"
+    file_content = b"x" * (4096 + _MULTIPART_OVERHEAD_BYTES + 1)
+    multipart = (
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="large.xlsx"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        + file_content
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    endpoint_read_called = False
+
+    async def unexpected_upload_read(file: Any) -> bytes:
+        nonlocal endpoint_read_called
+        endpoint_read_called = True
+        raise AssertionError("multipart parser reached the endpoint")
+
+    monkeypatch.setattr(
+        data_import_api,
+        "_read_bounded_upload",
+        unexpected_upload_read,
+    )
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition.id}/imports/excel",
+            content=_chunked_content(multipart, chunk_size=8192),
+            headers={
+                "content-type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == ErrorCode.DATA_IMPORT_INVALID
+    assert endpoint_read_called is False
+    await _assert_no_import_residue(
+        session,
+        import_audit_session_factory,
+        configure_import_storage,
+        definition.id,
+    )
+
+
+async def test_excel_exact_50_mib_file_is_accepted_with_multipart_margin(
+    session: AsyncSession,
+    import_audit_session_factory: async_sessionmaker[AsyncSession],
+    configure_import_storage: Path,
+) -> None:
+    caller = await make_user(session)
+    definition = await _create_table(session, caller)
+    raw_xlsx = b"x" * _HARD_MAX_IMPORT_BYTES
+    assert len(raw_xlsx) == _HARD_MAX_IMPORT_BYTES
+
+    async with _api_client(session, _context(caller)) as client:
+        response = await client.post(
+            f"/api/v1/data-tables/{definition.id}/imports/excel",
+            files={
+                "file": (
+                    "exact-boundary.xlsx",
+                    raw_xlsx,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    jobs = await _jobs(session, definition.id)
+    assert len(jobs) == 1
+    assert jobs[0].size_bytes == _HARD_MAX_IMPORT_BYTES
+    assert (
+        configure_import_storage / jobs[0].storage_path
+    ).stat().st_size == _HARD_MAX_IMPORT_BYTES
+    audits = await _audit_rows(import_audit_session_factory)
+    assert len(audits) == 1
+    assert audits[0].result is AuditResult.SUCCESS
 
 
 async def test_import_post_permission_denials_write_one_audit_each(
